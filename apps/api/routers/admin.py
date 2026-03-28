@@ -1,7 +1,7 @@
 """Admin API routes for the management dashboard."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -15,6 +15,7 @@ from core.database import get_session
 from core.orchestrator.claude_client import claude_client
 from models.db import (
     AgentRun, AgentRunStatus, AuditLog, Message, Session, SessionMessage, Task,
+    PipelineStatus,
 )
 
 router = APIRouter(prefix="/api", tags=["admin"])
@@ -131,6 +132,12 @@ async def get_session_detail(session_id: int, db: AsyncSession = Depends(get_ses
 
     result = _session_to_dict(sess)
     result["messages"] = messages
+
+    # Load summary content
+    from core.sessions.summary import get_summary
+    summary = await get_summary(sess)
+    result["summary_content"] = summary
+
     return result
 
 
@@ -336,6 +343,226 @@ async def delete_agent_session(sid: str):
     await agent_client.delete_session(sid)
     return {"success": True}
 
+
+# ---------- Pipeline ----------
+
+@router.post("/messages/{message_id}/process")
+async def process_message_endpoint(message_id: int, db: AsyncSession = Depends(get_session)):
+    """Manually trigger pipeline processing for a message."""
+    msg = await db.get(Message, message_id)
+    if not msg:
+        return {"error": "not found"}, 404
+
+    import asyncio
+    from core.pipeline import process_message
+    asyncio.create_task(process_message(message_id))
+    return {"status": "scheduled", "message_id": message_id}
+
+
+@router.post("/messages/{message_id}/reprocess")
+async def reprocess_message_endpoint(message_id: int, db: AsyncSession = Depends(get_session)):
+    """Reset and reprocess a message through the pipeline."""
+    msg = await db.get(Message, message_id)
+    if not msg:
+        return {"error": "not found"}, 404
+
+    import asyncio
+    from core.pipeline import reprocess_message
+    asyncio.create_task(reprocess_message(message_id))
+    return {"status": "scheduled", "message_id": message_id}
+
+
+@router.post("/pipeline/process-pending")
+async def process_pending_messages(limit: int = Query(10, ge=1, le=100)):
+    """Process all pending (unprocessed) messages."""
+    import asyncio
+    from core.pipeline import process_message
+    from core.database import async_session_factory
+
+    async with async_session_factory() as db:
+        stmt = (
+            select(Message.id)
+            .where(Message.pipeline_status == PipelineStatus.pending)
+            .order_by(Message.created_at)
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        msg_ids = [row[0] for row in result.all()]
+
+    for mid in msg_ids:
+        asyncio.create_task(process_message(mid))
+
+    return {"scheduled": len(msg_ids), "message_ids": msg_ids}
+
+
+@router.get("/pipeline/stats")
+async def pipeline_stats(db: AsyncSession = Depends(get_session)):
+    """Get pipeline processing statistics."""
+    from sqlalchemy import case
+
+    stmt = select(
+        Message.pipeline_status,
+        func.count(Message.id),
+    ).group_by(Message.pipeline_status)
+    result = await db.execute(stmt)
+    breakdown = {row[0] or "pending": row[1] for row in result.all()}
+
+    return {"pipeline_status": breakdown}
+
+
+@router.post("/sessions/lifecycle-check")
+async def run_lifecycle_check():
+    """Manually trigger session lifecycle check."""
+    from core.sessions.lifecycle import run_lifecycle_check
+    counts = await run_lifecycle_check()
+    return counts
+
+
+@router.get("/sessions/{session_id}/status")
+async def get_session_task_status(session_id: int):
+    """Get task progress for a session. NO LLM — pure DB query."""
+    from core.monitor import get_task_status_text
+    text = await get_task_status_text(session_id)
+    return {"session_id": session_id, "status_text": text}
+
+
+@router.get("/conversations")
+async def list_conversations(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    chat_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    """List conversations — pairs of user messages and bot replies."""
+    # Get user messages (not bot replies)
+    query = select(Message).where(Message.sender_id != "bot")
+    count_query = select(func.count(Message.id)).where(Message.sender_id != "bot")
+
+    if chat_id:
+        query = query.where(Message.chat_id == chat_id)
+        count_query = count_query.where(Message.chat_id == chat_id)
+
+    total = (await db.execute(count_query)).scalar() or 0
+    query = query.order_by(desc(Message.created_at)).offset((page - 1) * page_size).limit(page_size)
+    user_msgs = (await db.execute(query)).scalars().all()
+
+    conversations = []
+    for msg in user_msgs:
+        # Find corresponding bot reply
+        reply_stmt = select(Message).where(
+            Message.platform_message_id == f"reply_{msg.platform_message_id}"
+        )
+        reply = (await db.execute(reply_stmt)).scalar_one_or_none()
+
+        conversations.append({
+            "user_message": _message_to_dict(msg),
+            "bot_reply": _message_to_dict(reply) if reply else None,
+            "session_id": msg.session_id,
+        })
+
+    return {"items": conversations, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/conversations/{chat_id}/history")
+async def get_chat_history(
+    chat_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_session),
+):
+    """Get full chat history for a specific chat_id, ordered chronologically."""
+    stmt = (
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(Message.created_at)
+        .limit(limit)
+    )
+    messages = (await db.execute(stmt)).scalars().all()
+    return {
+        "chat_id": chat_id,
+        "messages": [
+            {**_message_to_dict(m), "role": "assistant" if m.sender_id == "bot" else "user"}
+            for m in messages
+        ],
+    }
+
+
+@router.get("/token-usage")
+async def get_token_usage(
+    days: int = Query(7, ge=1, le=90),
+    db: AsyncSession = Depends(get_session),
+):
+    """Get token consumption statistics."""
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+
+    # Total tokens
+    stmt = select(
+        func.sum(AgentRun.input_tokens),
+        func.sum(AgentRun.output_tokens),
+        func.count(AgentRun.id),
+    ).where(AgentRun.started_at >= cutoff)
+    row = (await db.execute(stmt)).one()
+    total_input = row[0] or 0
+    total_output = row[1] or 0
+    total_runs = row[2] or 0
+
+    # Per agent breakdown
+    stmt = select(
+        AgentRun.agent_name,
+        func.sum(AgentRun.input_tokens),
+        func.sum(AgentRun.output_tokens),
+        func.count(AgentRun.id),
+    ).where(AgentRun.started_at >= cutoff).group_by(AgentRun.agent_name)
+    breakdown = (await db.execute(stmt)).all()
+
+    # Daily totals
+    # Use date string grouping for SQLite compatibility
+    stmt = select(
+        func.date(AgentRun.started_at),
+        func.sum(AgentRun.input_tokens),
+        func.sum(AgentRun.output_tokens),
+        func.count(AgentRun.id),
+    ).where(AgentRun.started_at >= cutoff).group_by(func.date(AgentRun.started_at))
+    daily = (await db.execute(stmt)).all()
+
+    return {
+        "period_days": days,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_tokens": total_input + total_output,
+        "total_runs": total_runs,
+        "by_agent": [
+            {"agent": r[0], "input_tokens": r[1] or 0, "output_tokens": r[2] or 0, "runs": r[3]}
+            for r in breakdown
+        ],
+        "daily": [
+            {"date": str(r[0]), "input_tokens": r[1] or 0, "output_tokens": r[2] or 0, "runs": r[3]}
+            for r in daily
+        ],
+    }
+
+
+@router.post("/reports/daily")
+async def generate_daily_report_endpoint(
+    target_date: Optional[str] = None,
+    push_chat_id: str = "",
+):
+    """Manually trigger daily report generation."""
+    from core.reports.daily import generate_daily_report
+    content = await generate_daily_report(
+        target_date=target_date,
+        push_to_feishu=bool(push_chat_id),
+        push_chat_id=push_chat_id,
+    )
+    return {"report": content[:3000]}
+
+
+@router.post("/memory/consolidate")
+async def consolidate_memory_endpoint():
+    """Manually trigger memory consolidation."""
+    from core.memory.consolidator import consolidate_memories
+    result = await consolidate_memories()
+    return result
+
 def _message_to_dict(m: Message) -> dict:
     return {
         "id": m.id,
@@ -348,6 +575,9 @@ def _message_to_dict(m: Message) -> dict:
         "content": m.content,
         "classified_type": m.classified_type,
         "session_id": m.session_id,
+        "pipeline_status": m.pipeline_status,
+        "pipeline_error": m.pipeline_error,
+        "processed_at": m.processed_at.isoformat() if m.processed_at else None,
         "sent_at": m.sent_at.isoformat() if m.sent_at else None,
         "received_at": m.received_at.isoformat() if m.received_at else None,
         "created_at": m.created_at.isoformat() if m.created_at else None,

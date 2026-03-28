@@ -22,6 +22,9 @@ export interface MessageItem {
   content: string
   classified_type: string | null
   session_id: number | null
+  pipeline_status: string
+  pipeline_error: string
+  processed_at: string | null
   sent_at: string | null
   received_at: string | null
   created_at: string | null
@@ -45,6 +48,7 @@ export interface SessionItem {
   needs_manual_review: boolean
   created_at: string | null
   updated_at: string | null
+  summary_content?: string | null
   messages?: (MessageItem & { role: string; sequence_no: number })[]
 }
 
@@ -100,5 +104,29 @@ export const playgroundChat = (
     model,
     stream: false,
   })
+
+// Pipeline APIs
+export const processMessage = (id: number) =>
+  api.post(`/messages/${id}/process`)
+
+export const reprocessMessage = (id: number) =>
+  api.post(`/messages/${id}/reprocess`)
+
+export const processPendingMessages = (limit = 10) =>
+  api.post("/pipeline/process-pending", null, { params: { limit } })
+
+export const fetchPipelineStats = () =>
+  api.get<{ pipeline_status: Record<string, number> }>("/pipeline/stats")
+
+// Conversation APIs
+export const fetchConversations = (page = 1, pageSize = 20) =>
+  api.get("/conversations", { params: { page, page_size: pageSize } })
+
+export const fetchChatHistory = (chatId: string, limit = 50) =>
+  api.get(`/conversations/${chatId}/history`, { params: { limit } })
+
+// Token usage
+export const fetchTokenUsage = (days = 7) =>
+  api.get("/token-usage", { params: { days } })
 
 export default api

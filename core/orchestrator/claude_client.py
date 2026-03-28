@@ -42,6 +42,10 @@ class ClaudeClient:
         try:
             response = await self._client.messages.create(**kwargs)
             text = response.content[0].text if response.content else ""
+            self.last_usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
             logger.info(
                 "Claude API call: model={}, input_tokens={}, output_tokens={}",
                 model, response.usage.input_tokens, response.usage.output_tokens,

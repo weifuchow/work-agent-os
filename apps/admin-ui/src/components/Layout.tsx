@@ -2,6 +2,7 @@ import { NavLink, Outlet } from "react-router-dom"
 import {
   LayoutDashboard,
   MessageSquare,
+  MessagesSquare,
   Layers,
   FlaskConical,
   ScrollText,
@@ -10,6 +11,7 @@ import { cn } from "../lib/utils"
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
+  { to: "/conversations", icon: MessagesSquare, label: "对话记录" },
   { to: "/messages", icon: MessageSquare, label: "消息记录" },
   { to: "/sessions", icon: Layers, label: "工作会话" },
   { to: "/playground", icon: FlaskConical, label: "模型测试" },

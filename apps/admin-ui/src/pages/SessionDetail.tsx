@@ -63,6 +63,16 @@ export default function SessionDetail() {
         </div>
       </div>
 
+      {/* Session Summary */}
+      {sess.summary_content && (
+        <div className="bg-white rounded-xl border border-gray-200 p-5 mb-6">
+          <h3 className="text-sm font-medium text-gray-700 mb-3">会话摘要</h3>
+          <div className="prose prose-sm max-w-none text-gray-700 whitespace-pre-wrap">
+            {sess.summary_content}
+          </div>
+        </div>
+      )}
+
       {/* Messages in this session */}
       <div className="bg-white rounded-xl border border-gray-200 p-5">
         <h3 className="text-sm font-medium text-gray-700 mb-4">会话消息</h3>

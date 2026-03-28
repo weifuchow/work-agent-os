@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import Layout from "./components/Layout"
 import Dashboard from "./pages/Dashboard"
 import Messages from "./pages/Messages"
+import Conversations from "./pages/Conversations"
 import Sessions from "./pages/Sessions"
 import SessionDetail from "./pages/SessionDetail"
 import Playground from "./pages/Playground"
@@ -25,6 +26,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/messages" element={<Messages />} />
+            <Route path="/conversations" element={<Conversations />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/sessions/:id" element={<SessionDetail />} />
             <Route path="/playground" element={<Playground />} />

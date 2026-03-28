@@ -58,6 +58,11 @@ class FeishuClient:
             sender_id = sender.sender_id.open_id if sender.sender_id else ""
             sender_type = sender.sender_type  # user or bot
 
+            # Ignore messages from bots (including self)
+            if sender_type == "bot":
+                logger.debug("Ignoring bot message from {}", sender_id)
+                return
+
             # Parse content
             content = ""
             if message_type == "text":

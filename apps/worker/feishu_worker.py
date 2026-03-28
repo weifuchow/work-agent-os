@@ -14,7 +14,7 @@ import models.db  # noqa: E402, F401
 
 from core.config import settings  # noqa: E402
 from core.connectors.feishu import FeishuClient  # noqa: E402
-from core.connectors.message_service import save_message  # noqa: E402
+from core.connectors.message_service import save_and_process  # noqa: E402
 from core.database import async_session_factory, init_db  # noqa: E402
 from core.logging import setup_logging  # noqa: E402
 from loguru import logger  # noqa: E402
@@ -26,12 +26,12 @@ def on_message(event_data: dict) -> None:
 
 
 async def _async_on_message(event_data: dict) -> None:
-    """Persist message to DB."""
+    """Persist message to DB and trigger processing pipeline."""
     try:
         async with async_session_factory() as session:
-            await save_message(session, event_data)
+            await save_and_process(session, event_data)
     except Exception as e:
-        logger.exception("Failed to save message: {}", e)
+        logger.exception("Failed to save/process message: {}", e)
 
 
 def main():

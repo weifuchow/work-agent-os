@@ -15,6 +15,15 @@ class MessageClassifiedType(str, enum.Enum):
     task_request = "task_request"
 
 
+class PipelineStatus(str, enum.Enum):
+    pending = "pending"
+    classifying = "classifying"
+    routing = "routing"
+    completed = "completed"
+    failed = "failed"
+    skipped = "skipped"  # for noise/chat that don't need routing
+
+
 class SessionStatus(str, enum.Enum):
     open = "open"
     waiting = "waiting"
@@ -61,6 +70,9 @@ class Message(SQLModel, table=True):
     raw_payload: str = Field(default="")
     classified_type: Optional[str] = Field(default=None, max_length=32)
     session_id: Optional[int] = Field(default=None, foreign_key="sessions.id", index=True)
+    pipeline_status: str = Field(default=PipelineStatus.pending, max_length=32)
+    pipeline_error: str = Field(default="")
+    processed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -130,11 +142,15 @@ class AgentRun(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     session_id: Optional[int] = Field(default=None, foreign_key="sessions.id", index=True)
+    message_id: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
     agent_name: str = Field(default="", max_length=64)
     runtime_type: str = Field(default="claude_api", max_length=32)
     input_path: str = Field(default="")
     output_path: str = Field(default="")
     status: str = Field(default=AgentRunStatus.pending, max_length=32)
+    input_tokens: int = Field(default=0)
+    output_tokens: int = Field(default=0)
+    cost_usd: float = Field(default=0.0)
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     error_message: str = Field(default="")

@@ -52,3 +52,16 @@ async def save_message(session: AsyncSession, event_data: dict) -> Message | Non
 
     logger.info("Message saved: id={}, platform_id={}", msg.id, platform_message_id)
     return msg
+
+
+async def save_and_process(session: AsyncSession, event_data: dict) -> Message | None:
+    """Save message and trigger async pipeline processing."""
+    import asyncio
+    from core.pipeline import process_message
+
+    msg = await save_message(session, event_data)
+    if msg:
+        # Schedule pipeline processing as a background task
+        asyncio.create_task(process_message(msg.id))
+        logger.info("Pipeline scheduled for message {}", msg.id)
+    return msg
