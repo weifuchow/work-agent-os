@@ -32,6 +32,11 @@ class SessionStatus(str, enum.Enum):
     archived = "archived"
 
 
+class TaskContextStatus(str, enum.Enum):
+    active = "active"
+    closed = "closed"
+
+
 class TaskStatus(str, enum.Enum):
     open = "open"
     doing = "doing"
@@ -53,6 +58,17 @@ class AgentRunStatus(str, enum.Enum):
 
 
 # ---------- Models ----------
+
+class TaskContext(SQLModel, table=True):
+    __tablename__ = "task_contexts"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str = Field(default="", max_length=256)
+    description: str = Field(default="")
+    status: str = Field(default=TaskContextStatus.active, max_length=32)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
 
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
@@ -90,6 +106,7 @@ class Session(SQLModel, table=True):
     priority: str = Field(default="normal", max_length=32)
     status: str = Field(default=SessionStatus.open, max_length=32)
     parent_session_id: Optional[int] = Field(default=None, foreign_key="sessions.id")
+    task_context_id: Optional[int] = Field(default=None, foreign_key="task_contexts.id", index=True)
     summary_path: str = Field(default="")
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     message_count: int = Field(default=0)

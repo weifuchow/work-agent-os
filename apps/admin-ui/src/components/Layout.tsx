@@ -6,6 +6,7 @@ import {
   Layers,
   FlaskConical,
   ScrollText,
+  Brain,
 } from "lucide-react"
 import { cn } from "../lib/utils"
 
@@ -13,7 +14,8 @@ const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
   { to: "/conversations", icon: MessagesSquare, label: "对话记录" },
   { to: "/messages", icon: MessageSquare, label: "消息记录" },
-  { to: "/sessions", icon: Layers, label: "工作会话" },
+  { to: "/sessions", icon: Layers, label: "任务与会话" },
+  { to: "/memory", icon: Brain, label: "记忆管理" },
   { to: "/playground", icon: FlaskConical, label: "模型测试" },
   { to: "/audit-logs", icon: ScrollText, label: "审计日志" },
 ]

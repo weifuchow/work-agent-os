@@ -1,7 +1,6 @@
 ---
 name: context
 description: 检索并聚合最小必要上下文包（最近消息、摘要、项目知识、个人偏好）
-agent: context
 ---
 
 # Context — 上下文检索

@@ -1,7 +1,6 @@
 ---
 name: intake
 description: 对消息进行分类，判断工作/闲聊/噪音，提取主题和优先级
-agent: intake
 ---
 
 # Intake — 消息分类
@@ -19,19 +18,3 @@ agent: intake
 ## 关联脚本
 
 - `scripts/classify.py` — 批量分类入口，从数据库读取未分类消息并调用 intake agent
-
-## 输出示例
-
-```json
-{
-  "classified_type": "urgent_issue",
-  "topic": "线上订单服务 500 错误",
-  "project": "订单服务",
-  "priority": "high",
-  "urgency": true,
-  "needs_immediate_response": true,
-  "needs_manual_review": false,
-  "summary": "线上订单服务报 500，需要紧急排查",
-  "reason": "明确的线上故障报告"
-}
-```

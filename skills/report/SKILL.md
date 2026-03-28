@@ -1,7 +1,6 @@
 ---
 name: report
 description: 汇总前一日工作会话，生成结构化日报并保存
-agent: report
 ---
 
 # Report — 日报生成
@@ -20,17 +19,6 @@ agent: report
 ## 关联脚本
 
 - `scripts/generate_daily.py` — 手动触发日报生成
-- `scripts/send_report.py` — 通过飞书发送日报给自己
-
-## 日报结构
-
-- 昨日收到的工作问题
-- 已处理问题
-- 待跟进问题
-- 风险与阻塞
-- 新增待办
-- 需要本人介入
-- 可沉淀知识点
 
 ## 定时触发
 

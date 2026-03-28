@@ -11,6 +11,9 @@ from loguru import logger
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     AgentDefinition,
+    HookMatcher,
+    SubagentStopHookInput,
+    HookContext,
     query,
     tool,
     create_sdk_mcp_server,
@@ -145,9 +148,182 @@ async def update_session(input: dict) -> dict[str, Any]:
         return {"error": str(e)}
 
 
+@tool(
+    "route_to_session",
+    "根据 chat_id 和 topic/project 查找或创建工作会话。返回 session_id。",
+    {"type": "object", "properties": {
+        "chat_id": {"type": "string", "description": "飞书 chat_id"},
+        "sender_id": {"type": "string", "description": "发送者 ID"},
+        "message_id": {"type": "integer", "description": "消息 DB ID"},
+        "topic": {"type": "string", "description": "消息主题"},
+        "project": {"type": "string", "description": "涉及的项目"},
+        "priority": {"type": "string", "description": "优先级: high/normal/low"},
+        "summary": {"type": "string", "description": "消息摘要"},
+    }, "required": ["chat_id", "sender_id", "message_id"]},
+)
+async def route_to_session(input: dict) -> dict[str, Any]:
+    """Find or create a session and attach the message to it."""
+    import aiosqlite
+    from datetime import datetime, UTC, timedelta
+
+    db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
+    chat_id = input["chat_id"]
+    project = input.get("project", "")
+    topic = input.get("topic", "")
+    cutoff = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+
+            # Strategy 1: same chat_id + project + active within 2h
+            if project:
+                cursor = await db.execute(
+                    "SELECT id, title, topic, project FROM sessions "
+                    "WHERE source_chat_id = ? AND project = ? AND status IN ('open','waiting') "
+                    "AND last_active_at >= ? ORDER BY last_active_at DESC LIMIT 1",
+                    (chat_id, project, cutoff),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    await _attach_msg_to_session(db, row["id"], input["message_id"])
+                    return {"session_id": row["id"], "title": row["title"], "action": "matched_by_project"}
+
+            # Strategy 2: same chat_id + active window
+            cursor = await db.execute(
+                "SELECT id, title, topic, project FROM sessions "
+                "WHERE source_chat_id = ? AND status IN ('open','waiting') "
+                "AND last_active_at >= ? ORDER BY last_active_at DESC LIMIT 1",
+                (chat_id, cutoff),
+            )
+            row = await cursor.fetchone()
+            if row:
+                await _attach_msg_to_session(db, row["id"], input["message_id"])
+                return {"session_id": row["id"], "title": row["title"], "action": "matched_by_chat"}
+
+            # Strategy 3: create new session
+            now = datetime.now(UTC)
+            timestamp = now.strftime("%Y%m%d_%H%M%S")
+            session_key = f"feishu_{chat_id[:16]}_{timestamp}"
+            title = input.get("summary", "")[:128] or topic[:128] or "新会话"
+
+            await db.execute(
+                "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+                "title, topic, project, priority, status, last_active_at, message_count, "
+                "risk_level, needs_manual_review, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (session_key, "feishu", chat_id, input["sender_id"],
+                 title, topic, project, input.get("priority", "normal"),
+                 "open", now.isoformat(), 0, "low", False, now.isoformat(), now.isoformat()),
+            )
+            await db.commit()
+            cursor = await db.execute("SELECT last_insert_rowid()")
+            session_id = (await cursor.fetchone())[0]
+
+            await _attach_msg_to_session(db, session_id, input["message_id"])
+            return {"session_id": session_id, "title": title, "action": "created_new"}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool(
+    "link_task_context",
+    "将会话关联到任务上下文。查找匹配的已有任务或创建新任务。返回 task_context_id 和 title。",
+    {"type": "object", "properties": {
+        "session_id": {"type": "integer", "description": "会话 ID"},
+        "title": {"type": "string", "description": "会话标题"},
+        "topic": {"type": "string", "description": "会话主题"},
+        "project": {"type": "string", "description": "涉及的项目"},
+        "match_task_id": {"type": "integer", "description": "匹配到的已有任务 ID（如果你判断应该归入已有任务）"},
+        "new_title": {"type": "string", "description": "新任务标题（如果需要创建新任务）"},
+    }, "required": ["session_id"]},
+)
+async def link_task_context(input: dict) -> dict[str, Any]:
+    """Link a session to a task context (existing or new)."""
+    import aiosqlite
+    from datetime import datetime, UTC
+
+    db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
+    session_id = input["session_id"]
+    match_id = input.get("match_task_id")
+
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+
+            # If agent specifies a match, verify and link
+            if match_id:
+                cursor = await db.execute("SELECT id, title FROM task_contexts WHERE id = ?", (match_id,))
+                row = await cursor.fetchone()
+                if row:
+                    await db.execute(
+                        "UPDATE sessions SET task_context_id = ?, updated_at = ? WHERE id = ?",
+                        (match_id, datetime.now(UTC).isoformat(), session_id),
+                    )
+                    await db.execute(
+                        "UPDATE task_contexts SET updated_at = ? WHERE id = ?",
+                        (datetime.now(UTC).isoformat(), match_id),
+                    )
+                    await db.commit()
+                    return {"task_context_id": match_id, "title": row["title"], "action": "linked_existing"}
+
+            # Create new task context
+            now = datetime.now(UTC)
+            title = input.get("new_title") or input.get("title") or input.get("topic") or "未命名任务"
+            await db.execute(
+                "INSERT INTO task_contexts (title, description, status, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (title, "", "active", now.isoformat(), now.isoformat()),
+            )
+            await db.commit()
+            cursor = await db.execute("SELECT last_insert_rowid()")
+            tc_id = (await cursor.fetchone())[0]
+
+            await db.execute(
+                "UPDATE sessions SET task_context_id = ?, updated_at = ? WHERE id = ?",
+                (tc_id, now.isoformat(), session_id),
+            )
+            await db.commit()
+            return {"task_context_id": tc_id, "title": title, "action": "created_new"}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _attach_msg_to_session(db, session_id: int, message_id: int) -> None:
+    """Attach a message to a session (raw aiosqlite)."""
+    from datetime import datetime, UTC
+    now = datetime.now(UTC).isoformat()
+
+    # Get current message_count
+    cursor = await db.execute("SELECT message_count FROM sessions WHERE id = ?", (session_id,))
+    row = await cursor.fetchone()
+    new_count = (row[0] if row else 0) + 1
+
+    # Update session
+    await db.execute(
+        "UPDATE sessions SET message_count = ?, last_active_at = ?, updated_at = ? WHERE id = ?",
+        (new_count, now, now, session_id),
+    )
+
+    # Link message to session
+    await db.execute(
+        "UPDATE messages SET session_id = ? WHERE id = ?",
+        (session_id, message_id),
+    )
+
+    # Create session_message record
+    await db.execute(
+        "INSERT INTO session_messages (session_id, message_id, role, sequence_no, created_at) VALUES (?,?,?,?,?)",
+        (session_id, message_id, "user", new_count, now),
+    )
+    await db.commit()
+
+
 # ==================== MCP Server ====================
 
-CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, read_memory, write_memory, update_session]
+CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, read_memory, write_memory,
+                update_session, route_to_session, link_task_context]
 
 CUSTOM_MCP_SERVER = create_sdk_mcp_server(
     name="work-agent-tools",
@@ -156,6 +332,53 @@ CUSTOM_MCP_SERVER = create_sdk_mcp_server(
 )
 
 CUSTOM_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in CUSTOM_TOOLS]
+
+
+# ==================== Subagent Transcript Hook ====================
+
+async def _on_subagent_stop(
+    hook_input: SubagentStopHookInput,
+    _progress: str | None,
+    _context: HookContext,
+) -> dict:
+    """Capture sub-agent transcripts when they complete."""
+    import aiosqlite
+    from datetime import datetime, UTC
+    from pathlib import Path
+
+    agent_id = hook_input.agent_id
+    agent_type = hook_input.agent_type
+    transcript_path = hook_input.agent_transcript_path
+
+    logger.info("SubagentStop: agent={} type={} transcript={}",
+                agent_id, agent_type, transcript_path)
+
+    # Read transcript if available
+    transcript_content = ""
+    if transcript_path:
+        try:
+            tp = Path(transcript_path)
+            if tp.exists():
+                transcript_content = tp.read_text(encoding="utf-8")[:10000]
+        except Exception as e:
+            logger.warning("Failed to read transcript {}: {}", transcript_path, e)
+
+    # Save to agent_runs table
+    db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            now = datetime.now(UTC).isoformat()
+            await db.execute(
+                "INSERT INTO agent_runs (agent_name, runtime_type, input_path, output_path, "
+                "status, started_at, ended_at) VALUES (?,?,?,?,?,?,?)",
+                (f"subagent:{agent_type}", "agent_sdk", transcript_path or "",
+                 transcript_content[:2000], "success", now, now),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("Failed to save subagent run: {}", e)
+
+    return {"continue_": True}
 
 
 # ==================== Agent Client ====================
@@ -194,6 +417,10 @@ class AgentClient:
             env=self._get_env(),
             # Register all skills as sub-agents
             agents=SKILL_REGISTRY,
+            # Capture sub-agent transcripts
+            hooks={
+                "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],
+            },
         )
 
         # Resume existing session

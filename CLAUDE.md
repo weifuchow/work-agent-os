@@ -4,7 +4,23 @@
 
 ## 项目概述
 
-Personal Work Agent OS — 本地部署的个人工作助理系统。通过飞书接收消息，自动分类、路由到工作会话、分析并回复，定时生成日报。
+Personal Work Agent OS — 本地部署的个人工作助理系统。通过飞书接收消息，由 Orchestrator Agent 自主决策处理方式（分类、路由、分析、回复），定时生成日报。
+
+## 架构
+
+**Agentic 架构** — 所有消息统一进入 Orchestrator Agent，模型自主决定：
+- 调用哪些 skills（intake/context/analysis/reply/report）
+- 是否路由到工作会话（route_to_session tool）
+- 是否关联任务上下文（link_task_context tool）
+- 直接回复还是走完整分析链
+
+```
+消息 → Orchestrator Agent
+         ├── 闲聊 → 直接回复
+         ├── 工作问题 → intake → context → analysis → reply
+         ├── 紧急问题 → 快速回复
+         └── 噪音 → 静默
+```
 
 ## 技术栈
 
@@ -26,34 +42,36 @@ apps/api/          — FastAPI 应用，管理 API
 apps/worker/       — feishu_worker（消息接收）、scheduler（定时任务）
 apps/admin-ui/     — React 管理后台
 core/              — 核心业务逻辑
-  pipeline.py      — 消息处理管线
+  pipeline.py      — Orchestrator Agent 入口（单入口，模型自主决策）
   monitor.py       — 任务进度监控
   connectors/      — 飞书接入、消息服务
-  sessions/        — 路由、摘要、生命周期
-  orchestrator/    — Agent SDK / Claude API 客户端
+  sessions/        — 路由、摘要、生命周期（辅助模块）
+  orchestrator/    — Agent SDK 客户端 + MCP 工具（route_to_session, link_task_context 等）
   reports/         — 日报生成
   memory/          — 长期记忆归档
 models/db.py       — 数据库模型（SQLModel）
-skills/            — Agent 技能定义
+.claude/agents/    — Agent 定义（唯一定义源，被 Agent SDK 加载为子 agent）
+skills/            — Skill 文档 + 辅助脚本
 data/              — 运行时数据（DB、日志、摘要、记忆）
 scripts/           — 初始化和迁移脚本
 ```
 
 ## 关键文件
 
-- `core/pipeline.py` — 消息处理的完整链路：classify → route → analyze → reply
+- `core/pipeline.py` — Orchestrator Agent 入口：消息进来 → agent 自主处理
+- `core/orchestrator/agent_client.py` — Agent SDK 客户端 + 所有 MCP 工具定义
+- `.claude/agents/*.md` — 子 Agent 定义（intake, context, analysis, reply, report）
 - `core/connectors/feishu.py` — 飞书 WebSocket + 消息收发
-- `core/sessions/router.py` — 会话路由匹配逻辑
-- `core/orchestrator/agent_client.py` — Agent SDK 客户端 + MCP 工具定义
 - `models/db.py` — 所有数据库模型和枚举
-- `apps/api/routers/admin.py` — 管理 API（22 个端点）
+- `apps/api/routers/admin.py` — 管理 API
 
 ## 数据库表
 
 - `messages` — 消息（含 pipeline_status、classified_type）
-- `sessions` — 工作会话
+- `sessions` — 工作会话（含 task_context_id）
+- `task_contexts` — 任务上下文（多个 session 归属同一任务）
 - `session_messages` — 会话-消息关联（role: user/assistant）
-- `agent_runs` — Agent 执行记录（含 token 消耗）
+- `agent_runs` — Agent 执行记录（含 token 消耗、子 agent transcript）
 - `audit_logs` — 审计日志
 - `tasks` — 待办任务
 - `reports` — 日报记录
@@ -82,11 +100,12 @@ python scripts/init_db.py
 
 ## 设计原则
 
-1. 进度反馈和监控**不调用 LLM**，用 DB 查询和文件读取
-2. 日报从**实际对话数据**汇总，不凭空生成
-3. 回复通过 **Agent SDK**（有工具执行能力），不是纯文本 LLM
-4. 所有操作写**审计日志**，可追溯
-5. 闲聊也回复（Agent SDK），工作消息走完整管线
+1. **Agentic 架构** — 单入口 Orchestrator，模型自主决策调用哪些 skills
+2. `.claude/agents/*.md` 是子 Agent 的**唯一定义源**，`skills/` 是文档和辅助脚本
+3. 进度反馈和监控**不调用 LLM**，用 DB 查询和文件读取
+4. 日报从**实际对话数据**汇总，不凭空生成
+5. 所有操作写**审计日志**，子 agent transcript 也持久化到 DB
+6. Session 路由和 TaskContext 关联通过 **MCP tool** 暴露给模型，而非硬编码
 
 ## 环境变量
 

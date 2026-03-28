@@ -20,18 +20,14 @@ maxTurns: 3
   "strategy": "auto | draft | silent",
   "reply_content": "回复内容",
   "reason": "策略判断理由",
-  "risk_level": "low | medium | high",
-  "facts": ["回复中的事实部分"],
-  "inferences": ["回复中的推断部分"],
-  "suggestions": ["回复中的建议部分"],
-  "uncertain": ["不确定的部分"]
+  "risk_level": "low | medium | high"
 }
 ```
 
 ## 策略判断标准
 - **auto**（自动回复）：低风险、信息明确的问题
 - **draft**（草稿待确认）：中高风险问题
-- **silent**（不回复仅记录）：噪音、闲聊、暂不适合回应
+- **silent**（不回复仅记录）：噪音、暂不适合回应
 
 ## 高风险事项（必须 draft 或 silent）
 - 承诺排期
@@ -41,6 +37,6 @@ maxTurns: 3
 - 涉及责任归因
 
 ## 注意
-- 回复内容必须区分事实、推断、建议、不确定项
+- 回复内容必须区分事实、推断、建议
 - 如果是 draft，只输出草稿内容，不发送
 - 如果是 silent，说明原因即可

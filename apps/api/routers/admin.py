@@ -1,10 +1,12 @@
 """Admin API routes for the management dashboard."""
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -15,6 +17,7 @@ from core.database import get_session
 from core.orchestrator.claude_client import claude_client
 from models.db import (
     AgentRun, AgentRunStatus, AuditLog, Message, Session, SessionMessage, Task,
+    TaskContext, TaskContextStatus,
     PipelineStatus,
 )
 
@@ -344,6 +347,14 @@ async def delete_agent_session(sid: str):
     return {"success": True}
 
 
+@router.get("/agent/sessions/{sid}/transcript")
+async def get_agent_transcript(sid: str):
+    """Get full transcript for an Agent SDK session (including subagent sidechains)."""
+    from core.orchestrator.agent_client import agent_client
+    messages = await agent_client.get_session_messages(sid)
+    return {"session_id": sid, "messages": messages}
+
+
 # ---------- Pipeline ----------
 
 @router.post("/messages/{message_id}/process")
@@ -563,6 +574,193 @@ async def consolidate_memory_endpoint():
     result = await consolidate_memories()
     return result
 
+
+# ---------- Task Contexts ----------
+
+class TaskContextUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+
+
+@router.get("/task-contexts")
+async def list_task_contexts(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    """List task contexts with their associated sessions."""
+    query = select(TaskContext)
+    count_query = select(func.count(TaskContext.id))
+
+    if status:
+        query = query.where(TaskContext.status == status)
+        count_query = count_query.where(TaskContext.status == status)
+
+    total = (await db.execute(count_query)).scalar() or 0
+    query = query.order_by(desc(TaskContext.updated_at)) \
+        .offset((page - 1) * page_size).limit(page_size)
+    task_contexts = (await db.execute(query)).scalars().all()
+
+    items = []
+    for tc in task_contexts:
+        # Fetch associated sessions
+        sess_stmt = select(Session).where(
+            Session.task_context_id == tc.id
+        ).order_by(desc(Session.last_active_at))
+        sessions = (await db.execute(sess_stmt)).scalars().all()
+
+        items.append({
+            **_task_context_to_dict(tc),
+            "sessions": [_session_to_dict(s) for s in sessions],
+            "session_count": len(sessions),
+        })
+
+    # Also fetch unlinked sessions
+    unlinked_stmt = select(Session).where(
+        Session.task_context_id == None  # noqa: E711
+    ).order_by(desc(Session.last_active_at))
+    unlinked = (await db.execute(unlinked_stmt)).scalars().all()
+
+    return {
+        "items": items,
+        "unlinked_sessions": [_session_to_dict(s) for s in unlinked],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/task-contexts/{task_context_id}")
+async def get_task_context(task_context_id: int, db: AsyncSession = Depends(get_session)):
+    """Get task context detail with all sessions and their messages."""
+    tc = await db.get(TaskContext, task_context_id)
+    if not tc:
+        raise HTTPException(status_code=404, detail="not found")
+
+    sess_stmt = select(Session).where(
+        Session.task_context_id == tc.id
+    ).order_by(desc(Session.last_active_at))
+    sessions = (await db.execute(sess_stmt)).scalars().all()
+
+    sessions_with_messages = []
+    for s in sessions:
+        sm_stmt = select(SessionMessage).where(
+            SessionMessage.session_id == s.id
+        ).order_by(SessionMessage.sequence_no)
+        sms = (await db.execute(sm_stmt)).scalars().all()
+
+        messages = []
+        for sm in sms:
+            msg = await db.get(Message, sm.message_id)
+            if msg:
+                messages.append({**_message_to_dict(msg), "role": sm.role, "sequence_no": sm.sequence_no})
+
+        sessions_with_messages.append({
+            **_session_to_dict(s),
+            "messages": messages,
+        })
+
+    return {
+        **_task_context_to_dict(tc),
+        "sessions": sessions_with_messages,
+        "session_count": len(sessions),
+    }
+
+
+@router.put("/task-contexts/{task_context_id}")
+async def update_task_context(
+    task_context_id: int,
+    body: TaskContextUpdate,
+    db: AsyncSession = Depends(get_session),
+):
+    tc = await db.get(TaskContext, task_context_id)
+    if not tc:
+        raise HTTPException(status_code=404, detail="not found")
+
+    if body.title is not None:
+        tc.title = body.title
+    if body.description is not None:
+        tc.description = body.description
+    if body.status is not None:
+        tc.status = body.status
+    tc.updated_at = datetime.now(UTC)
+    await db.commit()
+    return _task_context_to_dict(tc)
+
+
+# ---------- Memory Files ----------
+
+class MemoryFileUpdate(BaseModel):
+    content: str
+
+
+def _memory_base_dir() -> Path:
+    from core.config import settings
+    return Path(settings.memory_dir)
+
+
+def _validate_memory_path(file_path: str) -> Path:
+    """Validate and resolve a memory file path, preventing traversal."""
+    base = _memory_base_dir().resolve()
+    target = (base / file_path).resolve()
+    if not str(target).startswith(str(base)):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return target
+
+
+@router.get("/memory/files")
+async def list_memory_files():
+    """List all memory files under data/memory/."""
+    base = _memory_base_dir()
+    if not base.exists():
+        return {"files": []}
+
+    files = []
+    for p in sorted(base.rglob("*.md")):
+        rel = p.relative_to(base)
+        parts = rel.parts
+        category = parts[0] if len(parts) > 1 else "general"
+        stat = p.stat()
+        files.append({
+            "path": str(rel).replace("\\", "/"),
+            "category": category,
+            "name": p.stem,
+            "size": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+        })
+    return {"files": files}
+
+
+@router.get("/memory/files/{file_path:path}")
+async def read_memory_file(file_path: str):
+    """Read a memory file's content."""
+    target = _validate_memory_path(file_path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    content = target.read_text(encoding="utf-8")
+    return {"path": file_path, "content": content}
+
+
+@router.put("/memory/files/{file_path:path}")
+async def update_memory_file(file_path: str, body: MemoryFileUpdate):
+    """Update or create a memory file."""
+    target = _validate_memory_path(file_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body.content, encoding="utf-8")
+    return {"path": file_path, "size": len(body.content.encode("utf-8"))}
+
+
+@router.delete("/memory/files/{file_path:path}")
+async def delete_memory_file(file_path: str):
+    """Delete a memory file."""
+    target = _validate_memory_path(file_path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    target.unlink()
+    return {"deleted": file_path}
+
 def _message_to_dict(m: Message) -> dict:
     return {
         "id": m.id,
@@ -601,8 +799,20 @@ def _session_to_dict(s: Session) -> dict:
         "message_count": s.message_count,
         "risk_level": s.risk_level,
         "needs_manual_review": s.needs_manual_review,
+        "task_context_id": s.task_context_id,
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
+def _task_context_to_dict(tc: TaskContext) -> dict:
+    return {
+        "id": tc.id,
+        "title": tc.title,
+        "description": tc.description,
+        "status": tc.status,
+        "created_at": tc.created_at.isoformat() if tc.created_at else None,
+        "updated_at": tc.updated_at.isoformat() if tc.updated_at else None,
     }
 
 

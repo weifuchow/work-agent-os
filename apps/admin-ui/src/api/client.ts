@@ -46,10 +46,38 @@ export interface SessionItem {
   message_count: number
   risk_level: string
   needs_manual_review: boolean
+  task_context_id: number | null
   created_at: string | null
   updated_at: string | null
   summary_content?: string | null
   messages?: (MessageItem & { role: string; sequence_no: number })[]
+}
+
+export interface TaskContextItem {
+  id: number
+  title: string
+  description: string
+  status: string
+  created_at: string | null
+  updated_at: string | null
+  sessions?: SessionItem[]
+  session_count?: number
+}
+
+export interface TaskContextListResponse {
+  items: TaskContextItem[]
+  unlinked_sessions: SessionItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface MemoryFile {
+  path: string
+  category: string
+  name: string
+  size: number
+  modified_at: string
 }
 
 export interface AuditLogItem {
@@ -128,5 +156,28 @@ export const fetchChatHistory = (chatId: string, limit = 50) =>
 // Token usage
 export const fetchTokenUsage = (days = 7) =>
   api.get("/token-usage", { params: { days } })
+
+// Task Contexts
+export const fetchTaskContexts = (page = 1, pageSize = 20, status?: string) =>
+  api.get<TaskContextListResponse>("/task-contexts", { params: { page, page_size: pageSize, status } })
+
+export const fetchTaskContext = (id: number) =>
+  api.get<TaskContextItem>(`/task-contexts/${id}`)
+
+export const updateTaskContext = (id: number, data: { title?: string; description?: string; status?: string }) =>
+  api.put(`/task-contexts/${id}`, data)
+
+// Memory Files
+export const fetchMemoryFiles = () =>
+  api.get<{ files: MemoryFile[] }>("/memory/files")
+
+export const fetchMemoryFile = (path: string) =>
+  api.get<{ path: string; content: string }>(`/memory/files/${path}`)
+
+export const updateMemoryFile = (path: string, content: string) =>
+  api.put(`/memory/files/${path}`, { content })
+
+export const deleteMemoryFile = (path: string) =>
+  api.delete(`/memory/files/${path}`)
 
 export default api
