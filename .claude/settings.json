@@ -9,6 +9,9 @@
       "Bash(python -c \":*)",
       "Read(//c/Users/Standard/AppData/Local/Programs/Python/Python313/Lib/site-packages/claude_agent_sdk/**)",
       "Bash(find . -name *.md -o -name SKILL* -o -name skill*)"
+    ],
+    "additionalDirectories": [
+      "d:\\standard\\work-agent-os\\.claude\\agents"
     ]
   }
 }
