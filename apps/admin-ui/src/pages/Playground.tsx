@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { playgroundChat, type PlaygroundMessage } from "../api/client"
+import { fetchModels, playgroundChat, type ModelOption, type PlaygroundMessage } from "../api/client"
 import { Send, Loader2, Settings, Bot, MessageSquare, Wrench, RotateCcw } from "lucide-react"
 import { cn } from "../lib/utils"
 import axios from "axios"
@@ -21,7 +21,7 @@ export default function Playground() {
   const [chatItems, setChatItems] = useState<ChatItem[]>([])
   const [input, setInput] = useState("")
   const [systemPrompt, setSystemPrompt] = useState("")
-  const [model, setModel] = useState("claude-sonnet-4-6")
+  const [model, setModel] = useState("")
   const [mode, setMode] = useState<"chat" | "agent">("chat")
   const [skill, setSkill] = useState<string>("")
   const [maxTurns, setMaxTurns] = useState(30)
@@ -31,12 +31,27 @@ export default function Playground() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
+  const { data: modelsData } = useQuery({
+    queryKey: ["models"],
+    queryFn: () => fetchModels().then((r) => r.data),
+    enabled: mode === "chat",
+  })
+  const modelOptions: ModelOption[] = (modelsData?.models ?? []).filter((item) => item.enabled && item.supports_chat)
+  const defaultModel = modelsData?.default ?? ""
+  const fallbackModel = modelsData?.fallback ?? ""
+
   // Fetch available skills
   const { data: skillsData } = useQuery({
     queryKey: ["skills"],
     queryFn: () => axios.get<{ skills: SkillInfo[] }>("/api/agent/skills").then((r) => r.data.skills),
     enabled: mode === "agent",
   })
+
+  useEffect(() => {
+    if (defaultModel && !model) {
+      setModel(defaultModel)
+    }
+  }, [defaultModel, model])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -253,8 +268,13 @@ export default function Playground() {
                 onChange={(e) => setModel(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm"
               >
-                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                <option value="claude-opus-4-6">Claude Opus 4.6</option>
+                {modelOptions.map((modelOption) => (
+                  <option key={modelOption.id} value={modelOption.id}>
+                    {modelOption.label} [{modelOption.provider}]
+                    {modelOption.id === defaultModel ? " (default)" : ""}
+                    {modelOption.id === fallbackModel ? " (fallback)" : ""}
+                  </option>
+                ))}
               </select>
             </div>
           )}

@@ -19,10 +19,18 @@ from core.database import async_session_factory, init_db  # noqa: E402
 from core.logging import setup_logging  # noqa: E402
 from loguru import logger  # noqa: E402
 
+# Reference to the main event loop, set in main() before WS starts.
+_main_loop: asyncio.AbstractEventLoop | None = None
+
 
 def on_message(event_data: dict) -> None:
-    """Sync callback from Feishu WS — schedule async save."""
-    asyncio.get_event_loop().create_task(_async_on_message(event_data))
+    """Sync callback from Feishu WS — thread-safely schedule async save."""
+    if _main_loop is None or _main_loop.is_closed():
+        logger.error("Main event loop not available, dropping message")
+        return
+    _main_loop.call_soon_threadsafe(
+        _main_loop.create_task, _async_on_message(event_data)
+    )
 
 
 async def _async_on_message(event_data: dict) -> None:
@@ -44,9 +52,25 @@ def main():
     # Init DB first
     asyncio.run(init_db())
 
+    # Create and hold the main event loop so WS callbacks can schedule tasks.
+    global _main_loop
+    _main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_main_loop)
+
     logger.info("Starting Feishu WebSocket worker...")
     client = FeishuClient(on_message=on_message)
-    client.start_ws()  # Blocks
+
+    # start_ws() blocks on its own thread; run the asyncio loop alongside it.
+    import threading
+    ws_thread = threading.Thread(target=client.start_ws, daemon=True)
+    ws_thread.start()
+
+    try:
+        _main_loop.run_forever()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Feishu worker stopped")
+    finally:
+        _main_loop.close()
 
 
 if __name__ == "__main__":

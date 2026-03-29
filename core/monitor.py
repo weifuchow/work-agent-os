@@ -12,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import async_session_factory
 from models.db import AgentRun, AgentRunStatus, AuditLog, Message, PipelineStatus, Session
 
+# Maximum auto-retries before giving up and marking the message failed.
+MAX_STUCK_RETRIES = 3
+
 
 async def check_running_tasks() -> dict:
     """Check all running tasks and send Feishu progress updates.
@@ -125,11 +128,39 @@ async def get_task_status_text(session_id: int) -> str:
 
 
 async def _notify_stuck(msg: Message) -> None:
-    """Notify about a stuck message via Feishu. No LLM."""
+    """Notify about a stuck message via Feishu and auto-retry with cap. No LLM."""
+    # Parse retry count from pipeline_error field
+    retry_count = 0
+    if msg.pipeline_error and msg.pipeline_error.startswith("auto-retry"):
+        # Format: "auto-retry #N after stuck"
+        try:
+            retry_count = int(msg.pipeline_error.split("#")[1].split(" ")[0])
+        except (IndexError, ValueError):
+            retry_count = 1  # at least one prior retry if prefix exists
+
+    if retry_count >= MAX_STUCK_RETRIES:
+        # Give up — mark as failed
+        try:
+            from core.connectors.feishu import FeishuClient
+            client = FeishuClient()
+            text = f"❌ 消息 #{msg.id} 处理失败（重试 {retry_count} 次后放弃）"
+            client.send_message(receive_id=msg.chat_id, content=text)
+        except Exception as e:
+            logger.warning("Failed to notify stuck message: {}", e)
+
+        async with async_session_factory() as db:
+            m = await db.get(Message, msg.id)
+            if m:
+                m.pipeline_status = PipelineStatus.failed
+                m.pipeline_error = f"exceeded max retries ({MAX_STUCK_RETRIES})"
+                m.processed_at = datetime.now(UTC)
+                await db.commit()
+        return
+
     try:
         from core.connectors.feishu import FeishuClient
         client = FeishuClient()
-        text = f"⚠️ 消息 #{msg.id} 处理卡住（{msg.pipeline_status}），正在重试..."
+        text = f"⚠️ 消息 #{msg.id} 处理卡住（{msg.pipeline_status}），正在重试（{retry_count + 1}/{MAX_STUCK_RETRIES}）..."
         client.send_message(receive_id=msg.chat_id, content=text)
     except Exception as e:
         logger.warning("Failed to notify stuck message: {}", e)
@@ -139,7 +170,7 @@ async def _notify_stuck(msg: Message) -> None:
         m = await db.get(Message, msg.id)
         if m and m.pipeline_status not in (PipelineStatus.completed, PipelineStatus.skipped):
             m.pipeline_status = PipelineStatus.pending
-            m.pipeline_error = "auto-retry after stuck"
+            m.pipeline_error = f"auto-retry #{retry_count + 1} after stuck"
             await db.commit()
 
             import asyncio

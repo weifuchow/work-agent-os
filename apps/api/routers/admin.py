@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import load_models_config, settings
 from core.database import get_session
 from core.orchestrator.claude_client import claude_client
 from models.db import (
@@ -36,7 +37,7 @@ class PaginatedResponse(BaseModel):
 class PlaygroundRequest(BaseModel):
     messages: list[dict]
     system: str = ""
-    model: str = "claude-sonnet-4-6"
+    model: str | None = None
     max_tokens: int = 4096
     stream: bool = False
 
@@ -197,6 +198,11 @@ async def get_stats(db: AsyncSession = Depends(get_session)):
         "audit_logs": audit_count,
         "classification": {(row[0] or "unclassified"): row[1] for row in classified},
     }
+
+
+@router.get("/models")
+async def list_models():
+    return load_models_config()
 
 
 # ---------- Playground ----------
@@ -462,7 +468,7 @@ async def list_conversations(
         # Find corresponding bot reply
         reply_stmt = select(Message).where(
             Message.platform_message_id == f"reply_{msg.platform_message_id}"
-        )
+        ).order_by(desc(Message.created_at)).limit(1)
         reply = (await db.execute(reply_stmt)).scalar_one_or_none()
 
         conversations.append({
@@ -688,6 +694,38 @@ async def update_task_context(
     tc.updated_at = datetime.now(UTC)
     await db.commit()
     return _task_context_to_dict(tc)
+
+
+# ---------- Projects ----------
+
+@router.get("/projects")
+async def list_projects_endpoint():
+    """List all registered projects from data/projects.yaml."""
+    from core.projects import get_projects, merge_skills
+    from skills import SKILL_REGISTRY
+
+    projects = get_projects()
+    result = []
+    for p in projects:
+        merged = merge_skills(SKILL_REGISTRY, p.path)
+        project_only = [k for k in merged if k not in SKILL_REGISTRY]
+        result.append({
+            "name": p.name,
+            "path": str(p.path),
+            "description": p.description,
+            "path_exists": p.path.exists(),
+            "has_skills": bool(project_only),
+            "skills": project_only,
+        })
+    return {"projects": result}
+
+
+@router.post("/projects/refresh")
+async def refresh_projects_endpoint():
+    """Reload projects.yaml from disk (clears cache)."""
+    from core.projects import refresh_projects
+    projects = refresh_projects()
+    return {"refreshed": len(projects), "projects": [p.name for p in projects]}
 
 
 # ---------- Memory Files ----------

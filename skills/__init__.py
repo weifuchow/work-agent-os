@@ -1,16 +1,12 @@
-"""Skill registry — discovers agent definitions from .claude/agents/*.md.
-
-Agent definitions (.claude/agents/*.md) are the single source of truth.
-SKILL.md files under skills/ are documentation only.
-"""
+"""Skill registry — discovers skills from .claude/agents/*.md."""
 
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import AgentDefinition
 
-SKILLS_DIR = Path(__file__).resolve().parent
-AGENTS_DIR = SKILLS_DIR.parent / ".claude" / "agents"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_AGENTS_DIR = PROJECT_ROOT / ".claude" / "agents"
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -55,41 +51,65 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
-def discover_skills() -> tuple[dict[str, AgentDefinition], dict[str, str]]:
-    """Discover all agent definitions from .claude/agents/*.md.
+def _load_from_md(md_file: Path) -> tuple[str, AgentDefinition, str] | None:
+    """Load a single agent definition from a markdown file with frontmatter.
+
+    Returns (name, AgentDefinition, description) or None on failure.
+    """
+    try:
+        text = md_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    meta, body = _parse_frontmatter(text)
+    if not body:
+        return None
+
+    name = meta.get("name", md_file.stem)
+    description = meta.get("description", "")
+    tools = meta.get("tools") if isinstance(meta.get("tools"), list) else None
+    max_turns = meta.get("maxTurns")
+    model = meta.get("model")
+
+    definition = AgentDefinition(
+        description=description,
+        prompt=body,
+        tools=tools,
+        maxTurns=max_turns,
+        model=model,
+    )
+    return name, definition, description
+
+
+def discover_skills(
+    agents_dir: Path | None = None,
+) -> tuple[dict[str, AgentDefinition], dict[str, str]]:
+    """Discover skills from .claude/agents/*.md.
+
+    Args:
+        agents_dir: Directory to scan. Defaults to project's .claude/agents/.
 
     Returns:
         (SKILL_REGISTRY, SKILL_DESCRIPTIONS)
     """
+    target_dir = agents_dir or DEFAULT_AGENTS_DIR
     registry: dict[str, AgentDefinition] = {}
     descriptions: dict[str, str] = {}
 
-    if not AGENTS_DIR.exists():
+    if not target_dir.exists():
         return registry, descriptions
 
-    for md_file in sorted(AGENTS_DIR.glob("*.md")):
-        text = md_file.read_text(encoding="utf-8")
-        meta, body = _parse_frontmatter(text)
-
-        name = meta.get("name", md_file.stem)
-        description = meta.get("description", "")
-        tools = meta.get("tools") if isinstance(meta.get("tools"), list) else None
-        max_turns = meta.get("maxTurns")
-        model = meta.get("model")
-
-        definition = AgentDefinition(
-            description=description,
-            prompt=body,
-            tools=tools,
-            maxTurns=max_turns,
-            model=model,
-        )
-
-        registry[name] = definition
-        descriptions[name] = description
+    for md_file in sorted(target_dir.glob("*.md")):
+        if not md_file.is_file():
+            continue
+        result = _load_from_md(md_file)
+        if result:
+            name, defn, desc = result
+            registry[name] = defn
+            descriptions[name] = desc
 
     return registry, descriptions
 
 
-# Auto-discover on import
+# Auto-discover on import (global skills from .claude/agents/)
 SKILL_REGISTRY, SKILL_DESCRIPTIONS = discover_skills()

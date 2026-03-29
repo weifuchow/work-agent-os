@@ -107,6 +107,8 @@ class Session(SQLModel, table=True):
     status: str = Field(default=SessionStatus.open, max_length=32)
     parent_session_id: Optional[int] = Field(default=None, foreign_key="sessions.id")
     task_context_id: Optional[int] = Field(default=None, foreign_key="task_contexts.id", index=True)
+    # Agent SDK session ID — used to resume multi-turn conversations
+    agent_session_id: Optional[str] = Field(default=None, max_length=256)
     summary_path: str = Field(default="")
     last_active_at: datetime = Field(default_factory=datetime.utcnow)
     message_count: int = Field(default=0)

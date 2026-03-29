@@ -204,36 +204,60 @@ cd apps/admin-ui && npm install && npm run dev
 | 记忆归档 | 每 6 小时 | 1 次/批 |
 | 日报 | 每天 8:00 | 1 次 |
 
+## 已完成修复
+
+### P0 修复
+
+| 修复 | 说明 |
+|------|------|
+| **JSON 解析增强** | `_parse_result` 使用平衡括号匹配 + `action` 字段校验，不再误取嵌套 JSON；fallback 不再将原始文本当回复内容 |
+| **回复保存与发送统一** | 新增 `save_bot_reply` MCP tool，agent 发送飞书消息后直接保存到 DB，支持 upsert 防重复 |
+| **agent_session_id 绑定** | sessions 表新增 `agent_session_id` 字段，pipeline 完成后自动写入，为 Phase 6 session resume 做准备 |
+
+### P1 修复
+
+| 修复 | 说明 |
+|------|------|
+| **日报推送启用** | `daily_report_job` 从 `settings.feishu_report_chat_id` 读取推送目标，配置后自动发送 |
+| **失败自动重试** | monitor 卡住消息重试上限 3 次，超限标记 failed 并发飞书告警，不再无限循环 |
+
+### P2 修复
+
+| 修复 | 说明 |
+|------|------|
+| **健康检查增强** | `/health` 端点检查 DB 连接并返回消息计数，返回 ok/degraded 状态 |
+| **路径绝对化** | `config.py` 所有 data 路径基于项目根目录，`database.py` 使用绝对路径，不再依赖 CWD |
+| **事件循环修复** | `feishu_worker` 使用 `call_soon_threadsafe` 跨线程调度；`scheduler` 使用 `new_event_loop()` |
+
+---
+
 ## 现有不足与下阶段计划
 
-### 问题分析
+### 剩余问题
 
 #### P0 — 架构缺陷（影响核心流程）
 
 | 问题 | 现状 | 影响 |
 |------|------|------|
 | **每条消息独立处理，无多轮对话** | 每条飞书消息触发独立的 orchestrator agent 调用，上下文不连续 | 用户连续追问时 agent 不知道之前聊了什么 |
-| **Agent SDK session 未复用** | 每次 `agent_client.run()` 创建新 session，不传 `session_id` 恢复 | 工具调用历史、推理上下文全部丢失 |
-| **orchestrator 输出解析脆弱** | 依赖模型最终输出严格 JSON，但模型可能先输出文字再输出 JSON | 分类/session_id 等元数据提取失败率高 |
-| **回复保存与发送分离** | orchestrator 通过 `send_feishu_message` tool 发送，但 pipeline 又自己 `_save_reply` | 可能出现已发送但未入库，或重复发送 |
+| **Agent SDK session 未复用** | `agent_session_id` 已绑定到 DB session，但 pipeline 尚未传 resume 参数 | 工具调用历史、推理上下文仍然丢失 |
+| **orchestrator 元数据依赖输出 JSON** | 分类/session_id 仍从模型最终输出解析，非通过 tool 写入 | 解析失败时元数据丢失 |
 
 #### P1 — 功能缺失（影响实用性）
 
 | 问题 | 现状 | 影响 |
 |------|------|------|
-| **日报不推送** | `daily_report_job` 中 `push_to_feishu=False` 硬编码 | 日报只生成文件，不发飞书 |
 | **飞书只支持纯文本** | `send_message` 发纯文本，不支持卡片/Markdown | 回复格式差，没有结构化展示 |
 | **记忆归档仍用 claude_client.chat** | `consolidator.py` 直接调 Claude API，没走 agent 架构 | 与 agentic 架构不一致，且无法用工具 |
 | **会话摘要仍用 claude_client.chat** | `summary.py` 直接调 Claude API | 同上 |
 | **管理后台无搜索/筛选** | 消息/会话列表只有分页，无搜索 | 数据多了以后找不到东西 |
-| **无错误恢复机制** | agent 调用失败后只记录错误，不重试 | 偶发的 API 超时导致消息永久失败 |
+| **草稿回复无法发送** | draft 消息保存到 DB 但无审批发送机制 | 草稿功能形同虚设 |
 
 #### P2 — 运维缺陷
 
 | 问题 | 现状 | 影响 |
 |------|------|------|
 | **三个进程独立启动** | feishu_worker、scheduler、API 分别启动 | 运维复杂，容易漏启 |
-| **无健康检查** | API 没有 `/health` 端点 | 无法做进程守护和监控 |
 | **Token 消耗无告警** | 只记录不告警 | 模型异常循环时烧钱无感知 |
 | **无数据备份** | SQLite 文件无自动备份 | 数据丢失风险 |
 
@@ -241,15 +265,15 @@ cd apps/admin-ui && npm install && npm run dev
 
 ### 下阶段计划
 
-#### Phase 6: 多轮对话与 Agent Session 管理
+#### Phase 6: 多轮对话与 Agent Session Resume
 
-**目标**: 解决 P0 问题，让 orchestrator 能在同一个 Agent SDK session 中持续对话。
+**目标**: 解决 P0 核心问题，让 orchestrator 在同一个 Agent SDK session 中持续对话。
 
-- [ ] 将 DB session 与 Agent SDK session 绑定（sessions 表加 `agent_session_id` 字段）
-- [ ] 消息路由到已有 session 时，用 `resume=agent_session_id` 恢复 agent 上下文
+- [ ] pipeline 调用 `agent_client.run()` 时传入 `session_id=session.agent_session_id` 恢复上下文
 - [ ] 新 session 首次创建 agent session，后续消息 resume 同一个
-- [ ] orchestrator 元数据（分类、session_id）改为通过 MCP tool 写入，不依赖输出 JSON 解析
-- [ ] 新增 `save_bot_reply` MCP tool，让 agent 自己保存回复到 DB，避免 pipeline 重复处理
+- [ ] 新增 `update_message_metadata` MCP tool，agent 通过 tool 写入分类和 session_id，不依赖输出 JSON
+- [ ] pipeline 优先读 DB 中 agent 写入的元数据，JSON 解析作为 fallback
+- [ ] 测试多轮对话场景：连续追问、话题切换、session 超时重建
 
 #### Phase 7: 飞书消息增强
 
@@ -258,27 +282,25 @@ cd apps/admin-ui && npm install && npm run dev
 - [ ] 支持飞书卡片消息（Interactive Card）回复
 - [ ] 回复中区分：正文、分析过程、风险提示（用卡片分块展示）
 - [ ] 支持图片/文件消息接收（存储到 data/files/，内容描述传给 agent）
-- [ ] 日报推送 chat_id 从配置/记忆读取，启用自动推送
-- [ ] 草稿消息支持飞书卡片确认按钮（approve/reject）
+- [ ] 草稿消息支持飞书卡片确认按钮（approve/reject → 发送或丢弃）
 
 #### Phase 8: 管理后台增强
 
-**目标**: 让管理后台真正可用。
+**目标**: 让管理后台真正可用于日常监控和运营。
 
 - [ ] 消息/会话列表增加搜索（关键词、发送者、时间范围）
-- [ ] Dashboard 增加 Token 消耗折线图（按天）
-- [ ] Dashboard 增加消息分类饼图
+- [ ] Dashboard 增加 Token 消耗折线图（按天）+ 消息分类饼图
 - [ ] 任务上下文详情页：展开每个 session 的完整对话流
 - [ ] 手动修正消息分类和会话归属
 - [ ] 日报预览和在线编辑
+- [ ] 草稿消息审批界面
 
 #### Phase 9: 稳定性与运维
 
 **目标**: 生产可用。
 
 - [ ] Docker Compose 一键部署（feishu_worker + scheduler + API + admin-ui）
-- [ ] API 增加 `/health` 端点（检查 DB 连接 + 飞书 WS 状态）
 - [ ] Token 消耗日预算告警（超阈值飞书推送）
-- [ ] pipeline 失败自动重试（指数退避，最多 3 次）
 - [ ] SQLite 每日自动备份到 data/backup/
 - [ ] 日志轮转配置
+- [ ] 将 consolidator.py 和 summary.py 迁移到 Agent SDK 架构（复用 skills 而非直接调 claude_client）

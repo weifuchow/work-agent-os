@@ -1,70 +1,223 @@
-"""Claude API client wrapper using Anthropic SDK."""
+"""LLM client wrapper with multi-provider model routing."""
 
 from collections.abc import AsyncIterator
-from typing import Optional
+from typing import Any, Optional
 
 import anthropic
 from loguru import logger
 
-from core.config import settings
+from core.config import load_models_config, settings
+
+try:
+    from openai import AsyncOpenAI
+except ImportError:  # pragma: no cover - optional dependency until installed
+    AsyncOpenAI = None
 
 
 class ClaudeClient:
-    """Async wrapper around Anthropic Messages API."""
+    """Async wrapper around configured LLM providers."""
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
-        kwargs: dict = {}
-        # Support both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN
+        anthropic_kwargs: dict[str, Any] = {}
         key = api_key or settings.anthropic_api_key or settings.anthropic_auth_token
         if key:
-            kwargs["api_key"] = key
+            anthropic_kwargs["api_key"] = key
         url = base_url or settings.anthropic_base_url
         if url:
-            kwargs["base_url"] = url
-        self._client = anthropic.AsyncAnthropic(**kwargs)
+            anthropic_kwargs["base_url"] = url
+        self._anthropic = anthropic.AsyncAnthropic(**anthropic_kwargs)
 
-    async def chat(
+        self._openai = None
+        if AsyncOpenAI is not None and settings.openai_api_key:
+            openai_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
+            if settings.openai_base_url:
+                openai_kwargs["base_url"] = settings.openai_base_url
+            self._openai = AsyncOpenAI(**openai_kwargs)
+
+    def _models_config(self) -> dict[str, Any]:
+        return load_models_config()
+
+    def _resolve_model(self, model: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        config = self._models_config()
+        selected_id = model or config.get("default")
+        if not selected_id:
+            raise ValueError("No default model configured in data/models.yaml")
+
+        models = [item for item in config.get("models", []) if item.get("enabled", True)]
+        match = next((item for item in models if item.get("id") == selected_id), None)
+        if not match:
+            raise ValueError(f"Model '{selected_id}' is not enabled in data/models.yaml")
+        return match, config
+
+    async def _create_anthropic_message(
         self,
+        *,
         messages: list[dict],
-        system: str = "",
-        model: str = "claude-sonnet-4-6",
-        max_tokens: int = 4096,
-    ) -> str:
-        """Send messages and return the full response text."""
-        kwargs: dict = {
-            "model": model,
+        system: str,
+        model_id: str,
+        max_tokens: int,
+    ):
+        kwargs: dict[str, Any] = {
+            "model": model_id,
             "max_tokens": max_tokens,
             "messages": messages,
         }
         if system:
             kwargs["system"] = system
+        response = await self._anthropic.messages.create(**kwargs)
+        return response, model_id
+
+    async def _create_openai_message(
+        self,
+        *,
+        messages: list[dict],
+        system: str,
+        model_id: str,
+        max_tokens: int,
+    ):
+        if self._openai is None:
+            raise RuntimeError("OpenAI client is not configured. Install openai and set OPENAI_API_KEY.")
+
+        openai_messages: list[dict[str, Any]] = []
+        if system:
+            openai_messages.append({"role": "system", "content": system})
+        openai_messages.extend(messages)
+
+        response = await self._openai.chat.completions.create(
+            model=model_id,
+            messages=openai_messages,
+            max_completion_tokens=max_tokens,
+        )
+        return response, model_id
+
+    async def _create_message(
+        self,
+        *,
+        messages: list[dict],
+        system: str,
+        model: str | None,
+        max_tokens: int,
+    ):
+        selected_model, config = self._resolve_model(model)
+        provider = selected_model["provider"]
+        model_id = selected_model["id"]
 
         try:
-            response = await self._client.messages.create(**kwargs)
-            text = response.content[0].text if response.content else ""
+            if provider == "anthropic":
+                return await self._create_anthropic_message(
+                    messages=messages,
+                    system=system,
+                    model_id=model_id,
+                    max_tokens=max_tokens,
+                )
+            if provider == "openai":
+                return await self._create_openai_message(
+                    messages=messages,
+                    system=system,
+                    model_id=model_id,
+                    max_tokens=max_tokens,
+                )
+            raise ValueError(f"Unsupported model provider '{provider}'")
+        except anthropic.APIStatusError as e:
+            fallback_id = config.get("fallback")
+            should_fallback = (
+                provider == "anthropic"
+                and e.status_code in {429, 500, 529}
+                and fallback_id
+                and fallback_id != model_id
+            )
+            if not should_fallback:
+                raise
+
+            fallback_model, _ = self._resolve_model(fallback_id)
+            if fallback_model["provider"] != "anthropic":
+                raise
+
+            logger.warning(
+                "LLM call failed on model={}, status_code={}, retrying with fallback={}",
+                model_id,
+                e.status_code,
+                fallback_id,
+            )
+            return await self._create_anthropic_message(
+                messages=messages,
+                system=system,
+                model_id=fallback_id,
+                max_tokens=max_tokens,
+            )
+
+    async def chat(
+        self,
+        messages: list[dict],
+        system: str = "",
+        model: str | None = None,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Send messages and return the full response text."""
+        try:
+            response, used_model = await self._create_message(
+                messages=messages,
+                system=system,
+                model=model,
+                max_tokens=max_tokens,
+            )
+
+            if hasattr(response, "content"):
+                text = response.content[0].text if response.content else ""
+                input_tokens = response.usage.input_tokens
+                output_tokens = response.usage.output_tokens
+            else:
+                text = response.choices[0].message.content or ""
+                input_tokens = response.usage.prompt_tokens if response.usage else 0
+                output_tokens = response.usage.completion_tokens if response.usage else 0
+
             self.last_usage = {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "model": used_model,
             }
             logger.info(
-                "Claude API call: model={}, input_tokens={}, output_tokens={}",
-                model, response.usage.input_tokens, response.usage.output_tokens,
+                "LLM API call: model={}, input_tokens={}, output_tokens={}",
+                used_model, input_tokens, output_tokens,
             )
             return text
         except Exception as e:
-            logger.exception("Claude API error: {}", e)
+            logger.exception("LLM API error: {}", e)
             raise
 
     async def chat_stream(
         self,
         messages: list[dict],
         system: str = "",
-        model: str = "claude-sonnet-4-6",
+        model: str | None = None,
         max_tokens: int = 4096,
     ) -> AsyncIterator[str]:
         """Stream response text chunks."""
-        kwargs: dict = {
-            "model": model,
+        selected_model, config = self._resolve_model(model)
+        provider = selected_model["provider"]
+        model_id = selected_model["id"]
+
+        if provider == "openai":
+            if self._openai is None:
+                raise RuntimeError("OpenAI client is not configured. Install openai and set OPENAI_API_KEY.")
+            openai_messages: list[dict[str, Any]] = []
+            if system:
+                openai_messages.append({"role": "system", "content": system})
+            openai_messages.extend(messages)
+            stream = await self._openai.chat.completions.create(
+                model=model_id,
+                messages=openai_messages,
+                max_completion_tokens=max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    yield delta
+            return
+
+        kwargs: dict[str, Any] = {
+            "model": model_id,
             "max_tokens": max_tokens,
             "messages": messages,
         }
@@ -72,11 +225,37 @@ class ClaudeClient:
             kwargs["system"] = system
 
         try:
-            async with self._client.messages.stream(**kwargs) as stream:
+            async with self._anthropic.messages.stream(**kwargs) as stream:
+                async for text in stream.text_stream:
+                    yield text
+        except anthropic.APIStatusError as e:
+            fallback_id = config.get("fallback")
+            should_fallback = (
+                e.status_code in {429, 500, 529}
+                and fallback_id
+                and fallback_id != model_id
+            )
+            if not should_fallback:
+                logger.exception("LLM API stream error: {}", e)
+                raise
+
+            fallback_model, _ = self._resolve_model(fallback_id)
+            if fallback_model["provider"] != "anthropic":
+                logger.exception("LLM API stream error: {}", e)
+                raise
+
+            fallback_kwargs = {**kwargs, "model": fallback_id}
+            logger.warning(
+                "LLM API stream failed on model={}, status_code={}, retrying with fallback={}",
+                model_id,
+                e.status_code,
+                fallback_id,
+            )
+            async with self._anthropic.messages.stream(**fallback_kwargs) as stream:
                 async for text in stream.text_stream:
                     yield text
         except Exception as e:
-            logger.exception("Claude API stream error: {}", e)
+            logger.exception("LLM API stream error: {}", e)
             raise
 
 

@@ -7,8 +7,12 @@ from sqlmodel import SQLModel
 
 from core.config import settings
 
+# Build absolute DB URL from project root to avoid CWD dependency.
+_db_path = settings.db_dir / "app.sqlite"
+_db_url = f"sqlite+aiosqlite:///{_db_path}"
+
 engine = create_async_engine(
-    settings.database_url,
+    _db_url,
     echo=settings.debug,
 )
 

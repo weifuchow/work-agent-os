@@ -121,10 +121,31 @@ export interface PlaygroundMessage {
   content: string
 }
 
+export interface ModelOption {
+  id: string
+  provider: string
+  label: string
+  enabled: boolean
+  supports_chat: boolean
+  supports_agent: boolean
+  is_default: boolean
+  is_fallback: boolean
+}
+
+export interface ModelsResponse {
+  default: string | null
+  fallback: string | null
+  providers: Record<string, { label?: string; enabled?: boolean }>
+  models: ModelOption[]
+}
+
+export const fetchModels = () =>
+  api.get<ModelsResponse>("/models")
+
 export const playgroundChat = (
   messages: PlaygroundMessage[],
   system = "",
-  model = "claude-sonnet-4-6",
+  model?: string,
 ) =>
   api.post<{ text: string; run_id: number }>("/playground/chat", {
     messages,

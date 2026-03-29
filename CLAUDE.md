@@ -93,6 +93,7 @@ cd apps/admin-ui && npm run dev
 
 # 数据库迁移
 python scripts/migrate_pipeline.py
+python scripts/migrate_agent_session.py
 
 # 初始化数据库
 python scripts/init_db.py
@@ -112,8 +113,9 @@ python scripts/init_db.py
 ```
 FEISHU_APP_ID       — 飞书应用 ID
 FEISHU_APP_SECRET   — 飞书应用密钥
-FEISHU_BOT_NAME     — 机器人名称（默认 WorkAgent）
-ANTHROPIC_API_KEY   — Claude API Key
+FEISHU_BOT_NAME         — 机器人名称（默认 WorkAgent）
+FEISHU_REPORT_CHAT_ID   — 日报推送目标 chat_id（留空则不推送）
+ANTHROPIC_API_KEY       — Claude API Key
 ANTHROPIC_BASE_URL  — API 代理地址（可选）
 DATABASE_URL        — 数据库连接串
 ```

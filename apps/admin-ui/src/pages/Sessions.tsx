@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
-import { fetchTaskContexts, SessionItem } from "../api/client"
+import { fetchTaskContexts, type SessionItem } from "../api/client"
 import { formatDate } from "../lib/utils"
 import { ChevronDown, ChevronRight, ChevronLeft, Layers } from "lucide-react"
 
@@ -23,7 +23,7 @@ function SessionCard({ sess }: { sess: SessionItem }) {
         <div>
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium text-gray-800">
-              {sess.title || sess.session_key}
+              #{sess.id} {sess.title || sess.session_key}
             </span>
             <span className={`px-1.5 py-0.5 rounded-full text-xs ${statusColors[sess.status] || "bg-gray-100"}`}>
               {sess.status}

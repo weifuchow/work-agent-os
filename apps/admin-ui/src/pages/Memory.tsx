@@ -5,7 +5,7 @@ import {
   fetchMemoryFile,
   updateMemoryFile,
   deleteMemoryFile,
-  MemoryFile,
+  type MemoryFile,
 } from "../api/client"
 import { FolderOpen, FileText, Save, Trash2, Brain } from "lucide-react"
 import { cn } from "../lib/utils"

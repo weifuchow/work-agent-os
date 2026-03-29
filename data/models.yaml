@@ -1,0 +1,39 @@
+default: claude-opus-4-6
+fallback: claude-sonnet-4-6
+
+providers:
+  anthropic:
+    label: Anthropic
+    enabled: true
+  openai:
+    label: OpenAI
+    enabled: true
+
+models:
+  - id: claude-opus-4-6
+    provider: anthropic
+    label: Claude Opus 4.6
+    enabled: true
+    supports_chat: true
+    supports_agent: true
+
+  - id: claude-sonnet-4-6
+    provider: anthropic
+    label: Claude Sonnet 4.6
+    enabled: true
+    supports_chat: true
+    supports_agent: true
+
+  - id: claude-haiku-4-5
+    provider: anthropic
+    label: Claude Haiku 4.5
+    enabled: true
+    supports_chat: true
+    supports_agent: false
+
+  - id: gpt-5.4
+    provider: openai
+    label: GPT-5.4
+    enabled: true
+    supports_chat: true
+    supports_agent: false

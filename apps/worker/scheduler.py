@@ -61,8 +61,11 @@ async def daily_report_job():
     """Generate and push daily report. 1 LLM call."""
     from core.reports.daily import generate_daily_report
     try:
-        # TODO: configure push_chat_id from settings or memory
-        await generate_daily_report(push_to_feishu=False)
+        push_chat_id = settings.feishu_report_chat_id
+        await generate_daily_report(
+            push_to_feishu=bool(push_chat_id),
+            push_chat_id=push_chat_id,
+        )
     except Exception as e:
         logger.exception("Daily report job failed: {}", e)
 
@@ -98,11 +101,15 @@ def main():
         "Scheduler started — monitor(2m), lifecycle(1h), consolidation(6h), report(8:00)"
     )
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.get_event_loop().run_forever()
+        loop.run_forever()
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
         logger.info("Scheduler stopped")
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
