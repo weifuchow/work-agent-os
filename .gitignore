@@ -24,6 +24,10 @@ env/
 # Data (runtime generated)
 data/db/
 data/audit/*.log
+data/memory/
+
+# Claude Code
+.claude/settings.json
 
 # OS
 .DS_Store
