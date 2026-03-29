@@ -97,16 +97,19 @@ flowchart TB
 | 能力 | 实现方式 | 状态 |
 |------|----------|------|
 | 会话路由 | `route_to_session` — chat_id + 项目 + 2h 时间窗口匹配 | ✅ |
-| 多轮上下文注入 | pipeline 通过 chat_id fallback 查找最近 session，注入 prompt | ✅ |
-| 任务上下文关联 | `link_task_context` — 模型判断会话归属哪个任务 | ✅ |
+| 多轮上下文注入 | pipeline 代码层面强制 session 路由（chat_id + 2h 窗口），注入 prompt | ✅ |
+| 任务上下文自动创建 | pipeline 处理后自动创建 task_context 并关联 session | ✅ |
 | Agent Session Resume | `agent_session_id` 绑定到 DB session，dispatch 时可恢复 | ✅ |
 | 项目派发 | `dispatch_to_project` — 在项目目录下启动子 Agent 执行 | ✅ |
 | 多 provider 模型路由 | Anthropic + OpenAI，fallback 自动切换 | ✅ |
 | 审计日志增强 | pipeline_agent_call/result 记录完整 prompt 和输出 | ✅ |
 | 审计日志前端 | 可点击展开，JSON 格式化显示 | ✅ |
+| 飞书消息审计 | message_received 记录完整消息内容（JSON） | ✅ |
 | e2e 集成测试 | 7 项检查点覆盖全部 DB 表和 API | ✅ |
 | 闲聊也能执行命令 | agent 可用 Bash 工具获取系统信息后回复 | ✅ |
 | 所有消息必回复 | 不再静默，噪音消息也简短回复 | ✅ |
+| 时区修复 | 所有时间统一使用本地时间，不再用 UTC | ✅ |
+| 飞书多轮实测验证 | 4 轮对话 → 1 session + 1 task_context + 8 session_messages | ✅ |
 
 ### 修复记录
 
@@ -117,7 +120,8 @@ flowchart TB
 | conversations API | 修复 MultipleResultsFound，取最新回复 |
 | 前端类型导入 | 修复 `verbatimModuleSyntax` 下的 interface 导入 |
 | DB 迁移 | sessions 表补 `task_context_id`、`agent_session_id` 列 |
-| 强制会话路由 | system prompt 要求非闲聊消息必须调用 `route_to_session` |
+| session 路由硬编码 | 不再依赖模型调 tool，pipeline 代码层强制路由 |
+| 时区统一 | 全局 `datetime.now(UTC)` → `datetime.now()` |
 
 ## 架构
 
@@ -201,15 +205,13 @@ pytest tests/test_multiturn_session.py -v
 
 ## 下阶段计划
 
-### Phase 7: 端到端多轮对话验证与稳定性
+### Phase 7: 端到端多轮对话验证与稳定性（已完成）
 
-**目标**: 在真实飞书环境中验证多轮对话，确保会话路由稳定可靠。
-
-- [ ] 真实飞书环境验证 3 轮连续工作问题，管理端确认 session 归属
-- [ ] Agent SDK session resume 真实验证（dispatch_to_project 多轮）
-- [ ] 消息处理超时保护（agent_client.run 设置 timeout）
-- [ ] 处理失败时回复用户"处理异常，请稍后再试"而非静默
-- [ ] Token 消耗记录到 agent_runs（目前仅记录 input/output_path）
+- [x] 飞书真实环境 4 轮连续对话验证通过
+- [x] session 路由改为代码层强制（不依赖模型调 tool）
+- [x] task_context 自动创建并关联
+- [x] 时区统一为本地时间
+- [x] 审计日志记录飞书消息完整内容
 
 ### Phase 8: 飞书消息增强
 

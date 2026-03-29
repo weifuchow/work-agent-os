@@ -1,6 +1,6 @@
 """Session Router — assign messages to work sessions."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import select, and_, or_
@@ -24,7 +24,7 @@ async def route_message(db: AsyncSession, msg: Message, intake_result: dict) -> 
     topic = intake_result.get("topic", "")
     project = intake_result.get("project", "")
     priority = intake_result.get("priority", "normal")
-    cutoff = datetime.now(UTC) - ACTIVE_WINDOW
+    cutoff = datetime.now() - ACTIVE_WINDOW
 
     # Strategy 1: exact chat_id + project match within active window
     if project:
@@ -84,7 +84,7 @@ async def _find_session(
 
 async def _create_session(db: AsyncSession, msg: Message, intake_result: dict) -> Session:
     """Create a new work session from the message + classification result."""
-    now = datetime.now(UTC)
+    now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     session_key = f"{msg.platform}_{msg.chat_id[:16]}_{timestamp}"
 
@@ -110,8 +110,8 @@ async def _create_session(db: AsyncSession, msg: Message, intake_result: dict) -
 async def _attach_message(db: AsyncSession, session: Session, msg: Message) -> None:
     """Attach a message to a session and update session metadata."""
     session.message_count += 1
-    session.last_active_at = datetime.now(UTC)
-    session.updated_at = datetime.now(UTC)
+    session.last_active_at = datetime.now()
+    session.updated_at = datetime.now()
 
     sm = SessionMessage(
         session_id=session.id,

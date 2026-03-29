@@ -5,6 +5,11 @@ from typing import Optional
 from sqlmodel import Field, SQLModel
 
 
+def _now() -> datetime:
+    """Local time for all timestamp fields."""
+    return datetime.now()
+
+
 # ---------- Enums ----------
 
 class MessageClassifiedType(str, enum.Enum):
@@ -66,8 +71,8 @@ class TaskContext(SQLModel, table=True):
     title: str = Field(default="", max_length=256)
     description: str = Field(default="")
     status: str = Field(default=TaskContextStatus.active, max_length=32)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
 
 
 class Message(SQLModel, table=True):
@@ -82,14 +87,14 @@ class Message(SQLModel, table=True):
     message_type: str = Field(default="text", max_length=32)
     content: str = Field(default="")
     sent_at: Optional[datetime] = None
-    received_at: datetime = Field(default_factory=datetime.utcnow)
+    received_at: datetime = Field(default_factory=_now)
     raw_payload: str = Field(default="")
     classified_type: Optional[str] = Field(default=None, max_length=32)
     session_id: Optional[int] = Field(default=None, foreign_key="sessions.id", index=True)
     pipeline_status: str = Field(default=PipelineStatus.pending, max_length=32)
     pipeline_error: str = Field(default="")
     processed_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)
 
 
 class Session(SQLModel, table=True):
@@ -110,12 +115,12 @@ class Session(SQLModel, table=True):
     # Agent SDK session ID — used to resume multi-turn conversations
     agent_session_id: Optional[str] = Field(default=None, max_length=256)
     summary_path: str = Field(default="")
-    last_active_at: datetime = Field(default_factory=datetime.utcnow)
+    last_active_at: datetime = Field(default_factory=_now)
     message_count: int = Field(default=0)
     risk_level: str = Field(default="low", max_length=32)
     needs_manual_review: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
 
 
 class SessionMessage(SQLModel, table=True):
@@ -126,7 +131,7 @@ class SessionMessage(SQLModel, table=True):
     message_id: int = Field(foreign_key="messages.id", index=True)
     role: str = Field(default="user", max_length=32)
     sequence_no: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)
 
 
 class Task(SQLModel, table=True):
@@ -140,8 +145,8 @@ class Task(SQLModel, table=True):
     priority: str = Field(default="normal", max_length=32)
     assignee: str = Field(default="", max_length=128)
     source: str = Field(default="", max_length=128)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
 
 
 class Report(SQLModel, table=True):
@@ -152,7 +157,7 @@ class Report(SQLModel, table=True):
     report_type: str = Field(default="daily", max_length=32)
     content_path: str = Field(default="")
     status: str = Field(default=ReportStatus.generated, max_length=32)
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=_now)
     sent_at: Optional[datetime] = None
 
 
@@ -184,4 +189,4 @@ class AuditLog(SQLModel, table=True):
     target_id: str = Field(default="", max_length=128)
     detail: str = Field(default="")
     operator: str = Field(default="system", max_length=64)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_now)

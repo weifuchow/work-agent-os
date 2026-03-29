@@ -8,7 +8,7 @@ Flow:
 5. Save to file + push to Feishu
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -38,7 +38,7 @@ async def generate_daily_report(
         Report content (markdown)
     """
     if not target_date:
-        yesterday = datetime.now(UTC) - timedelta(days=1)
+        yesterday = datetime.now() - timedelta(days=1)
         target_date = yesterday.strftime("%Y-%m-%d")
 
     # ── Step 1: Gather facts from DB (NO LLM) ──
@@ -77,7 +77,7 @@ async def generate_daily_report(
                 content = report_text[:3000]
                 client.send_message(receive_id=push_chat_id, content=content)
                 report.status = ReportStatus.sent
-                report.sent_at = datetime.now(UTC)
+                report.sent_at = datetime.now()
                 await db.commit()
                 logger.info("Daily report sent to {}", push_chat_id)
             except Exception as e:

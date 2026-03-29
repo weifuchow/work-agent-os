@@ -1,7 +1,7 @@
 """Task Linker — use LLM to associate sessions with task contexts."""
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 
 from loguru import logger
 from sqlalchemy import select
@@ -45,7 +45,7 @@ async def link_session_to_task(db: AsyncSession, session: Session) -> TaskContex
         task_ctx = await db.get(TaskContext, matched_id)
         if task_ctx:
             session.task_context_id = task_ctx.id
-            task_ctx.updated_at = datetime.now(UTC)
+            task_ctx.updated_at = datetime.now()
             await db.commit()
             logger.info("TaskLinker: session {} → existing task {} ({})",
                         session.id, task_ctx.id, task_ctx.title)

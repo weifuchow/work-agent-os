@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime
 
 from fastapi import APIRouter
 from loguru import logger
@@ -29,6 +29,6 @@ async def health_check():
     return {
         "status": overall,
         "service": "work-agent-os",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now().isoformat(),
         "checks": checks,
     }

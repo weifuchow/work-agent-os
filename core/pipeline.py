@@ -12,7 +12,7 @@ Each run:
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 
 from loguru import logger
 
@@ -137,25 +137,18 @@ async def process_message(message_id: int) -> None:
             msg.pipeline_status = PipelineStatus.classifying
             await db.commit()
 
-            # Look up existing session context for multi-turn resume
-            session_context = None
-            if msg.session_id:
-                from models.db import Session as DBSession
-                existing_sess = await db.get(DBSession, msg.session_id)
-                if existing_sess and (existing_sess.agent_session_id or existing_sess.project):
-                    session_context = {
-                        "agent_session_id": existing_sess.agent_session_id,
-                        "project": existing_sess.project,
-                        "title": existing_sess.title,
-                        "db_session_id": existing_sess.id,
-                    }
+            # ── Force session routing BEFORE agent call ──
+            # Don't rely on agent calling route_to_session — do it here.
+            from datetime import timedelta
+            from sqlalchemy import desc, select, func
+            from models.db import Session as DBSession, SessionMessage
 
-            # Fallback: find recent session by chat_id for multi-turn continuity
-            if not session_context and msg.chat_id:
-                from datetime import timedelta
-                from sqlalchemy import desc, select
-                from models.db import Session as DBSession
-                cutoff = datetime.now(UTC) - timedelta(hours=2)
+            session_context = None
+            db_session_id = msg.session_id
+
+            if not db_session_id and msg.chat_id:
+                # Find recent session by chat_id within 2h window
+                cutoff = datetime.now() - timedelta(hours=2)
                 stmt = select(DBSession).where(
                     DBSession.source_chat_id == msg.chat_id,
                     DBSession.status.in_(["open", "waiting"]),
@@ -163,12 +156,61 @@ async def process_message(message_id: int) -> None:
                 ).order_by(desc(DBSession.last_active_at)).limit(1)
                 result = await db.execute(stmt)
                 recent_sess = result.scalar_one_or_none()
+
                 if recent_sess:
+                    db_session_id = recent_sess.id
+                else:
+                    # Create new session
+                    new_sess = DBSession(
+                        session_key=f"feishu_{msg.chat_id[:16]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        source_platform="feishu",
+                        source_chat_id=msg.chat_id,
+                        owner_user_id=msg.sender_id,
+                        title=msg.content[:64] if msg.content else "新会话",
+                        topic="",
+                        project="",
+                        priority="normal",
+                        status="open",
+                        summary_path="",
+                        last_active_at=datetime.now(),
+                        message_count=0,
+                        risk_level="low",
+                        needs_manual_review=False,
+                    )
+                    db.add(new_sess)
+                    await db.commit()
+                    await db.refresh(new_sess)
+                    db_session_id = new_sess.id
+
+            # Attach message to session
+            if db_session_id:
+                sess_obj = await db.get(DBSession, db_session_id)
+                if sess_obj:
+                    msg.session_id = db_session_id
+                    sess_obj.message_count = sess_obj.message_count + 1
+                    sess_obj.last_active_at = datetime.now()
+                    sess_obj.updated_at = datetime.now()
+                    await db.commit()
+
+                    # Create session_message record
+                    max_seq_result = await db.execute(
+                        select(func.coalesce(func.max(SessionMessage.sequence_no), 0))
+                        .where(SessionMessage.session_id == db_session_id)
+                    )
+                    max_seq = max_seq_result.scalar() or 0
+                    db.add(SessionMessage(
+                        session_id=db_session_id,
+                        message_id=msg.id,
+                        role="user",
+                        sequence_no=max_seq + 1,
+                    ))
+                    await db.commit()
+
                     session_context = {
-                        "agent_session_id": recent_sess.agent_session_id,
-                        "project": recent_sess.project,
-                        "title": recent_sess.title,
-                        "db_session_id": recent_sess.id,
+                        "agent_session_id": sess_obj.agent_session_id,
+                        "project": sess_obj.project,
+                        "title": sess_obj.title,
+                        "db_session_id": sess_obj.id,
                     }
 
             # Build prompt
@@ -195,7 +237,7 @@ async def process_message(message_id: int) -> None:
                 agent_name="orchestrator",
                 runtime_type="agent_sdk",
                 status=AgentRunStatus.running,
-                started_at=datetime.now(UTC),
+                started_at=datetime.now(),
             )
             db.add(run)
             await db.commit()
@@ -234,9 +276,9 @@ async def process_message(message_id: int) -> None:
 
             # Update message with classification
             msg.classified_type = parsed.get("classified_type", "chat")
-            msg.session_id = parsed.get("session_id") or msg.session_id
+            # session_id already set by pre-agent routing — don't overwrite with null
             msg.pipeline_status = PipelineStatus.completed
-            msg.processed_at = datetime.now(UTC)
+            msg.processed_at = datetime.now()
             await db.commit()
 
             # Save bot reply if agent sent one
@@ -244,21 +286,35 @@ async def process_message(message_id: int) -> None:
             action = parsed.get("action", "silent")
             if reply_content and action in ("replied", "drafted"):
                 await _save_reply(db, msg, reply_content,
-                                  session_id=parsed.get("session_id"),
+                                  session_id=msg.session_id,
                                   is_draft=(action == "drafted"))
+
+            # ── Ensure task_context exists for non-chat sessions ──
+            if msg.session_id and msg.classified_type not in ("chat", "noise"):
+                from models.db import TaskContext
+                sess_for_tc = await db.get(DBSession, msg.session_id)
+                if sess_for_tc and not sess_for_tc.task_context_id:
+                    tc = TaskContext(
+                        title=parsed.get("topic") or sess_for_tc.title or "未命名任务",
+                        description="",
+                        status="active",
+                    )
+                    db.add(tc)
+                    await db.commit()
+                    await db.refresh(tc)
+                    sess_for_tc.task_context_id = tc.id
+                    await db.commit()
 
             # Update agent run
             run.status = AgentRunStatus.success
-            run.ended_at = datetime.now(UTC)
+            run.ended_at = datetime.now()
             run.output_path = result_text[:2000]
-            run.session_id = parsed.get("session_id")
+            run.session_id = msg.session_id
             if agent_session_id:
                 run.input_path = f"agent_session:{agent_session_id}"
                 # Persist SDK session ID to the DB session for future resume
-                db_session_id = parsed.get("session_id") or msg.session_id
-                if db_session_id:
-                    from models.db import Session as DBSession
-                    db_sess = await db.get(DBSession, db_session_id)
+                if msg.session_id:
+                    db_sess = await db.get(DBSession, msg.session_id)
                     if db_sess and not db_sess.agent_session_id:
                         db_sess.agent_session_id = agent_session_id
             await db.commit()
@@ -283,7 +339,7 @@ async def process_message(message_id: int) -> None:
                 if m:
                     m.pipeline_status = PipelineStatus.failed
                     m.pipeline_error = str(e)[:500]
-                    m.processed_at = datetime.now(UTC)
+                    m.processed_at = datetime.now()
                     await db2.commit()
                 db2.add(AuditLog(
                     event_type="pipeline_failed",
@@ -435,11 +491,11 @@ async def _save_reply(db, original_msg: Message, reply_content: str,
         sender_name="WorkAgent",
         message_type="text",
         content=f"{prefix}{reply_content}",
-        received_at=datetime.now(UTC),
+        received_at=datetime.now(),
         classified_type="bot_reply",
         session_id=session_id,
         pipeline_status=PipelineStatus.completed,
-        processed_at=datetime.now(UTC),
+        processed_at=datetime.now(),
     )
     db.add(reply_msg)
     await db.commit()

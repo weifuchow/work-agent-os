@@ -1,6 +1,6 @@
 """Session lifecycle management — auto-freeze and archive stale sessions."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import select, and_
@@ -21,7 +21,7 @@ async def run_lifecycle_check() -> dict:
     Returns counts of transitions made.
     """
     async with async_session_factory() as db:
-        now = datetime.now(UTC)
+        now = datetime.now()
         counts = {"to_waiting": 0, "to_archived": 0}
 
         # Open sessions inactive > 24h → waiting

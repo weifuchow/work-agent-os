@@ -1,6 +1,7 @@
 """Message persistence service — save incoming messages to DB with dedup."""
 
-from datetime import UTC, datetime
+import json
+from datetime import datetime
 
 from loguru import logger
 from sqlalchemy import select
@@ -24,6 +25,7 @@ async def save_message(session: AsyncSession, event_data: dict) -> Message | Non
         logger.debug("Duplicate message ignored: {}", platform_message_id)
         return None
 
+    now = datetime.now()
     msg = Message(
         platform=event_data.get("platform", "feishu"),
         platform_message_id=platform_message_id,
@@ -32,18 +34,27 @@ async def save_message(session: AsyncSession, event_data: dict) -> Message | Non
         sender_name=event_data.get("sender_name", ""),
         message_type=event_data.get("message_type", "text"),
         content=event_data.get("content", ""),
-        received_at=datetime.now(UTC),
+        received_at=now,
         raw_payload=event_data.get("raw_payload", ""),
     )
     session.add(msg)
 
-    # Audit log
+    # Audit log — include message content for traceability
     audit = AuditLog(
         event_type="message_received",
         target_type="message",
         target_id=platform_message_id,
-        detail=f"from={event_data.get('sender_id', '')} chat={event_data.get('chat_id', '')}",
+        detail=json.dumps({
+            "sender_id": event_data.get("sender_id", ""),
+            "sender_name": event_data.get("sender_name", ""),
+            "chat_id": event_data.get("chat_id", ""),
+            "chat_type": event_data.get("chat_type", ""),
+            "message_type": event_data.get("message_type", ""),
+            "content": event_data.get("content", "")[:500],
+            "is_mentioned": event_data.get("is_mentioned", False),
+        }, ensure_ascii=False),
         operator="feishu_connector",
+        created_at=now,
     )
     session.add(audit)
 

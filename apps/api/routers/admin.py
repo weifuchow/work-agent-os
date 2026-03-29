@@ -2,7 +2,7 @@
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -216,7 +216,7 @@ async def playground_chat(req: PlaygroundRequest, db: AsyncSession = Depends(get
         input_path="",
         output_path="",
         status=AgentRunStatus.running,
-        started_at=datetime.now(UTC),
+        started_at=datetime.now(),
     )
     db.add(run)
     await db.commit()
@@ -237,7 +237,7 @@ async def playground_chat(req: PlaygroundRequest, db: AsyncSession = Depends(get
 
                 # Mark success
                 run.status = AgentRunStatus.success
-                run.ended_at = datetime.now(UTC)
+                run.ended_at = datetime.now()
                 db.add(run)
                 await db.commit()
 
@@ -245,7 +245,7 @@ async def playground_chat(req: PlaygroundRequest, db: AsyncSession = Depends(get
             except Exception as e:
                 run.status = AgentRunStatus.failed
                 run.error_message = str(e)
-                run.ended_at = datetime.now(UTC)
+                run.ended_at = datetime.now()
                 db.add(run)
                 await db.commit()
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -261,14 +261,14 @@ async def playground_chat(req: PlaygroundRequest, db: AsyncSession = Depends(get
             max_tokens=req.max_tokens,
         )
         run.status = AgentRunStatus.success
-        run.ended_at = datetime.now(UTC)
+        run.ended_at = datetime.now()
         db.add(run)
         await db.commit()
         return {"text": text, "run_id": run.id}
     except Exception as e:
         run.status = AgentRunStatus.failed
         run.error_message = str(e)
-        run.ended_at = datetime.now(UTC)
+        run.ended_at = datetime.now()
         db.add(run)
         await db.commit()
         return {"error": str(e), "run_id": run.id}
@@ -303,7 +303,7 @@ async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_
         input_path="",
         output_path="",
         status=AgentRunStatus.running,
-        started_at=datetime.now(UTC),
+        started_at=datetime.now(),
     )
     db.add(run)
     await db.commit()
@@ -322,14 +322,14 @@ async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_
 
             # Mark success
             run.status = AgentRunStatus.success
-            run.ended_at = datetime.now(UTC)
+            run.ended_at = datetime.now()
             db.add(run)
             await db.commit()
         except Exception as e:
             logger.exception("Agent run failed: {}", e)
             run.status = AgentRunStatus.failed
             run.error_message = str(e)
-            run.ended_at = datetime.now(UTC)
+            run.ended_at = datetime.now()
             db.add(run)
             await db.commit()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
@@ -509,7 +509,7 @@ async def get_token_usage(
     db: AsyncSession = Depends(get_session),
 ):
     """Get token consumption statistics."""
-    cutoff = datetime.now(UTC) - timedelta(days=days)
+    cutoff = datetime.now() - timedelta(days=days)
 
     # Total tokens
     stmt = select(
@@ -691,7 +691,7 @@ async def update_task_context(
         tc.description = body.description
     if body.status is not None:
         tc.status = body.status
-    tc.updated_at = datetime.now(UTC)
+    tc.updated_at = datetime.now()
     await db.commit()
     return _task_context_to_dict(tc)
 

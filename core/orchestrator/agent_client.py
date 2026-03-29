@@ -70,7 +70,7 @@ async def write_audit_log(input: dict) -> dict[str, Any]:
         async with aiosqlite.connect(str(db_path)) as db:
             await db.execute(
                 "INSERT INTO audit_logs (event_type, target_type, target_id, detail, operator, created_at) VALUES (?,?,?,?,?,?)",
-                (input["event_type"], input.get("target_type", ""), input.get("target_id", ""), input["detail"], "agent", datetime.now(UTC).isoformat()),
+                (input["event_type"], input.get("target_type", ""), input.get("target_id", ""), input["detail"], "agent", datetime.now().isoformat()),
             )
             await db.commit()
             return {"success": True}
@@ -122,7 +122,7 @@ async def save_bot_reply(input: dict) -> dict[str, Any]:
             platform_msg_id = row[0]
             platform = row[1]
 
-            now = datetime.now(UTC).isoformat()
+            now = datetime.now().isoformat()
             prefix = "[草稿] " if input.get("is_draft") else ""
             content = f"{prefix}{input['reply_content']}"
             reply_platform_id = f"reply_{platform_msg_id}"
@@ -210,7 +210,7 @@ async def update_session(input: dict) -> dict[str, Any]:
     updates = {k: v for k, v in input["updates"].items() if k in allowed}
     if not updates:
         return {"error": "没有有效的更新字段"}
-    updates["updated_at"] = datetime.now(UTC).isoformat()
+    updates["updated_at"] = datetime.now().isoformat()
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [input["session_id"]]
     db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
@@ -245,7 +245,7 @@ async def route_to_session(input: dict) -> dict[str, Any]:
     chat_id = input["chat_id"]
     project = input.get("project", "")
     topic = input.get("topic", "")
-    cutoff = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    cutoff = (datetime.now() - timedelta(hours=2)).isoformat()
 
     try:
         async with aiosqlite.connect(str(db_path)) as db:
@@ -281,7 +281,7 @@ async def route_to_session(input: dict) -> dict[str, Any]:
                         "action": "matched_by_chat"}
 
             # Strategy 3: create new session
-            now = datetime.now(UTC)
+            now = datetime.now()
             timestamp = now.strftime("%Y%m%d_%H%M%S")
             session_key = f"feishu_{chat_id[:16]}_{timestamp}"
             title = input.get("summary", "")[:128] or topic[:128] or "新会话"
@@ -338,17 +338,17 @@ async def link_task_context(input: dict) -> dict[str, Any]:
                 if row:
                     await db.execute(
                         "UPDATE sessions SET task_context_id = ?, updated_at = ? WHERE id = ?",
-                        (match_id, datetime.now(UTC).isoformat(), session_id),
+                        (match_id, datetime.now().isoformat(), session_id),
                     )
                     await db.execute(
                         "UPDATE task_contexts SET updated_at = ? WHERE id = ?",
-                        (datetime.now(UTC).isoformat(), match_id),
+                        (datetime.now().isoformat(), match_id),
                     )
                     await db.commit()
                     return {"task_context_id": match_id, "title": row["title"], "action": "linked_existing"}
 
             # Create new task context
-            now = datetime.now(UTC)
+            now = datetime.now()
             title = input.get("new_title") or input.get("title") or input.get("topic") or "未命名任务"
             await db.execute(
                 "INSERT INTO task_contexts (title, description, status, created_at, updated_at) VALUES (?,?,?,?,?)",
@@ -372,7 +372,7 @@ async def link_task_context(input: dict) -> dict[str, Any]:
 async def _attach_msg_to_session(db, session_id: int, message_id: int) -> None:
     """Attach a message to a session (raw aiosqlite)."""
     from datetime import datetime, UTC
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now().isoformat()
 
     # Get current message_count
     cursor = await db.execute("SELECT message_count FROM sessions WHERE id = ?", (session_id,))
@@ -490,7 +490,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                 async with aiosqlite.connect(str(db_path)) as db:
                     await db.execute(
                         "UPDATE sessions SET agent_session_id = ?, updated_at = ? WHERE id = ?",
-                        (new_session_id, datetime.now(UTC).isoformat(), db_session_id),
+                        (new_session_id, datetime.now().isoformat(), db_session_id),
                     )
                     await db.commit()
             except Exception as e:
@@ -554,7 +554,7 @@ async def _on_subagent_stop(
     db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
     try:
         async with aiosqlite.connect(str(db_path)) as db:
-            now = datetime.now(UTC).isoformat()
+            now = datetime.now().isoformat()
             await db.execute(
                 "INSERT INTO agent_runs (agent_name, runtime_type, input_path, output_path, "
                 "status, started_at, ended_at) VALUES (?,?,?,?,?,?,?)",

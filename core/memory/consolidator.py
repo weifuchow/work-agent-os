@@ -11,7 +11,7 @@ Flow:
 """
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -112,7 +112,7 @@ async def consolidate_memories() -> dict:
         for sd in session_data:
             _memory_marker_path(sd["id"]).parent.mkdir(parents=True, exist_ok=True)
             _memory_marker_path(sd["id"]).write_text(
-                datetime.now(UTC).isoformat(), encoding="utf-8"
+                datetime.now().isoformat(), encoding="utf-8"
             )
 
         # Audit
@@ -172,7 +172,7 @@ async def _extract_knowledge(session_data: list[dict]) -> list[dict]:
         # Fallback: just store raw summaries
         return [
             {"project": sd.get("project", "general"),
-             "content": f"## {sd['title']} ({datetime.now(UTC).strftime('%Y-%m-%d')})\n{sd['summary'][:300]}",
+             "content": f"## {sd['title']} ({datetime.now().strftime('%Y-%m-%d')})\n{sd['summary'][:300]}",
              "people": []}
             for sd in session_data
         ]

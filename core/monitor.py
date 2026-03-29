@@ -3,7 +3,7 @@
 NO LLM calls. Pure DB queries + file reads + Feishu notifications.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import select, and_
@@ -26,7 +26,7 @@ async def check_running_tasks() -> dict:
         counts = {"running": 0, "stuck": 0, "notified": 0}
 
         # 1. Check stuck pipelines (classifying/routing for > 5 min)
-        cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        cutoff = datetime.now() - timedelta(minutes=5)
         stmt = select(Message).where(and_(
             Message.pipeline_status.in_([
                 PipelineStatus.classifying, PipelineStatus.routing,
@@ -41,7 +41,7 @@ async def check_running_tasks() -> dict:
                            msg.id, msg.pipeline_status)
 
         # 2. Check running agent_runs (running for > 3 min)
-        agent_cutoff = datetime.now(UTC) - timedelta(minutes=3)
+        agent_cutoff = datetime.now() - timedelta(minutes=3)
         stmt = select(AgentRun).where(and_(
             AgentRun.status == AgentRunStatus.running,
             AgentRun.started_at < agent_cutoff,
@@ -53,7 +53,7 @@ async def check_running_tasks() -> dict:
                            run.id, run.agent_name)
 
         # 3. Report recently completed tasks (last check interval)
-        interval = datetime.now(UTC) - timedelta(minutes=2)
+        interval = datetime.now() - timedelta(minutes=2)
         stmt = select(Message).where(and_(
             Message.pipeline_status == PipelineStatus.completed,
             Message.processed_at >= interval,
@@ -120,7 +120,7 @@ async def get_task_status_text(session_id: int) -> str:
                     d = (r.ended_at - r.started_at).total_seconds()
                     duration = f" ({d:.1f}s)"
                 elif r.started_at:
-                    d = (datetime.now(UTC) - r.started_at).total_seconds()
+                    d = (datetime.now() - r.started_at).total_seconds()
                     duration = f" (已运行{d:.0f}s)"
                 lines.append(f"  {status_icon} {r.agent_name}{duration}")
 
@@ -153,7 +153,7 @@ async def _notify_stuck(msg: Message) -> None:
             if m:
                 m.pipeline_status = PipelineStatus.failed
                 m.pipeline_error = f"exceeded max retries ({MAX_STUCK_RETRIES})"
-                m.processed_at = datetime.now(UTC)
+                m.processed_at = datetime.now()
                 await db.commit()
         return
 
