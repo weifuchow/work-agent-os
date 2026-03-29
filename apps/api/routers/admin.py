@@ -163,7 +163,7 @@ async def list_audit_logs(
 
     total = (await db.execute(count_query)).scalar() or 0
 
-    query = query.order_by(desc(AuditLog.created_at)) \
+    query = query.order_by(desc(AuditLog.id)) \
         .offset((page - 1) * page_size) \
         .limit(page_size)
     results = (await db.execute(query)).scalars().all()
