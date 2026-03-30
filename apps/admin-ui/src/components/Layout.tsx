@@ -9,6 +9,7 @@ import {
   Brain,
 } from "lucide-react"
 import { cn } from "../lib/utils"
+import ModelSwitcher from "./ModelSwitcher"
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
@@ -52,8 +53,11 @@ export default function Layout() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-auto">
-        <div className="p-6">
+      <main className="flex-1 overflow-auto flex flex-col">
+        <header className="flex items-center justify-end px-6 py-3 border-b border-gray-200 bg-white">
+          <ModelSwitcher />
+        </header>
+        <div className="flex-1 overflow-auto p-6">
           <Outlet />
         </div>
       </main>

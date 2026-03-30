@@ -68,10 +68,11 @@ scripts/           — 初始化和迁移脚本
 
 - `core/pipeline.py` — Orchestrator Agent 入口：消息进来 → agent 自主处理
 - `core/orchestrator/agent_client.py` — Agent SDK 客户端 + 所有 MCP 工具定义（12 个 tool）
-- `core/orchestrator/claude_client.py` — 多 provider 模型路由（Anthropic + OpenAI）
+- `core/orchestrator/claude_client.py` — 多 provider 模型路由（Anthropic + OpenAI），支持运行时 override
 - `core/projects.py` — 项目注册、skill 合并、dispatch 支持
 - `.claude/agents/*.md` — 子 Agent 定义（intake, context, analysis, reply, report）
 - `core/connectors/feishu.py` — 飞书 WebSocket + 消息收发
+- `core/connectors/message_service.py` — 消息入库 + 命令拦截（`/m` 模型切换）
 - `models/db.py` — 所有数据库模型和枚举
 - `apps/api/routers/admin.py` — 管理 API
 - `tests/test_multiturn_session.py` — 多轮会话 e2e 集成测试
@@ -125,6 +126,12 @@ python scripts/migrate_pipeline.py
 python scripts/migrate_agent_session.py
 ```
 
+## 飞书命令
+
+| 命令 | 说明 |
+|------|------|
+| `/m <model_id>` | 切换运行时模型（如 `/m gpt-5.4`），支持任意模型 ID |
+
 ## 设计原则
 
 1. **Agentic 架构** — 单入口 Orchestrator，模型自主决策调用哪些 skills
@@ -135,6 +142,9 @@ python scripts/migrate_agent_session.py
 6. Session 路由在 **pipeline 代码层强制执行**（chat_id + 2h 窗口匹配），不依赖模型调 tool
 7. 多轮对话通过 **chat_id + 时间窗口** 自动关联已有会话
 8. 所有时间使用**本地时间**（`datetime.now()`），不用 UTC
+9. **运行时模型切换** — `core/config.py` 内存 override，不修改 models.yaml；任意模型 ID 自动推断 provider
+10. **多轮 resume 精简 prompt** — 有 `agent_session_id` + `project` 时，prompt 只传新消息 + session_id，不重复元数据
+11. **dispatch 回写 project** — `dispatch_to_project` 成功后将 project 写回 session 表，确保后续消息能关联
 
 ## 环境变量
 

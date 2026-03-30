@@ -377,6 +377,20 @@ def _build_prompt(msg: Message, session_context: dict | None = None) -> str:
     Args:
         session_context: Optional dict with keys agent_session_id, project, title, db_session_id.
     """
+    # If session has agent_session_id + project, this is a resume — keep prompt minimal
+    if (session_context
+            and session_context.get("agent_session_id")
+            and session_context.get("project")):
+        return f"""多轮对话继续（消息ID: {msg.id}，聊天ID: {msg.chat_id}，db_session_id: {session_context['db_session_id']}）
+
+项目: {session_context['project']}
+agent_session_id: {session_context['agent_session_id']}
+
+用户新消息:
+{msg.content}
+
+请 dispatch_to_project 并传入 session_id 恢复上下文。"""
+
     prompt = f"""新消息到达，请处理：
 
 - 消息ID: {msg.id}

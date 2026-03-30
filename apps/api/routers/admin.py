@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import load_models_config, settings
+from core.config import load_models_config, get_model_override, set_model_override, settings
 from core.database import get_session
 from core.orchestrator.claude_client import claude_client
 from models.db import (
@@ -281,6 +281,32 @@ async def get_stats(db: AsyncSession = Depends(get_session)):
 @router.get("/models")
 async def list_models():
     return load_models_config()
+
+
+class ModelSwitchRequest(BaseModel):
+    model: str
+
+
+@router.post("/model/switch")
+async def switch_model(req: ModelSwitchRequest, db: AsyncSession = Depends(get_session)):
+    """Switch the runtime model override."""
+    old_model = get_model_override() or load_models_config().get("default", "unknown")
+    set_model_override(req.model)
+
+    db.add(AuditLog(
+        event_type="model_switch",
+        target_type="model",
+        target_id=req.model,
+        detail=json.dumps({
+            "old_model": old_model,
+            "new_model": req.model,
+            "source": "admin_api",
+        }, ensure_ascii=False),
+        operator="admin",
+    ))
+    await db.commit()
+
+    return {"old_model": old_model, "new_model": req.model, "current": req.model}
 
 
 # ---------- Playground ----------

@@ -135,12 +135,17 @@ export interface ModelOption {
 export interface ModelsResponse {
   default: string | null
   fallback: string | null
+  current: string | null
+  override: string | null
   providers: Record<string, { label?: string; enabled?: boolean }>
   models: ModelOption[]
 }
 
 export const fetchModels = () =>
   api.get<ModelsResponse>("/models")
+
+export const switchModel = (model: string) =>
+  api.post<{ old_model: string; new_model: string; current: string }>("/model/switch", { model })
 
 export const playgroundChat = (
   messages: PlaygroundMessage[],

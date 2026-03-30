@@ -82,6 +82,22 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+# ---------------------------------------------------------------------------
+# Runtime model override (in-memory, not persisted to models.yaml)
+# ---------------------------------------------------------------------------
+
+_runtime_model_override: str | None = None
+
+
+def get_model_override() -> str | None:
+    return _runtime_model_override
+
+
+def set_model_override(model_id: str | None) -> None:
+    global _runtime_model_override
+    _runtime_model_override = model_id
+
+
 def load_models_config() -> dict[str, Any]:
     if not settings.models_file.exists():
         return {"default": None, "fallback": None, "models": [], "providers": {}}
@@ -111,9 +127,14 @@ def load_models_config() -> dict[str, Any]:
             "is_fallback": model_id == fallback,
         })
 
+    override = get_model_override()
+    current = override or default
+
     return {
         "default": default,
         "fallback": fallback,
+        "current": current,
+        "override": override,
         "models": normalized_models,
         "providers": providers,
     }

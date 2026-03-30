@@ -103,25 +103,20 @@ flowchart TB
 | 项目派发 | `dispatch_to_project` — 在项目目录下启动子 Agent 执行 | ✅ |
 | 多 provider 模型路由 | Anthropic + OpenAI，fallback 自动切换 | ✅ |
 | 审计日志增强 | pipeline_agent_call/result 记录完整 prompt 和输出 | ✅ |
-| 审计日志前端 | 可点击展开，JSON 格式化显示 | ✅ |
-| 飞书消息审计 | message_received 记录完整消息内容（JSON） | ✅ |
-| e2e 集成测试 | 7 项检查点覆盖全部 DB 表和 API | ✅ |
-| 闲聊也能执行命令 | agent 可用 Bash 工具获取系统信息后回复 | ✅ |
-| 所有消息必回复 | 不再静默，噪音消息也简短回复 | ✅ |
-| 时区修复 | 所有时间统一使用本地时间，不再用 UTC | ✅ |
-| 飞书多轮实测验证 | 4 轮对话 → 1 session + 1 task_context + 8 session_messages | ✅ |
 
-### 修复记录
+### Phase 7: 可观测性与模型切换（已完成）
 
-| 修复 | 说明 |
-|------|------|
-| JSON 解析增强 | 平衡括号匹配 + `action` 校验，fallback 不泄露原始输出 |
-| 回复保存统一 | `save_bot_reply` MCP tool，upsert 防重复 |
-| conversations API | 修复 MultipleResultsFound，取最新回复 |
-| 前端类型导入 | 修复 `verbatimModuleSyntax` 下的 interface 导入 |
-| DB 迁移 | sessions 表补 `task_context_id`、`agent_session_id` 列 |
-| session 路由硬编码 | 不再依赖模型调 tool，pipeline 代码层强制路由 |
-| 时区统一 | 全局 `datetime.now(UTC)` → `datetime.now()` |
+| 能力 | 实现方式 | 状态 |
+|------|----------|------|
+| 运行时模型切换 | 飞书 `/m <model_id>` 命令 + 管理后台 API | ✅ |
+| 任意模型 ID 支持 | 不在 models.yaml 中的模型自动推断 provider | ✅ |
+| 全局模型切换器 | 管理后台顶栏下拉 — 搜索/选择/自定义输入 | ✅ |
+| Agent Run 可观测 | inflight 查询 + 历史记录 API（含 cost/duration） | ✅ |
+| dispatch 追踪 | dispatch_to_project 独立 AgentRun 生命周期 | ✅ |
+| 多轮 resume 精简 | 有 agent_session_id 时 prompt 只传新消息 | ✅ |
+| dispatch 回写 project | 成功后 project 写回 session，后续消息自动关联 | ✅ |
+| Scheduler 修复 | AsyncIOScheduler event loop bug 修复 | ✅ |
+| 审计日志增强 | pipeline_agent_call/result 记录完整 prompt 和输出 | ✅ |
 
 ## 架构
 
@@ -196,7 +191,10 @@ pytest tests/test_multiturn_session.py -v
 | `GET /api/memory/files` | 记忆文件列表 |
 | `GET/PUT/DELETE /api/memory/files/{path}` | 记忆文件 CRUD |
 | `GET /api/audit-logs` | 审计日志 |
-| `GET /api/models` | 模型配置 |
+| `GET /api/models` | 模型配置（含 current/override） |
+| `POST /api/model/switch` | 运行时模型切换 |
+| `GET /api/agent-runs` | Agent 执行历史 |
+| `GET /api/agent-runs/inflight` | 当前运行中的 Agent |
 | `GET /api/stats` | 统计概览 |
 | `POST /api/messages/{id}/reprocess` | 重新处理消息 |
 | `POST /api/playground/chat` | 模型测试对话 |
@@ -215,11 +213,13 @@ pytest tests/test_multiturn_session.py -v
 
 ### Phase 8: 飞书消息增强
 
-**目标**: 提升消息展示质量。
+**目标**: 支持图片消息、卡片消息，提升消息展示质量。
 
+- [ ] **支持图片消息接收**（解析 image 类型，下载图片，传给多模态模型处理）
+- [ ] **支持图片消息回复**（Agent 生成的图片/截图可通过飞书发送）
 - [ ] 支持飞书卡片消息（Interactive Card）回复
 - [ ] 回复区分：正文、分析过程、风险提示（卡片分块）
-- [ ] 支持图片/文件消息接收
+- [ ] 支持文件消息接收
 - [ ] 草稿消息支持飞书卡片确认按钮
 
 ### Phase 9: 管理后台增强

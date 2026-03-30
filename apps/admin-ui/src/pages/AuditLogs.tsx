@@ -22,6 +22,7 @@ const eventTypeColors: Record<string, string> = {
   message_processed: "bg-cyan-50 text-cyan-700",
   message_classified: "bg-teal-50 text-teal-700",
   pipeline_skipped: "bg-gray-50 text-gray-500",
+  model_switch: "bg-amber-50 text-amber-700",
 }
 
 function AuditLogRow({ log }: { log: AuditLogItem }) {

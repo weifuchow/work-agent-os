@@ -66,8 +66,52 @@ async def save_message(session: AsyncSession, event_data: dict) -> Message | Non
 
 
 async def save_and_process(session: AsyncSession, event_data: dict) -> Message | None:
-    """Save message and trigger async pipeline processing."""
+    """Save message and trigger async pipeline processing.
+
+    Intercepts special commands (e.g. /m <model>) before pipeline.
+    """
     import asyncio
+
+    content = (event_data.get("content") or "").strip()
+
+    # ── Command: /m <model_id> — switch runtime model ──
+    if content.startswith("/m "):
+        model_id = content[3:].strip()
+        if model_id:
+            from core.config import set_model_override, get_model_override, load_models_config
+            old_model = get_model_override() or load_models_config().get("default", "unknown")
+            set_model_override(model_id)
+
+            # Save the command message
+            msg = await save_message(session, event_data)
+
+            # Write audit log
+            audit = AuditLog(
+                event_type="model_switch",
+                target_type="model",
+                target_id=model_id,
+                detail=json.dumps({
+                    "old_model": old_model,
+                    "new_model": model_id,
+                    "sender_id": event_data.get("sender_id", ""),
+                    "chat_id": event_data.get("chat_id", ""),
+                }, ensure_ascii=False),
+                operator="command",
+            )
+            session.add(audit)
+            await session.commit()
+
+            # Reply via feishu
+            chat_id = event_data.get("chat_id", "")
+            if chat_id:
+                from core.connectors.feishu import FeishuClient
+                client = FeishuClient()
+                client.send_message(chat_id, f"模型已切换: {old_model} → {model_id}")
+
+            logger.info("Model switched: {} → {} (by {})", old_model, model_id,
+                        event_data.get("sender_id", ""))
+            return msg
+
     from core.pipeline import process_message
 
     msg = await save_message(session, event_data)

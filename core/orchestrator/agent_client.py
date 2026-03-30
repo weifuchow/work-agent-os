@@ -513,17 +513,23 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             except Exception as e:
                 logger.warning("Failed to update dispatch AgentRun: {}", e)
 
-        # Persist the SDK session_id to DB session for future resume
-        if new_session_id and db_session_id:
+        # Persist the SDK session_id and project to DB session for future resume
+        if db_session_id:
             try:
                 async with aiosqlite.connect(str(db_path)) as db:
+                    updates = ["project = ?", "updated_at = ?"]
+                    params = [project_name, datetime.now().isoformat()]
+                    if new_session_id:
+                        updates.append("agent_session_id = ?")
+                        params.append(new_session_id)
+                    params.append(db_session_id)
                     await db.execute(
-                        "UPDATE sessions SET agent_session_id = ?, updated_at = ? WHERE id = ?",
-                        (new_session_id, datetime.now().isoformat(), db_session_id),
+                        f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?",
+                        params,
                     )
                     await db.commit()
             except Exception as e:
-                logger.warning("Failed to persist agent_session_id: {}", e)
+                logger.warning("Failed to update session after dispatch: {}", e)
 
         return {
             "project": project_name,

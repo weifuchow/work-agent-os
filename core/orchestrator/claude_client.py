@@ -6,7 +6,7 @@ from typing import Any, Optional
 import anthropic
 from loguru import logger
 
-from core.config import load_models_config, settings
+from core.config import load_models_config, get_model_override, settings
 
 try:
     from openai import AsyncOpenAI
@@ -39,15 +39,29 @@ class ClaudeClient:
 
     def _resolve_model(self, model: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
         config = self._models_config()
-        selected_id = model or config.get("default")
+        # Priority: explicit param > runtime override > yaml default
+        selected_id = model or get_model_override() or config.get("default")
         if not selected_id:
             raise ValueError("No default model configured in data/models.yaml")
 
         models = [item for item in config.get("models", []) if item.get("enabled", True)]
         match = next((item for item in models if item.get("id") == selected_id), None)
-        if not match:
-            raise ValueError(f"Model '{selected_id}' is not enabled in data/models.yaml")
-        return match, config
+        if match:
+            return match, config
+
+        # Model not in list — infer provider from model ID prefix
+        if selected_id.startswith("claude-") or selected_id.startswith("anthropic"):
+            provider = "anthropic"
+        else:
+            provider = "openai"
+        return {
+            "id": selected_id,
+            "provider": provider,
+            "label": selected_id,
+            "enabled": True,
+            "supports_chat": True,
+            "supports_agent": True,
+        }, config
 
     async def _create_anthropic_message(
         self,
