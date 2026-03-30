@@ -139,8 +139,8 @@ python scripts/migrate_agent_session.py
 3. 进度反馈和监控**不调用 LLM**，用 DB 查询和文件读取
 4. 日报从**实际对话数据**汇总，不凭空生成
 5. 所有操作写**审计日志**，pipeline 每轮记录完整 prompt 和 agent 结果
-6. Session 路由在 **pipeline 代码层强制执行**（chat_id + 2h 窗口匹配），不依赖模型调 tool
-7. 多轮对话通过 **chat_id + 时间窗口** 自动关联已有会话
+6. Session 路由在 **pipeline 代码层强制执行**，不依赖模型调 tool
+7. 多轮对话优先通过 **飞书话题（thread_id）** 关联会话，无话题时 fallback 到 chat_id + 时间窗口
 8. 所有时间使用**本地时间**（`datetime.now()`），不用 UTC
 9. **运行时模型切换** — `core/config.py` 内存 override，不修改 models.yaml；任意模型 ID 自动推断 provider
 10. **多轮 resume 精简 prompt** — 有 `agent_session_id` + `project` 时，prompt 只传新消息 + session_id，不重复元数据
