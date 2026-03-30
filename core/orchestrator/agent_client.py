@@ -444,6 +444,24 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     if not project:
         return {"error": f"Project '{project_name}' not found. Call list_projects to see available projects."}
 
+    # Track dispatch as a separate AgentRun
+    import aiosqlite
+    from datetime import datetime
+    db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
+    dispatch_run_id = None
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            now = datetime.now().isoformat()
+            cursor = await db.execute(
+                "INSERT INTO agent_runs (agent_name, runtime_type, session_id, status, started_at) "
+                "VALUES (?,?,?,?,?)",
+                (f"dispatch:{project_name}", "agent_sdk", db_session_id, "running", now),
+            )
+            dispatch_run_id = cursor.lastrowid
+            await db.commit()
+    except Exception as e:
+        logger.warning("Failed to create dispatch AgentRun: {}", e)
+
     # Merge skills: project overrides global
     merged_agents = merge_skills(SKILL_REGISTRY, project.path)
 
@@ -481,12 +499,23 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
         new_session_id = result.get("session_id")
 
+        # Update dispatch AgentRun with result
+        if dispatch_run_id:
+            try:
+                async with aiosqlite.connect(str(db_path)) as db:
+                    now = datetime.now().isoformat()
+                    await db.execute(
+                        "UPDATE agent_runs SET status=?, ended_at=?, cost_usd=?, output_path=? WHERE id=?",
+                        ("success", now, result.get("cost_usd", 0),
+                         result.get("text", "")[:2000], dispatch_run_id),
+                    )
+                    await db.commit()
+            except Exception as e:
+                logger.warning("Failed to update dispatch AgentRun: {}", e)
+
         # Persist the SDK session_id to DB session for future resume
         if new_session_id and db_session_id:
             try:
-                import aiosqlite
-                from datetime import datetime, UTC
-                db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
                 async with aiosqlite.connect(str(db_path)) as db:
                     await db.execute(
                         "UPDATE sessions SET agent_session_id = ?, updated_at = ? WHERE id = ?",
@@ -503,6 +532,18 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         }
     except Exception as e:
         logger.exception("dispatch_to_project failed for {}: {}", project_name, e)
+        # Mark dispatch AgentRun as failed
+        if dispatch_run_id:
+            try:
+                async with aiosqlite.connect(str(db_path)) as db:
+                    now = datetime.now().isoformat()
+                    await db.execute(
+                        "UPDATE agent_runs SET status=?, ended_at=?, error_message=? WHERE id=?",
+                        ("failed", now, str(e)[:500], dispatch_run_id),
+                    )
+                    await db.commit()
+            except Exception:
+                pass
         return {"error": str(e), "project": project_name}
 
 
@@ -645,6 +686,7 @@ class AgentClient:
 
         result_text = ""
         result_session_id = session_id
+        result_meta = {}
 
         async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, AssistantMessage) and msg.content:
@@ -653,8 +695,14 @@ class AgentClient:
                         result_text = block.text
             elif isinstance(msg, ResultMessage):
                 result_session_id = msg.session_id
+                result_meta = {
+                    "duration_ms": msg.duration_ms,
+                    "num_turns": msg.num_turns,
+                    "cost_usd": msg.total_cost_usd,
+                    "is_error": msg.is_error,
+                }
 
-        return {"text": result_text, "session_id": result_session_id}
+        return {"text": result_text, "session_id": result_session_id, **result_meta}
 
     async def run_stream(
         self,
@@ -733,6 +781,7 @@ class AgentClient:
 
         result_text = ""
         result_session_id = None
+        result_meta = {}
 
         async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, AssistantMessage) and msg.content:
@@ -741,8 +790,14 @@ class AgentClient:
                         result_text = block.text
             elif isinstance(msg, ResultMessage):
                 result_session_id = msg.session_id
+                result_meta = {
+                    "duration_ms": msg.duration_ms,
+                    "num_turns": msg.num_turns,
+                    "cost_usd": msg.total_cost_usd,
+                    "is_error": msg.is_error,
+                }
 
-        return {"text": result_text, "session_id": result_session_id}
+        return {"text": result_text, "session_id": result_session_id, **result_meta}
 
     # ---- Session Management ----
 

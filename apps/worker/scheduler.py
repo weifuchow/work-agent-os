@@ -96,20 +96,19 @@ def main():
     # 1 LLM call: daily report at 8:00 AM
     scheduler.add_job(daily_report_job, "cron", hour=8, minute=0, id="daily_report")
 
-    scheduler.start()
-    logger.info(
-        "Scheduler started — monitor(2m), lifecycle(1h), consolidation(6h), report(8:00)"
-    )
+    async def _run():
+        scheduler.start()
+        logger.info(
+            "Scheduler started — monitor(2m), lifecycle(1h), consolidation(6h), report(8:00)"
+        )
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            scheduler.shutdown()
+            logger.info("Scheduler stopped")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_forever()
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
-        logger.info("Scheduler stopped")
-    finally:
-        loop.close()
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

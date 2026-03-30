@@ -176,6 +176,84 @@ async def list_audit_logs(
     }
 
 
+# ---------- Agent Runs ----------
+
+@router.get("/agent-runs/inflight")
+async def get_inflight_runs(db: AsyncSession = Depends(get_session)):
+    """Get all currently running agent tasks — real-time observability."""
+    stmt = select(AgentRun).where(AgentRun.status == AgentRunStatus.running)
+    runs = (await db.execute(stmt)).scalars().all()
+
+    now = datetime.now()
+    items = []
+    for r in runs:
+        elapsed = (now - r.started_at).total_seconds() if r.started_at else 0
+        items.append({
+            "id": r.id,
+            "agent_name": r.agent_name,
+            "runtime_type": r.runtime_type,
+            "message_id": r.message_id,
+            "session_id": r.session_id,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "elapsed_seconds": round(elapsed, 1),
+        })
+
+    return {"items": items, "total_running": len(items)}
+
+
+@router.get("/agent-runs")
+async def list_agent_runs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    """List agent run history with filtering."""
+    query = select(AgentRun)
+    count_query = select(func.count(AgentRun.id))
+
+    if status:
+        query = query.where(AgentRun.status == status)
+        count_query = count_query.where(AgentRun.status == status)
+    if agent_name:
+        query = query.where(AgentRun.agent_name == agent_name)
+        count_query = count_query.where(AgentRun.agent_name == agent_name)
+
+    total = (await db.execute(count_query)).scalar() or 0
+
+    query = query.order_by(desc(AgentRun.id)) \
+        .offset((page - 1) * page_size) \
+        .limit(page_size)
+    runs = (await db.execute(query)).scalars().all()
+
+    items = []
+    for r in runs:
+        duration = None
+        if r.started_at and r.ended_at:
+            duration = round((r.ended_at - r.started_at).total_seconds(), 1)
+        elif r.started_at and r.status == AgentRunStatus.running:
+            duration = round((datetime.now() - r.started_at).total_seconds(), 1)
+
+        items.append({
+            "id": r.id,
+            "agent_name": r.agent_name,
+            "runtime_type": r.runtime_type,
+            "message_id": r.message_id,
+            "session_id": r.session_id,
+            "status": r.status,
+            "cost_usd": r.cost_usd,
+            "input_tokens": r.input_tokens,
+            "output_tokens": r.output_tokens,
+            "duration_seconds": duration,
+            "error_message": r.error_message or None,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        })
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
 # ---------- Stats ----------
 
 @router.get("/stats")

@@ -23,7 +23,7 @@ async def check_running_tasks() -> dict:
     Returns summary of checks performed.
     """
     async with async_session_factory() as db:
-        counts = {"running": 0, "stuck": 0, "notified": 0}
+        counts = {"running": 0, "stuck": 0, "notified": 0, "inflight": []}
 
         # 1. Check stuck pipelines (classifying/routing for > 5 min)
         cutoff = datetime.now() - timedelta(minutes=5)
@@ -40,17 +40,20 @@ async def check_running_tasks() -> dict:
             logger.warning("Monitor: message {} stuck in {} for >5min",
                            msg.id, msg.pipeline_status)
 
-        # 2. Check running agent_runs (running for > 3 min)
-        agent_cutoff = datetime.now() - timedelta(minutes=3)
-        stmt = select(AgentRun).where(and_(
-            AgentRun.status == AgentRunStatus.running,
-            AgentRun.started_at < agent_cutoff,
-        ))
-        stuck_runs = (await db.execute(stmt)).scalars().all()
-        for run in stuck_runs:
+        # 2. Collect all running agent_runs (observability, no auto-action)
+        stmt = select(AgentRun).where(AgentRun.status == AgentRunStatus.running)
+        running_runs = (await db.execute(stmt)).scalars().all()
+        now = datetime.now()
+        for run in running_runs:
             counts["running"] += 1
-            logger.warning("Monitor: agent_run {} ({}) running for >3min",
-                           run.id, run.agent_name)
+            elapsed = (now - run.started_at).total_seconds() if run.started_at else 0
+            counts["inflight"].append({
+                "id": run.id,
+                "agent_name": run.agent_name,
+                "message_id": run.message_id,
+                "session_id": run.session_id,
+                "elapsed_seconds": round(elapsed, 1),
+            })
 
         # 3. Report recently completed tasks (last check interval)
         interval = datetime.now() - timedelta(minutes=2)
@@ -62,11 +65,34 @@ async def check_running_tasks() -> dict:
         for msg in recent_completed:
             counts["notified"] += 1
 
-        if counts["stuck"] > 0:
-            logger.info("Monitor: {} stuck, {} running, {} recently completed",
-                        counts["stuck"], counts["running"], counts["notified"])
+        if counts["running"] > 0:
+            logger.info("Monitor: {} inflight, {} stuck, {} recently completed",
+                        counts["running"], counts["stuck"], counts["notified"])
 
         return counts
+
+
+async def get_inflight_summary() -> str:
+    """Get a human-readable summary of all in-flight agent tasks. No LLM."""
+    async with async_session_factory() as db:
+        stmt = select(AgentRun).where(AgentRun.status == AgentRunStatus.running)
+        runs = (await db.execute(stmt)).scalars().all()
+
+        if not runs:
+            return "当前没有正在执行的任务"
+
+        now = datetime.now()
+        lines = [f"当前 {len(runs)} 个任务正在执行："]
+        for r in runs:
+            elapsed = (now - r.started_at).total_seconds() if r.started_at else 0
+            if elapsed < 60:
+                duration_str = f"{elapsed:.0f}s"
+            else:
+                duration_str = f"{elapsed / 60:.1f}min"
+            msg_info = f" (消息#{r.message_id})" if r.message_id else ""
+            lines.append(f"  🔄 [{r.agent_name}] 已运行 {duration_str}{msg_info}")
+
+        return "\n".join(lines)
 
 
 async def get_task_status_text(session_id: int) -> str:

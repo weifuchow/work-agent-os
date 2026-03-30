@@ -310,6 +310,7 @@ async def process_message(message_id: int) -> None:
             run.ended_at = datetime.now()
             run.output_path = result_text[:2000]
             run.session_id = msg.session_id
+            run.cost_usd = result.get("cost_usd") or 0
             if agent_session_id:
                 run.input_path = f"agent_session:{agent_session_id}"
                 # Persist SDK session ID to the DB session for future resume

@@ -1,5 +1,5 @@
 default: claude-opus-4-6
-fallback: claude-sonnet-4-6
+fallback: gpt-5.4
 
 providers:
   anthropic:
@@ -20,14 +20,14 @@ models:
   - id: claude-sonnet-4-6
     provider: anthropic
     label: Claude Sonnet 4.6
-    enabled: true
+    enabled: false
     supports_chat: true
     supports_agent: true
 
   - id: claude-haiku-4-5
     provider: anthropic
     label: Claude Haiku 4.5
-    enabled: true
+    enabled: false
     supports_chat: true
     supports_agent: false
 
@@ -36,4 +36,4 @@ models:
     label: GPT-5.4
     enabled: true
     supports_chat: true
-    supports_agent: false
+    supports_agent: true
