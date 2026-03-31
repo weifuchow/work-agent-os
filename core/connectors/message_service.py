@@ -72,10 +72,20 @@ async def save_and_process(session: AsyncSession, event_data: dict) -> Message |
     """Save message and trigger async pipeline processing.
 
     Intercepts special commands (e.g. /m <model>) before pipeline.
+    Adds an emoji reaction to acknowledge receipt.
     """
     import asyncio
 
     content = (event_data.get("content") or "").strip()
+
+    # ── Immediate ack: react 👀 to show "received" ──
+    platform_message_id = event_data.get("platform_message_id", "")
+    if platform_message_id:
+        try:
+            from core.connectors.feishu import FeishuClient
+            FeishuClient().react_to_message(platform_message_id, emoji="GLANCE")
+        except Exception:
+            pass  # Non-critical — don't block message processing
 
     # ── Command: /m <model_id> — switch runtime model ──
     if content.startswith("/m "):

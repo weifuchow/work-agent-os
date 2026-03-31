@@ -1,6 +1,8 @@
 """Feishu WebSocket long-connection connector using lark-oapi SDK."""
 
 import json
+import os
+import tempfile
 from typing import Callable, Optional
 
 import lark_oapi as lark
@@ -43,6 +45,36 @@ class FeishuClient:
         logger.info("Starting Feishu WebSocket connection...")
         ws_client.start()
 
+    def react_to_message(self, message_id: str, emoji: str = "GLANCE") -> bool:
+        """Add an emoji reaction to a message.
+
+        Args:
+            message_id: The Feishu message ID.
+            emoji: Emoji type string (e.g. "Eyes", "Thumbsup", "Done").
+
+        Returns True on success.
+        """
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+        )
+
+        request = CreateMessageReactionRequest.builder() \
+            .message_id(message_id) \
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": emoji})
+                .build()
+            ).build()
+
+        response = self._client.im.v1.message_reaction.create(request)
+        if not response.success():
+            logger.warning("Failed to react to message {}: code={}, msg={}",
+                           message_id, response.code, response.msg)
+            return False
+        logger.debug("Reacted {} to message {}", emoji, message_id)
+        return True
+
     def _handle_message_event(self, data) -> None:
         """Handle im.message.receive_v1 event."""
         try:
@@ -63,13 +95,8 @@ class FeishuClient:
                 logger.debug("Ignoring bot message from {}", sender_id)
                 return
 
-            # Parse content
-            content = ""
-            if message_type == "text":
-                try:
-                    content = json.loads(content_raw).get("text", "")
-                except (json.JSONDecodeError, TypeError):
-                    content = content_raw or ""
+            # Parse content — support multimodal types
+            content, media_info = _parse_message_content(message_type, content_raw)
 
             # For group messages, check if bot is mentioned
             mentions = message.mentions or []
@@ -93,6 +120,7 @@ class FeishuClient:
                 "message_type": message_type,
                 "content": content,
                 "content_raw": content_raw,
+                "media_info": media_info,
                 "is_mentioned": is_mentioned,
                 "mentions": [{"key": m.key, "id": m.id.open_id, "name": m.name} for m in mentions] if mentions else [],
                 "thread_id": thread_id,
@@ -190,3 +218,105 @@ class FeishuClient:
         logger.info("Replied to message {} (thread_id={}, reply_in_thread={})",
                      message_id, result["thread_id"], reply_in_thread)
         return result
+
+
+def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, dict]:
+    """Parse Feishu message content for all supported types.
+
+    Returns (text_content, media_info) where media_info contains
+    download keys, filenames, etc. for non-text types.
+    """
+    content = ""
+    media_info: dict = {}
+
+    try:
+        data = json.loads(content_raw) if content_raw else {}
+    except (json.JSONDecodeError, TypeError):
+        return content_raw or "", media_info
+
+    if message_type == "text":
+        content = data.get("text", "")
+
+    elif message_type == "image":
+        img_key = data.get("image_key", "")
+        content = f"[图片]"
+        media_info = {"type": "image", "image_key": img_key}
+
+    elif message_type == "file":
+        file_key = data.get("file_key", "")
+        file_name = data.get("file_name", "")
+        content = f"[文件: {file_name}]" if file_name else "[文件]"
+        media_info = {"type": "file", "file_key": file_key, "file_name": file_name}
+
+    elif message_type == "video":
+        video_key = data.get("video_key", "")
+        file_name = data.get("file_name", "")
+        content = f"[视频: {file_name}]" if file_name else "[视频]"
+        media_info = {"type": "video", "video_key": video_key, "file_name": file_name}
+
+    elif message_type == "audio":
+        audio_key = data.get("file_key", "")
+        file_name = data.get("file_name", "")
+        content = f"[语音: {file_name}]" if file_name else "[语音]"
+        media_info = {"type": "audio", "file_key": audio_key, "file_name": file_name}
+
+    elif message_type == "post":
+        # Rich text post — extract plain text from all content sections
+        title = data.get("title", "")
+        paragraphs = []
+        for lang_content in data.get("content", []):
+            if not isinstance(lang_content, list):
+                continue
+            for block in lang_content:
+                if not isinstance(block, list):
+                    # Single element (dict) directly in the content array
+                    if isinstance(block, dict):
+                        if block.get("tag") == "text":
+                            paragraphs.append(block.get("text", ""))
+                        elif block.get("tag") == "at":
+                            paragraphs.append(block.get("user_name", "@user"))
+                        elif block.get("tag") == "a":
+                            paragraphs.append(block.get("text", "") or block.get("href", ""))
+                    continue
+                for elem in block:
+                    if not isinstance(elem, dict):
+                        continue
+                    if elem.get("tag") == "text":
+                        paragraphs.append(elem.get("text", ""))
+                    elif elem.get("tag") == "at":
+                        paragraphs.append(elem.get("user_name", "@user"))
+                    elif elem.get("tag") == "a":
+                        paragraphs.append(elem.get("text", "") or elem.get("href", ""))
+        body_text = "\n".join(paragraphs)
+        content = f"{title}\n{body_text}" if title else body_text
+        media_info = {"type": "post", "title": title}
+
+    elif message_type == "interactive":
+        # Interactive card — extract card elements text
+        card = data.get("card", {})
+        elements = card.get("elements", [])
+        texts = []
+        header = card.get("header", {})
+        if header.get("title", {}).get("tag") == "plain_text":
+            texts.append(header["title"].get("content", ""))
+        for elem in elements:
+            if elem.get("tag") == "div" and elem.get("text", {}).get("tag") == "plain_text":
+                texts.append(elem["text"].get("content", ""))
+        content = "\n".join(texts) if texts else "[卡片消息]"
+        media_info = {"type": "interactive"}
+
+    elif message_type == "sticker":
+        # Sticker / emoji
+        content = f"[表情]"
+        media_info = {"type": "sticker"}
+
+    elif message_type == "share_chat" or message_type == "share_user":
+        content = f"[分享]"
+        media_info = {"type": message_type}
+
+    else:
+        # Unknown type — use raw content as fallback
+        content = f"[{message_type}消息] " + (data.get("text", "") or "")
+        media_info = {"type": message_type}
+
+    return content, media_info

@@ -116,6 +116,7 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用
 - 不要对闲聊消息调用 intake/analysis，直接回复即可
 - 高风险事项（承诺排期、确认上线、技术方案拍板）必须 draft，不能 auto
 - 回复要简洁、专业、有帮助
+- **多模态消息**：用户可能发送图片、文件、视频、语音等，prompt 中会包含 `[多模态内容]` 描述。对于图片，描述其内容（如果能获取到信息）；对于文件，了解文件用途后回复；对于语音，根据转写内容处理。如果无法直接处理媒体内容，告知用户你已收到并说明你的理解。
 """
 
 
@@ -404,18 +405,95 @@ def _build_prompt(msg: Message, session_context: dict | None = None) -> str:
     db_sid = session_context.get("db_session_id", "") if session_context else ""
     platform_mid = msg.platform_message_id
 
+    # Extract multimodal info from raw_payload
+    media_desc = _extract_media_description(msg)
+
     # Resume: SDK has full context, only send new message
     if session_context and session_context.get("agent_session_id"):
         project = session_context.get("project", "")
         prompt = f"db_session_id: {db_sid} | 飞书消息ID: {platform_mid}\n\n{msg.content}"
+        if media_desc:
+            prompt += f"\n\n[多模态内容] {media_desc}"
         if project:
             prompt += f"\n\n项目: {project}\n请 dispatch_to_project 并传入 session_id 恢复上下文。"
         return prompt
 
     # New session: minimal context
-    return f"""飞书消息ID: {platform_mid} | 聊天ID: {msg.chat_id} | db_session_id: {db_sid}
+    parts = [f"飞书消息ID: {platform_mid} | 聊天ID: {msg.chat_id} | db_session_id: {db_sid}"]
+    if media_desc:
+        parts.append(f"[多模态内容] {media_desc}")
+    parts.append("")
+    parts.append(msg.content)
+    return "\n".join(parts)
 
-{msg.content}"""
+
+def _extract_media_description(msg: Message) -> str:
+    """Extract a human-readable description of multimodal content from message fields."""
+    if msg.message_type == "text" or not msg.message_type:
+        return ""
+
+    # msg.content already contains "[图片]", "[文件: xxx]", etc. from feishu parser
+    # We also try to extract richer info from raw_payload if available
+    media_detail = ""
+    if msg.raw_payload:
+        try:
+            payload = json.loads(msg.raw_payload)
+            # Try to find content_raw in the serialized event dict
+            # The structure varies but typically: {"event": {"message": {...}}}
+            # or flat dict depending on SDK serialization
+            msg_data = _find_message_in_payload(payload)
+            if msg_data:
+                content_raw = msg_data.get("content", "")
+                try:
+                    content_data = json.loads(content_raw) if content_raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    content_data = {}
+
+                msg_type = msg_data.get("message_type", msg.message_type)
+                if msg_type == "image" and content_data.get("image_key"):
+                    media_detail = f" (image_key: {content_data['image_key']})"
+                elif msg_type == "file":
+                    parts = []
+                    if content_data.get("file_name"):
+                        parts.append(f"文件名: {content_data['file_name']}")
+                    if content_data.get("file_key"):
+                        parts.append(f"file_key: {content_data['file_key']}")
+                    if parts:
+                        media_detail = f" ({', '.join(parts)})"
+                elif msg_type == "video":
+                    parts = []
+                    if content_data.get("file_name"):
+                        parts.append(f"文件名: {content_data['file_name']}")
+                    if content_data.get("video_key"):
+                        parts.append(f"video_key: {content_data['video_key']}")
+                    if parts:
+                        media_detail = f" ({', '.join(parts)})"
+        except Exception:
+            pass
+
+    return f"用户发送了{msg.content[1:-1] if msg.content.startswith('[') else msg.message_type + '消息'}{media_detail}"
+
+
+def _find_message_in_payload(payload: dict) -> dict:
+    """Recursively find message data dict in the serialized payload."""
+    if not isinstance(payload, dict):
+        return {}
+    # Direct message keys
+    if "message_type" in payload and "content" in payload:
+        return payload
+    # Nested under "event"
+    event = payload.get("event")
+    if isinstance(event, dict):
+        msg = event.get("message")
+        if isinstance(msg, dict):
+            return msg
+    # Try nested dict values
+    for v in payload.values():
+        if isinstance(v, dict):
+            result = _find_message_in_payload(v)
+            if result:
+                return result
+    return {}
 
 
 def _parse_result(text: str) -> dict:
