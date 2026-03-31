@@ -28,3 +28,12 @@ projects:
       Riot 2.0 单体版。Java 11 + Spring Boot + Maven 多模块。
       前代车队调度系统，模块：bootstrap/device/task/fcs（Fleet Control System）/
       brokerx/security。使用 Flyway 数据库迁移，sprint/release/master 分支流程。
+
+  - name: allsparkbox
+    path: D:/standard/riot/allsparkbox
+    description: >
+      RIOT3 部署构建包。Docker/Podman 一键安装方案。
+      涵盖：镜像构建流程（Makefile + Dockerfile）、分层镜像依赖链（base→mysql→taos→grafana→
+      mosquitto→admin→allspark→mip→set→middler）、Linux/Windows 部署方法、
+      端口配置、数据卷挂载、supervisord 服务管理、中控部署、Podman 适配。
+      关键文件：RIOT3部署文档.md（完整部署手册）、README.md（构建指南）、images/（镜像构建脚本）。

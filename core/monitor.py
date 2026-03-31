@@ -12,8 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import async_session_factory
 from models.db import AgentRun, AgentRunStatus, AuditLog, Message, PipelineStatus, Session
 
-# Maximum auto-retries before giving up and marking the message failed.
-MAX_STUCK_RETRIES = 3
+# Max time before marking a truly stuck message as failed (not just slow).
+MAX_STUCK_MINUTES = 30
+
+# Time to wait before first "thinking" notification.
+THINKING_NOTIFY_MINUTES = 5
 
 
 async def check_running_tasks() -> dict:
@@ -25,20 +28,53 @@ async def check_running_tasks() -> dict:
     async with async_session_factory() as db:
         counts = {"running": 0, "stuck": 0, "notified": 0, "inflight": []}
 
-        # 1. Check stuck pipelines (classifying/routing for > 5 min)
-        cutoff = datetime.now() - timedelta(minutes=5)
+        # 1. Check stuck pipelines — distinguish "slow" vs "truly stuck"
+        thinking_cutoff = datetime.now() - timedelta(minutes=THINKING_NOTIFY_MINUTES)
+        failed_cutoff = datetime.now() - timedelta(minutes=MAX_STUCK_MINUTES)
+
+        # 1a. Slow messages (>3 min) — reply "thinking" in thread (once)
         stmt = select(Message).where(and_(
             Message.pipeline_status.in_([
                 PipelineStatus.classifying, PipelineStatus.routing,
             ]),
-            Message.received_at < cutoff,
+            Message.received_at < thinking_cutoff,
+            Message.received_at >= failed_cutoff,
+        ))
+        slow_msgs = (await db.execute(stmt)).scalars().all()
+        for msg in slow_msgs:
+            await _notify_thinking(msg)
+            counts["notified"] += 1
+
+        # 1b. Truly stuck messages (>30 min) — check if agent_run has failed
+        stmt = select(Message).where(and_(
+            Message.pipeline_status.in_([
+                PipelineStatus.classifying, PipelineStatus.routing,
+            ]),
+            Message.received_at < failed_cutoff,
         ))
         stuck_msgs = (await db.execute(stmt)).scalars().all()
         for msg in stuck_msgs:
-            counts["stuck"] += 1
-            await _notify_stuck(msg)
-            logger.warning("Monitor: message {} stuck in {} for >5min",
-                           msg.id, msg.pipeline_status)
+            # Check if there's a failed agent_run — that's a clear failure
+            has_failed_run = False
+            run_stmt = select(AgentRun).where(and_(
+                AgentRun.message_id == msg.id,
+                AgentRun.status == AgentRunStatus.failed,
+            ))
+            failed_run = (await db.execute(run_stmt)).scalar_one_or_none()
+            if failed_run:
+                has_failed_run = True
+
+            if has_failed_run:
+                # Clear failure — retry
+                counts["stuck"] += 1
+                await _notify_and_retry(msg)
+                logger.warning("Monitor: message {} has failed agent_run, retrying", msg.id)
+            else:
+                # No failure but very slow — just notify again
+                await _notify_thinking(msg, force=True)
+                counts["notified"] += 1
+                logger.info("Monitor: message {} still processing after >{}min",
+                            msg.id, MAX_STUCK_MINUTES)
 
         # 2. Collect all running agent_runs (observability, no auto-action)
         stmt = select(AgentRun).where(AgentRun.status == AgentRunStatus.running)
@@ -153,26 +189,77 @@ async def get_task_status_text(session_id: int) -> str:
         return "\n".join(lines)
 
 
-async def _notify_stuck(msg: Message) -> None:
-    """Notify about a stuck message via Feishu and auto-retry with cap. No LLM."""
-    # Parse retry count from pipeline_error field
+async def _notify_thinking(msg: Message, force: bool = False) -> None:
+    """Reply 'thinking' in the thread for slow-but-alive messages. No LLM.
+
+    Sends a progress update with cumulative elapsed time each check cycle.
+    Uses reply_message to post inside the thread/topic.
+    """
+    try:
+        from core.connectors.feishu import FeishuClient
+        client = FeishuClient()
+
+        elapsed = (datetime.now() - msg.received_at).total_seconds()
+        if elapsed < 120:
+            duration_str = f"{elapsed:.0f}秒"
+        else:
+            minutes = int(elapsed // 60)
+            duration_str = f"{minutes}分钟"
+
+        text = f"🤔 模型正在思考中，请稍等... 已思考 {duration_str}"
+
+        # Reply in thread if possible (creates thread on first reply)
+        if msg.platform_message_id:
+            result = client.reply_message(
+                message_id=msg.platform_message_id,
+                content=text,
+                reply_in_thread=True,
+            )
+            # Bind thread_id to session if new thread created
+            if result and msg.session_id:
+                thread_id = result.get("thread_id", "")
+                if thread_id:
+                    try:
+                        async with async_session_factory() as db:
+                            sess = await db.get(Session, msg.session_id)
+                            if sess and not sess.thread_id:
+                                sess.thread_id = thread_id
+                                await db.commit()
+                    except Exception:
+                        pass
+        else:
+            client.send_message(receive_id=msg.chat_id, content=text)
+    except Exception as e:
+        logger.warning("Failed to send thinking notification: {}", e)
+
+
+async def _notify_and_retry(msg: Message) -> None:
+    """Retry a clearly failed message (agent_run has failed status). No LLM.
+
+    Parse retry count from pipeline_error, cap at MAX_STUCK_RETRIES.
+    """
     retry_count = 0
-    if msg.pipeline_error and msg.pipeline_error.startswith("auto-retry"):
-        # Format: "auto-retry #N after stuck"
-        try:
-            retry_count = int(msg.pipeline_error.split("#")[1].split(" ")[0])
-        except (IndexError, ValueError):
-            retry_count = 1  # at least one prior retry if prefix exists
+    if msg.pipeline_error:
+        import re
+        match = re.search(r"auto-retry #(\d+)", msg.pipeline_error)
+        if match:
+            retry_count = int(match.group(1))
 
     if retry_count >= MAX_STUCK_RETRIES:
-        # Give up — mark as failed
         try:
             from core.connectors.feishu import FeishuClient
             client = FeishuClient()
             text = f"❌ 消息 #{msg.id} 处理失败（重试 {retry_count} 次后放弃）"
-            client.send_message(receive_id=msg.chat_id, content=text)
+            if msg.platform_message_id:
+                client.reply_message(
+                    message_id=msg.platform_message_id,
+                    content=text,
+                    reply_in_thread=True,
+                )
+            else:
+                client.send_message(receive_id=msg.chat_id, content=text)
         except Exception as e:
-            logger.warning("Failed to notify stuck message: {}", e)
+            logger.warning("Failed to notify failed message: {}", e)
 
         async with async_session_factory() as db:
             m = await db.get(Message, msg.id)
@@ -186,17 +273,24 @@ async def _notify_stuck(msg: Message) -> None:
     try:
         from core.connectors.feishu import FeishuClient
         client = FeishuClient()
-        text = f"⚠️ 消息 #{msg.id} 处理卡住（{msg.pipeline_status}），正在重试（{retry_count + 1}/{MAX_STUCK_RETRIES}）..."
-        client.send_message(receive_id=msg.chat_id, content=text)
+        text = f"🔄 消息 #{msg.id} 处理异常，正在重试（{retry_count + 1}/{MAX_STUCK_RETRIES}）..."
+        if msg.platform_message_id:
+            client.reply_message(
+                message_id=msg.platform_message_id,
+                content=text,
+                reply_in_thread=True,
+            )
+        else:
+            client.send_message(receive_id=msg.chat_id, content=text)
     except Exception as e:
-        logger.warning("Failed to notify stuck message: {}", e)
+        logger.warning("Failed to notify retry message: {}", e)
 
     # Auto-retry by resetting to pending
     async with async_session_factory() as db:
         m = await db.get(Message, msg.id)
         if m and m.pipeline_status not in (PipelineStatus.completed, PipelineStatus.skipped):
             m.pipeline_status = PipelineStatus.pending
-            m.pipeline_error = f"auto-retry #{retry_count + 1} after stuck"
+            m.pipeline_error = f"auto-retry #{retry_count + 1} after failed agent_run"
             await db.commit()
 
             import asyncio

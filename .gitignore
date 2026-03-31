@@ -25,6 +25,8 @@ env/
 data/db/
 data/audit/*.log
 data/memory/
+data/*.restart.log
+data/reports/
 
 # Claude Code
 .claude/settings.json
