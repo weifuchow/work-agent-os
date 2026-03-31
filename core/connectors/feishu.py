@@ -77,6 +77,11 @@ class FeishuClient:
                 m.name == settings.feishu_bot_name for m in mentions
             ) if mentions else False
 
+            # Thread fields — non-empty when message is inside a thread/topic
+            thread_id = getattr(message, "thread_id", "") or ""
+            root_id = getattr(message, "root_id", "") or ""
+            parent_id_val = getattr(message, "parent_id", "") or ""
+
             event_data = {
                 "platform": "feishu",
                 "platform_message_id": message_id,
@@ -90,6 +95,9 @@ class FeishuClient:
                 "content_raw": content_raw,
                 "is_mentioned": is_mentioned,
                 "mentions": [{"key": m.key, "id": m.id.open_id, "name": m.name} for m in mentions] if mentions else [],
+                "thread_id": thread_id,
+                "root_id": root_id,
+                "parent_id": parent_id_val,
                 "raw_payload": json.dumps(data.__dict__, default=str),
             }
 
@@ -135,8 +143,17 @@ class FeishuClient:
         logger.info("Message sent to {}", receive_id)
         return True
 
-    def reply_message(self, message_id: str, content: str, msg_type: str = "text") -> bool:
-        """Reply to a specific message."""
+    def reply_message(self, message_id: str, content: str, msg_type: str = "text",
+                      reply_in_thread: bool = False) -> dict | None:
+        """Reply to a specific message.
+
+        Args:
+            reply_in_thread: If True, creates a thread/topic on first reply,
+                             or replies inside an existing thread.
+
+        Returns:
+            dict with message_id and thread_id from response, or None on failure.
+        """
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
         if msg_type == "text":
@@ -144,14 +161,16 @@ class FeishuClient:
         else:
             body_content = content
 
+        body_builder = ReplyMessageRequestBody.builder() \
+            .msg_type(msg_type) \
+            .content(body_content)
+        if reply_in_thread:
+            body_builder = body_builder.reply_in_thread(True)
+
         request = ReplyMessageRequest.builder() \
             .message_id(message_id) \
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type(msg_type)
-                .content(body_content)
-                .build()
-            ).build()
+            .request_body(body_builder.build()) \
+            .build()
 
         response = self._client.im.v1.message.reply(request)
 
@@ -160,7 +179,14 @@ class FeishuClient:
                 "Failed to reply message: code={}, msg={}",
                 response.code, response.msg
             )
-            return False
+            return None
 
-        logger.info("Replied to message {}", message_id)
-        return True
+        resp_data = response.data
+        result = {
+            "message_id": getattr(resp_data, "message_id", "") or "",
+            "thread_id": getattr(resp_data, "thread_id", "") or "",
+            "root_id": getattr(resp_data, "root_id", "") or "",
+        }
+        logger.info("Replied to message {} (thread_id={}, reply_in_thread={})",
+                     message_id, result["thread_id"], reply_in_thread)
+        return result

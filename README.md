@@ -203,18 +203,19 @@ pytest tests/test_multiturn_session.py -v
 
 ## 下阶段计划
 
-### Phase 8: 飞书话题会话跟踪
+### Phase 8: 飞书话题会话跟踪 ✅
 
 **目标**: 用飞书话题（Thread）替代时间窗口，实现精确的多轮会话关联。
 
-**现状问题**: 当前靠 `chat_id + 2h 时间窗口` 猜测会话归属，超时后新建 session，但用户可能还在聊同一件事。
+**已完成**:
 
-**方案**: 利用飞书消息的 `thread_id`（话题 ID）作为会话关联的主键。
-
-- [ ] 解析飞书消息中的 `thread_id` / `root_id` 字段，入库存储
-- [ ] Session 路由优先用 `thread_id` 匹配，无话题时 fallback 到时间窗口
-- [ ] Bot 回复时在同一话题内回复（reply_in_thread），保持对话连贯
-- [ ] 新话题 = 新会话，话题内回复 = 续接会话
+- [x] 解析飞书消息中的 `thread_id` / `root_id` / `parent_id` 字段，入库存储
+- [x] Bot 回复使用 `reply_in_thread=true` 自动创建话题，`thread_id` 回写到 Session
+- [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建（移除 chat_id + 时间窗口猜测）
+- [x] 新增 `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
+- [x] 移除 `route_to_session` MCP tool，session 路由完全由 pipeline 代码层处理
+- [x] SDK session resume：有 `agent_session_id` 时传入 `session_id` 恢复上下文
+- [x] 精简 prompt：resume 时只传新消息 + 必要 ID，首次也只传核心信息
 - [ ] 管理后台按话题维度展示会话
 
 ### Phase 9: 飞书消息增强

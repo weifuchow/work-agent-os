@@ -80,7 +80,7 @@ async def write_audit_log(input: dict) -> dict[str, Any]:
 
 @tool(
     "send_feishu_message",
-    "通过飞书发送消息。",
+    "通过飞书发送消息到 chat_id（仅用于首次主动发消息，不创建话题）。回复用户消息请优先用 reply_to_message。",
     {"type": "object", "properties": {"receive_id": {"type": "string"}, "content": {"type": "string"}, "receive_id_type": {"type": "string", "enum": ["chat_id", "open_id"]}}, "required": ["receive_id", "content"]},
 )
 async def send_feishu_message(input: dict) -> dict[str, Any]:
@@ -89,6 +89,58 @@ async def send_feishu_message(input: dict) -> dict[str, Any]:
         client = FeishuClient()
         ok = client.send_message(receive_id=input["receive_id"], content=input["content"], receive_id_type=input.get("receive_id_type", "chat_id"))
         return {"success": ok}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool(
+    "reply_to_message",
+    "回复指定的飞书消息。设置 reply_in_thread=true 会创建话题（首次）或在现有话题内回复。返回 message_id 和 thread_id。",
+    {"type": "object", "properties": {
+        "message_id": {"type": "string", "description": "要回复的飞书消息 ID（platform_message_id）"},
+        "content": {"type": "string", "description": "回复内容"},
+        "reply_in_thread": {"type": "boolean", "description": "是否在话题内回复（默认 true）"},
+        "db_session_id": {"type": "integer", "description": "DB 会话 ID（可选，用于自动绑定 thread_id 到 session）"},
+    }, "required": ["message_id", "content"]},
+)
+async def reply_to_message(input: dict) -> dict[str, Any]:
+    try:
+        from core.connectors.feishu import FeishuClient
+        client = FeishuClient()
+        reply_in_thread = input.get("reply_in_thread", True)
+        result = client.reply_message(
+            message_id=input["message_id"],
+            content=input["content"],
+            reply_in_thread=reply_in_thread,
+        )
+        if result is None:
+            return {"success": False, "error": "Failed to reply message"}
+
+        # Auto-bind thread_id to session if provided
+        thread_id = result.get("thread_id", "")
+        db_session_id = input.get("db_session_id")
+        if thread_id and db_session_id:
+            try:
+                import aiosqlite
+                db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
+                async with aiosqlite.connect(str(db_path)) as db:
+                    # Only set if session doesn't already have a thread_id
+                    cursor = await db.execute(
+                        "SELECT thread_id FROM sessions WHERE id = ?", (db_session_id,)
+                    )
+                    row = await cursor.fetchone()
+                    if row and not row[0]:
+                        from datetime import datetime
+                        await db.execute(
+                            "UPDATE sessions SET thread_id = ?, updated_at = ? WHERE id = ?",
+                            (thread_id, datetime.now().isoformat(), db_session_id),
+                        )
+                        await db.commit()
+                        logger.info("Bound thread_id {} to session {}", thread_id, db_session_id)
+            except Exception as e:
+                logger.warning("Failed to bind thread_id to session: {}", e)
+
+        return {"success": True, **result}
     except Exception as e:
         return {"error": str(e)}
 
@@ -223,88 +275,6 @@ async def update_session(input: dict) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-@tool(
-    "route_to_session",
-    "根据 chat_id 和 topic/project 查找或创建工作会话。返回 session_id。",
-    {"type": "object", "properties": {
-        "chat_id": {"type": "string", "description": "飞书 chat_id"},
-        "sender_id": {"type": "string", "description": "发送者 ID"},
-        "message_id": {"type": "integer", "description": "消息 DB ID"},
-        "topic": {"type": "string", "description": "消息主题"},
-        "project": {"type": "string", "description": "涉及的项目"},
-        "priority": {"type": "string", "description": "优先级: high/normal/low"},
-        "summary": {"type": "string", "description": "消息摘要"},
-    }, "required": ["chat_id", "sender_id", "message_id"]},
-)
-async def route_to_session(input: dict) -> dict[str, Any]:
-    """Find or create a session and attach the message to it."""
-    import aiosqlite
-    from datetime import datetime, UTC, timedelta
-
-    db_path = PROJECT_ROOT / "data" / "db" / "app.sqlite"
-    chat_id = input["chat_id"]
-    project = input.get("project", "")
-    topic = input.get("topic", "")
-    cutoff = (datetime.now() - timedelta(hours=2)).isoformat()
-
-    try:
-        async with aiosqlite.connect(str(db_path)) as db:
-            db.row_factory = aiosqlite.Row
-
-            # Strategy 1: same chat_id + project + active within 2h
-            if project:
-                cursor = await db.execute(
-                    "SELECT id, title, topic, project, agent_session_id FROM sessions "
-                    "WHERE source_chat_id = ? AND project = ? AND status IN ('open','waiting') "
-                    "AND last_active_at >= ? ORDER BY last_active_at DESC LIMIT 1",
-                    (chat_id, project, cutoff),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    await _attach_msg_to_session(db, row["id"], input["message_id"])
-                    return {"session_id": row["id"], "title": row["title"],
-                            "agent_session_id": row["agent_session_id"] or None,
-                            "action": "matched_by_project"}
-
-            # Strategy 2: same chat_id + active window
-            cursor = await db.execute(
-                "SELECT id, title, topic, project, agent_session_id FROM sessions "
-                "WHERE source_chat_id = ? AND status IN ('open','waiting') "
-                "AND last_active_at >= ? ORDER BY last_active_at DESC LIMIT 1",
-                (chat_id, cutoff),
-            )
-            row = await cursor.fetchone()
-            if row:
-                await _attach_msg_to_session(db, row["id"], input["message_id"])
-                return {"session_id": row["id"], "title": row["title"],
-                        "agent_session_id": row["agent_session_id"] or None,
-                        "action": "matched_by_chat"}
-
-            # Strategy 3: create new session
-            now = datetime.now()
-            timestamp = now.strftime("%Y%m%d_%H%M%S")
-            session_key = f"feishu_{chat_id[:16]}_{timestamp}"
-            title = input.get("summary", "")[:128] or topic[:128] or "新会话"
-
-            await db.execute(
-                "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
-                "title, topic, project, priority, status, last_active_at, message_count, "
-                "risk_level, needs_manual_review, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (session_key, "feishu", chat_id, input["sender_id"],
-                 title, topic, project, input.get("priority", "normal"),
-                 "open", now.isoformat(), 0, "low", False, now.isoformat(), now.isoformat()),
-            )
-            await db.commit()
-            cursor = await db.execute("SELECT last_insert_rowid()")
-            session_id = (await cursor.fetchone())[0]
-
-            await _attach_msg_to_session(db, session_id, input["message_id"])
-            return {"session_id": session_id, "title": title, "action": "created_new"}
-
-    except Exception as e:
-        return {"error": str(e)}
-
 
 @tool(
     "link_task_context",
@@ -369,35 +339,6 @@ async def link_task_context(input: dict) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-async def _attach_msg_to_session(db, session_id: int, message_id: int) -> None:
-    """Attach a message to a session (raw aiosqlite)."""
-    from datetime import datetime, UTC
-    now = datetime.now().isoformat()
-
-    # Get current message_count
-    cursor = await db.execute("SELECT message_count FROM sessions WHERE id = ?", (session_id,))
-    row = await cursor.fetchone()
-    new_count = (row[0] if row else 0) + 1
-
-    # Update session
-    await db.execute(
-        "UPDATE sessions SET message_count = ?, last_active_at = ?, updated_at = ? WHERE id = ?",
-        (new_count, now, now, session_id),
-    )
-
-    # Link message to session
-    await db.execute(
-        "UPDATE messages SET session_id = ? WHERE id = ?",
-        (session_id, message_id),
-    )
-
-    # Create session_message record
-    await db.execute(
-        "INSERT INTO session_messages (session_id, message_id, role, sequence_no, created_at) VALUES (?,?,?,?,?)",
-        (session_id, message_id, "user", new_count, now),
-    )
-    await db.commit()
-
 
 # ==================== Project Tools ====================
 
@@ -420,7 +361,7 @@ async def list_projects_tool(input: dict) -> dict[str, Any]:
 @tool(
     "dispatch_to_project",
     "将任务派发到指定项目的 Agent，在该项目目录下执行，使用该项目的 skills。"
-    "如果提供 session_id（从 route_to_session 返回的 agent_session_id），则恢复之前的对话上下文，实现多轮交互。"
+    "如果提供 session_id（会话上下文中的 agent_session_id），则恢复之前的对话上下文，实现多轮交互。"
     "返回项目 Agent 的输出结果和 session_id（下次 resume 用）。",
     {"type": "object", "properties": {
         "project_name": {"type": "string", "description": "projects.yaml 中注册的项目名称"},
@@ -555,8 +496,9 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
 # ==================== MCP Server ====================
 
-CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, save_bot_reply,
-                read_memory, write_memory, update_session, route_to_session, link_task_context,
+CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, reply_to_message,
+                save_bot_reply,
+                read_memory, write_memory, update_session, link_task_context,
                 list_projects_tool, dispatch_to_project]
 
 CUSTOM_MCP_SERVER = create_sdk_mcp_server(

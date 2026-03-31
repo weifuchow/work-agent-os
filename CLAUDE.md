@@ -67,7 +67,7 @@ scripts/           — 初始化和迁移脚本
 ## 关键文件
 
 - `core/pipeline.py` — Orchestrator Agent 入口：消息进来 → agent 自主处理
-- `core/orchestrator/agent_client.py` — Agent SDK 客户端 + 所有 MCP 工具定义（12 个 tool）
+- `core/orchestrator/agent_client.py` — Agent SDK 客户端 + 所有 MCP 工具定义（11 个 tool）
 - `core/orchestrator/claude_client.py` — 多 provider 模型路由（Anthropic + OpenAI），支持运行时 override
 - `core/projects.py` — 项目注册、skill 合并、dispatch 支持
 - `.claude/agents/*.md` — 子 Agent 定义（intake, context, analysis, reply, report）
@@ -82,20 +82,20 @@ scripts/           — 初始化和迁移脚本
 | 工具 | 说明 |
 |------|------|
 | `query_db` | 只读 SQL 查询 |
-| `send_feishu_message` | 发送飞书消息 |
+| `send_feishu_message` | 发送飞书消息（主动发送） |
+| `reply_to_message` | 回复飞书消息（创建/回复话题，自动绑定 session） |
 | `save_bot_reply` | 保存回复到 DB |
 | `write_audit_log` | 写审计日志 |
 | `read_memory` / `write_memory` | 长期记忆读写 |
 | `update_session` | 更新会话字段 |
-| `route_to_session` | 查找/创建工作会话 |
 | `link_task_context` | 关联任务上下文 |
 | `list_projects` | 列出注册项目 |
 | `dispatch_to_project` | 派发任务到项目 Agent |
 
 ## 数据库表
 
-- `messages` — 消息（含 pipeline_status、classified_type、session_id）
-- `sessions` — 工作会话（含 task_context_id、agent_session_id）
+- `messages` — 消息（含 pipeline_status、classified_type、session_id、thread_id）
+- `sessions` — 工作会话（含 task_context_id、agent_session_id、thread_id）
 - `task_contexts` — 任务上下文（多个 session 归属同一任务）
 - `session_messages` — 会话-消息关联（role: user/assistant，sequence_no）
 - `agent_runs` — Agent 执行记录（含 token 消耗、子 agent transcript）
@@ -139,8 +139,8 @@ python scripts/migrate_agent_session.py
 3. 进度反馈和监控**不调用 LLM**，用 DB 查询和文件读取
 4. 日报从**实际对话数据**汇总，不凭空生成
 5. 所有操作写**审计日志**，pipeline 每轮记录完整 prompt 和 agent 结果
-6. Session 路由在 **pipeline 代码层强制执行**，不依赖模型调 tool
-7. 多轮对话优先通过 **飞书话题（thread_id）** 关联会话，无话题时 fallback 到 chat_id + 时间窗口
+6. Session 路由在 **pipeline 代码层强制执行**，不依赖模型调 tool（已移除 `route_to_session` tool）
+7. 多轮对话通过 **飞书话题（thread_id）** 关联会话；bot 回复自动创建话题（`reply_in_thread=true`），thread_id 回写到 session；无 thread_id 的消息一律新建 session
 8. 所有时间使用**本地时间**（`datetime.now()`），不用 UTC
 9. **运行时模型切换** — `core/config.py` 内存 override，不修改 models.yaml；任意模型 ID 自动推断 provider
 10. **多轮 resume 精简 prompt** — 有 `agent_session_id` + `project` 时，prompt 只传新消息 + session_id，不重复元数据

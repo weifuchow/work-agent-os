@@ -91,6 +91,9 @@ class Message(SQLModel, table=True):
     raw_payload: str = Field(default="")
     classified_type: Optional[str] = Field(default=None, max_length=32)
     session_id: Optional[int] = Field(default=None, foreign_key="sessions.id", index=True)
+    thread_id: str = Field(default="", max_length=128, index=True)
+    root_id: str = Field(default="", max_length=128)
+    parent_id: str = Field(default="", max_length=128)
     pipeline_status: str = Field(default=PipelineStatus.pending, max_length=32)
     pipeline_error: str = Field(default="")
     processed_at: Optional[datetime] = None
@@ -112,6 +115,8 @@ class Session(SQLModel, table=True):
     status: str = Field(default=SessionStatus.open, max_length=32)
     parent_session_id: Optional[int] = Field(default=None, foreign_key="sessions.id")
     task_context_id: Optional[int] = Field(default=None, foreign_key="task_contexts.id", index=True)
+    # Feishu thread_id — used to bind session to a thread/topic
+    thread_id: str = Field(default="", max_length=128, index=True)
     # Agent SDK session ID — used to resume multi-turn conversations
     agent_session_id: Optional[str] = Field(default=None, max_length=256)
     summary_path: str = Field(default="")

@@ -41,32 +41,31 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用
 ## 可用 Tools
 
 - `query_db`: 查询数据库（消息、会话、任务等）
-- `send_feishu_message`: 通过飞书发送消息
+- `send_feishu_message`: 通过飞书发送消息到 chat_id（仅用于首次主动发消息，不创建话题）
+- `reply_to_message`: 回复指定飞书消息（创建话题或在话题内回复）— **优先使用此工具**
 - `save_bot_reply`: 保存回复到数据库（发送飞书消息后必须调用，确保回复可追溯）
 - `write_audit_log`: 写入审计日志
 - `read_memory`: 读取长期记忆（项目知识、人物画像）
 - `write_memory`: 写入长期记忆
 - `update_session`: 更新会话状态
-- `route_to_session`: 将消息路由到工作会话（查找已有或创建新会话）
 - `link_task_context`: 将会话关联到任务上下文（查找已有或创建新任务）
 - `list_projects`: 列出所有已注册项目（名称 + 描述），用于判断消息涉及哪个项目
 - `dispatch_to_project`: 将任务派发到指定项目目录下执行，使用该项目的 skills，返回结果
 
 ## 处理策略
 
-**核心规则**：除了"你好"、"谢谢"、"早上好"等纯社交问候语，所有消息都必须先调用 `route_to_session` 创建或匹配会话。这是强制要求，不可跳过。调用 `route_to_session` 后，将返回的 `session_id` 填入最终 JSON 输出。
+**会话路由已由系统自动完成**：消息到达时，系统已通过 thread_id 或 chat_id 自动匹配/创建会话，prompt 中的 `db_session_id` 就是已路由好的会话 ID。你不需要手动路由。
 
 根据消息内容自主判断处理方式：
 
 ### 闲聊 / 简单问候（仅限"你好""早上好""谢谢"等纯社交语）
-直接回复，不需要调用 skill。通过 `send_feishu_message` 发送回复，然后调用 `save_bot_reply` 保存记录。
+直接回复，不需要调用 skill。通过 `reply_to_message` 回复（传入飞书消息ID，reply_in_thread=true，db_session_id），然后调用 `save_bot_reply` 保存记录。
 
 ### 所有其他消息（包括工作问题、知识问询、技术讨论、系统查询等）
-1. **第一步必须调用** `route_to_session`（传入 chat_id、sender_id、message_id、topic）
-2. 使用 `link_task_context` 关联任务上下文
-3. 如果需要执行操作获取信息（查磁盘、读文件等），可以使用 Bash/Read/Glob 等工具
-4. 通过 `send_feishu_message` 发送回复，然后调用 `save_bot_reply` 保存
-5. 输出 JSON 时 `session_id` **必须**填入 `route_to_session` 返回的 session_id
+1. 使用 `link_task_context` 关联任务上下文（传入 prompt 中的 db_session_id）
+2. 如果需要执行操作获取信息（查磁盘、读文件等），可以使用 Bash/Read/Glob 等工具
+3. 通过 `reply_to_message` 回复（传入飞书消息ID，reply_in_thread=true，db_session_id），然后调用 `save_bot_reply` 保存
+4. 输出 JSON 时 `session_id` 填入 prompt 中提供的 db_session_id
 **不要静默**，所有消息都必须有回复。
 
 ## 项目路由
@@ -82,7 +81,7 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用
 
 当用户就同一个项目连续对话时（比如先分析问题，再确认修复方案）：
 1. 首次 dispatch 会返回 `session_id`（Agent SDK session）
-2. 用 `route_to_session` 将消息路由到工作会话后，会话中会保存 `agent_session_id`
+2. 系统会自动保存 `agent_session_id` 到会话，后续消息 prompt 中会传入
 3. 后续消息 dispatch 同一项目时，传入 `session_id=agent_session_id` 和 `db_session_id`
 4. 项目 Agent 会恢复之前的完整上下文（包括它读过的文件、执行过的命令、生成的方案）
 
@@ -102,15 +101,17 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用
   "classified_type": "work_question | urgent_issue | task_request | chat | noise",
   "topic": "消息主题",
   "project_name": "路由到的项目名（如有，否则 null）",
-  "session_id": "route_to_session 返回的 session_id（非闲聊消息必填）",
+  "session_id": "prompt 中提供的 db_session_id",
   "task_context_id": null,
   "reply_content": "回复内容（如有）",
+  "thread_id": "reply_to_message 返回的 thread_id（如有，用于绑定会话到话题）",
   "reason": "处理理由"
 }
 ```
 
 ## 注意事项
-- 每次通过 `send_feishu_message` 发送回复后，**必须**紧接着调用 `save_bot_reply` 保存回复到数据库
+- **回复方式**：优先用 `reply_to_message`（传入飞书消息ID + reply_in_thread=true + db_session_id），而不是 `send_feishu_message`。这会自动创建飞书话题并绑定到会话，后续用户在话题内回复会自动关联到同一会话。
+- 每次通过 `reply_to_message` 或 `send_feishu_message` 发送回复后，**必须**紧接着调用 `save_bot_reply` 保存回复到数据库
 - 每条消息都要写 `write_audit_log` 记录处理过程
 - 不要对闲聊消息调用 intake/analysis，直接回复即可
 - 高风险事项（承诺排期、确认上线、技术方案拍板）必须 draft，不能 auto
@@ -138,8 +139,7 @@ async def process_message(message_id: int) -> None:
             await db.commit()
 
             # ── Force session routing BEFORE agent call ──
-            # Don't rely on agent calling route_to_session — do it here.
-            from datetime import timedelta
+            # thread_id match → create new (no more chat_id + time window guessing)
             from sqlalchemy import desc, select, func
             from models.db import Session as DBSession, SessionMessage
 
@@ -147,20 +147,21 @@ async def process_message(message_id: int) -> None:
             db_session_id = msg.session_id
 
             if not db_session_id and msg.chat_id:
-                # Find recent session by chat_id within 2h window
-                cutoff = datetime.now() - timedelta(hours=2)
-                stmt = select(DBSession).where(
-                    DBSession.source_chat_id == msg.chat_id,
-                    DBSession.status.in_(["open", "waiting"]),
-                    DBSession.last_active_at >= cutoff,
-                ).order_by(desc(DBSession.last_active_at)).limit(1)
-                result = await db.execute(stmt)
-                recent_sess = result.scalar_one_or_none()
+                # Match by thread_id (exact, no time limit)
+                if msg.thread_id:
+                    stmt = select(DBSession).where(
+                        DBSession.thread_id == msg.thread_id,
+                        DBSession.status.in_(["open", "waiting"]),
+                    ).order_by(desc(DBSession.last_active_at)).limit(1)
+                    result = await db.execute(stmt)
+                    recent_sess = result.scalar_one_or_none()
+                else:
+                    recent_sess = None
 
                 if recent_sess:
                     db_session_id = recent_sess.id
                 else:
-                    # Create new session
+                    # No thread match → create new session
                     new_sess = DBSession(
                         session_key=f"feishu_{msg.chat_id[:16]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                         source_platform="feishu",
@@ -171,6 +172,7 @@ async def process_message(message_id: int) -> None:
                         project="",
                         priority="normal",
                         status="open",
+                        thread_id=msg.thread_id or "",
                         summary_path="",
                         last_active_at=datetime.now(),
                         message_count=0,
@@ -211,6 +213,8 @@ async def process_message(message_id: int) -> None:
                         "project": sess_obj.project,
                         "title": sess_obj.title,
                         "db_session_id": sess_obj.id,
+                        "thread_id": sess_obj.thread_id or "",
+                        "platform_message_id": msg.platform_message_id,
                     }
 
             # Build prompt
@@ -245,10 +249,12 @@ async def process_message(message_id: int) -> None:
 
             # Run orchestrator agent
             from core.orchestrator.agent_client import agent_client
+            resume_session_id = session_context.get("agent_session_id") if session_context else None
             result = await agent_client.run(
                 prompt=prompt,
                 system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
                 max_turns=30,
+                session_id=resume_session_id,
             )
 
             result_text = result.get("text", "")
@@ -318,6 +324,18 @@ async def process_message(message_id: int) -> None:
                     db_sess = await db.get(DBSession, msg.session_id)
                     if db_sess and not db_sess.agent_session_id:
                         db_sess.agent_session_id = agent_session_id
+
+            # ── Persist thread_id from agent result to session ──
+            # The agent's reply_to_message tool returns thread_id;
+            # extract it from parsed result or audit logs
+            reply_thread_id = parsed.get("thread_id", "")
+            if reply_thread_id and msg.session_id:
+                db_sess = await db.get(DBSession, msg.session_id)
+                if db_sess and not db_sess.thread_id:
+                    db_sess.thread_id = reply_thread_id
+                    logger.info("Session {} bound to thread_id {}",
+                                msg.session_id, reply_thread_id)
+
             await db.commit()
 
             # Audit
@@ -377,43 +395,21 @@ def _build_prompt(msg: Message, session_context: dict | None = None) -> str:
     Args:
         session_context: Optional dict with keys agent_session_id, project, title, db_session_id.
     """
-    # If session has agent_session_id + project, this is a resume — keep prompt minimal
-    if (session_context
-            and session_context.get("agent_session_id")
-            and session_context.get("project")):
-        return f"""多轮对话继续（消息ID: {msg.id}，聊天ID: {msg.chat_id}，db_session_id: {session_context['db_session_id']}）
+    db_sid = session_context.get("db_session_id", "") if session_context else ""
+    platform_mid = msg.platform_message_id
 
-项目: {session_context['project']}
-agent_session_id: {session_context['agent_session_id']}
+    # Resume: SDK has full context, only send new message
+    if session_context and session_context.get("agent_session_id"):
+        project = session_context.get("project", "")
+        prompt = f"db_session_id: {db_sid} | 飞书消息ID: {platform_mid}\n\n{msg.content}"
+        if project:
+            prompt += f"\n\n项目: {project}\n请 dispatch_to_project 并传入 session_id 恢复上下文。"
+        return prompt
 
-用户新消息:
-{msg.content}
+    # New session: minimal context
+    return f"""飞书消息ID: {platform_mid} | 聊天ID: {msg.chat_id} | db_session_id: {db_sid}
 
-请 dispatch_to_project 并传入 session_id 恢复上下文。"""
-
-    prompt = f"""新消息到达，请处理：
-
-- 消息ID: {msg.id}
-- 发送者: {msg.sender_name or msg.sender_id} (ID: {msg.sender_id})
-- 聊天ID: {msg.chat_id}
-- 消息类型: {msg.message_type}
-- 时间: {msg.received_at.isoformat() if msg.received_at else 'unknown'}
-
-消息内容:
 {msg.content}"""
-
-    if session_context:
-        prompt += "\n\n## 已有会话上下文"
-        if session_context.get("project"):
-            prompt += f"\n- 关联项目: {session_context['project']}"
-        if session_context.get("title"):
-            prompt += f"\n- 会话标题: {session_context['title']}"
-        if session_context.get("agent_session_id"):
-            prompt += f"\n- agent_session_id: {session_context['agent_session_id']}（dispatch_to_project 时传入此 session_id 可恢复上下文）"
-        if session_context.get("db_session_id"):
-            prompt += f"\n- db_session_id: {session_context['db_session_id']}"
-
-    return prompt
 
 
 def _parse_result(text: str) -> dict:

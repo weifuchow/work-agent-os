@@ -36,6 +36,9 @@ async def save_message(session: AsyncSession, event_data: dict) -> Message | Non
         content=event_data.get("content", ""),
         received_at=now,
         raw_payload=event_data.get("raw_payload", ""),
+        thread_id=event_data.get("thread_id", ""),
+        root_id=event_data.get("root_id", ""),
+        parent_id=event_data.get("parent_id", ""),
     )
     session.add(msg)
 
