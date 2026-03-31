@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import load_models_config, get_model_override, set_model_override, settings
+from core.config import load_models_config, get_model_override, set_model_override, settings, with_model_state
 from core.database import get_session
 from core.orchestrator.claude_client import claude_client
 from models.db import (
@@ -280,7 +280,7 @@ async def get_stats(db: AsyncSession = Depends(get_session)):
 
 @router.get("/models")
 async def list_models():
-    return load_models_config()
+    return with_model_state(load_models_config(), get_model_override())
 
 
 class ModelSwitchRequest(BaseModel):

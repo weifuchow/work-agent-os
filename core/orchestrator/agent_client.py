@@ -28,7 +28,7 @@ from claude_agent_sdk import (
     ToolResultBlock,
 )
 
-from core.config import settings
+from core.config import settings, get_model_override, load_models_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -581,6 +581,7 @@ class AgentClient:
         project_cwd: Optional[str] = None,
         project_agents: Optional[dict] = None,
         exclude_tools: Optional[list[str]] = None,
+        model: Optional[str] = None,
     ) -> ClaudeAgentOptions:
         from skills import SKILL_REGISTRY
 
@@ -590,6 +591,8 @@ class AgentClient:
         if exclude_tools:
             allowed = [t for t in allowed if t not in exclude_tools]
 
+        selected_model = model or get_model_override() or load_models_config().get("default")
+
         opts = ClaudeAgentOptions(
             system_prompt=system_prompt or None,
             mcp_servers={"work-agent-tools": CUSTOM_MCP_SERVER},
@@ -598,6 +601,7 @@ class AgentClient:
             max_turns=max_turns,
             cwd=project_cwd or str(PROJECT_ROOT),
             env=self._get_env(),
+            model=selected_model,
             # Register skills as sub-agents (project-specific or global)
             agents=project_agents or SKILL_REGISTRY,
             # Capture sub-agent transcripts
@@ -619,6 +623,7 @@ class AgentClient:
         max_turns: int = 30,
         session_id: Optional[str] = None,
         skill: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> dict[str, Any]:
         """Run agent to completion. Returns {"text": ..., "session_id": ...}."""
         # If a specific skill is requested, prepend instruction to use it
@@ -630,6 +635,7 @@ class AgentClient:
             max_turns=max_turns,
             session_id=session_id,
             skill=skill,
+            model=model,
         )
 
         result_text = ""
@@ -650,7 +656,12 @@ class AgentClient:
                     "is_error": msg.is_error,
                 }
 
-        return {"text": result_text, "session_id": result_session_id, **result_meta}
+        return {
+            "text": result_text,
+            "session_id": result_session_id,
+            "model": options.model,
+            **result_meta,
+        }
 
     async def run_stream(
         self,
@@ -659,6 +670,7 @@ class AgentClient:
         max_turns: int = 30,
         session_id: Optional[str] = None,
         skill: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """Run agent with SSE streaming. Yields event dicts."""
         if skill:
@@ -669,6 +681,7 @@ class AgentClient:
             max_turns=max_turns,
             session_id=session_id,
             skill=skill,
+            model=model,
         )
 
         async for msg in query(prompt=prompt, options=options):
@@ -704,6 +717,7 @@ class AgentClient:
         project_agents: dict,
         max_turns: int = 20,
         session_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> dict[str, Any]:
         """Run an agent in a specific project directory with project-specific skills.
 
@@ -725,6 +739,7 @@ class AgentClient:
             project_cwd=project_cwd,
             project_agents=project_agents,
             exclude_tools=exclude,
+            model=model,
         )
 
         result_text = ""
@@ -745,7 +760,12 @@ class AgentClient:
                     "is_error": msg.is_error,
                 }
 
-        return {"text": result_text, "session_id": result_session_id, **result_meta}
+        return {
+            "text": result_text,
+            "session_id": result_session_id,
+            "model": options.model,
+            **result_meta,
+        }
 
     # ---- Session Management ----
 

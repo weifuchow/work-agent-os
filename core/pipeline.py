@@ -220,6 +220,9 @@ async def process_message(message_id: int) -> None:
             # Build prompt
             prompt = _build_prompt(msg, session_context=session_context)
 
+            from core.config import get_model_override, load_models_config
+            selected_model = get_model_override() or load_models_config().get("default")
+
             # Audit: log the full prompt and session context before agent call
             db.add(AuditLog(
                 event_type="pipeline_agent_call",
@@ -229,6 +232,7 @@ async def process_message(message_id: int) -> None:
                     "message_id": msg.id,
                     "chat_id": msg.chat_id,
                     "session_context": session_context,
+                    "selected_model": selected_model,
                     "prompt": prompt[:2000],
                 }, ensure_ascii=False),
                 operator="orchestrator",
@@ -259,6 +263,7 @@ async def process_message(message_id: int) -> None:
 
             result_text = result.get("text", "")
             agent_session_id = result.get("session_id")
+            used_model = result.get("model")
 
             # Parse structured result from agent output
             parsed = _parse_result(result_text)
@@ -271,6 +276,7 @@ async def process_message(message_id: int) -> None:
                 detail=json.dumps({
                     "message_id": msg.id,
                     "agent_session_id": agent_session_id,
+                    "used_model": used_model,
                     "parsed_session_id": parsed.get("session_id"),
                     "action": parsed.get("action"),
                     "classified_type": parsed.get("classified_type"),

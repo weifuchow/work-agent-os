@@ -195,3 +195,11 @@ class AuditLog(SQLModel, table=True):
     detail: str = Field(default="")
     operator: str = Field(default="system", max_length=64)
     created_at: datetime = Field(default_factory=_now)
+
+
+class AppSetting(SQLModel, table=True):
+    __tablename__ = "app_settings"
+
+    key: str = Field(primary_key=True, max_length=128)
+    value: str = Field(default="")
+    updated_at: datetime = Field(default_factory=_now)

@@ -1,4 +1,4 @@
-"""LLM client wrapper with multi-provider model routing."""
+"""LLM client wrapper — all models routed through Anthropic-compatible proxy."""
 
 from collections.abc import AsyncIterator
 from typing import Any, Optional
@@ -8,14 +8,9 @@ from loguru import logger
 
 from core.config import load_models_config, get_model_override, settings
 
-try:
-    from openai import AsyncOpenAI
-except ImportError:  # pragma: no cover - optional dependency until installed
-    AsyncOpenAI = None
-
 
 class ClaudeClient:
-    """Async wrapper around configured LLM providers."""
+    """Async wrapper around Anthropic-compatible API proxy."""
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         anthropic_kwargs: dict[str, Any] = {}
@@ -26,13 +21,6 @@ class ClaudeClient:
         if url:
             anthropic_kwargs["base_url"] = url
         self._anthropic = anthropic.AsyncAnthropic(**anthropic_kwargs)
-
-        self._openai = None
-        if AsyncOpenAI is not None and settings.openai_api_key:
-            openai_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
-            if settings.openai_base_url:
-                openai_kwargs["base_url"] = settings.openai_base_url
-            self._openai = AsyncOpenAI(**openai_kwargs)
 
     def _models_config(self) -> dict[str, Any]:
         return load_models_config()
@@ -49,18 +37,11 @@ class ClaudeClient:
         if match:
             return match, config
 
-        # Model not in list — infer provider from model ID prefix
-        if selected_id.startswith("claude-") or selected_id.startswith("anthropic"):
-            provider = "anthropic"
-        else:
-            provider = "openai"
+        # Unknown model — all go through anthropic (proxy handles routing)
         return {
             "id": selected_id,
-            "provider": provider,
             "label": selected_id,
             "enabled": True,
-            "supports_chat": True,
-            "supports_agent": True,
         }, config
 
     async def _create_anthropic_message(
@@ -81,29 +62,6 @@ class ClaudeClient:
         response = await self._anthropic.messages.create(**kwargs)
         return response, model_id
 
-    async def _create_openai_message(
-        self,
-        *,
-        messages: list[dict],
-        system: str,
-        model_id: str,
-        max_tokens: int,
-    ):
-        if self._openai is None:
-            raise RuntimeError("OpenAI client is not configured. Install openai and set OPENAI_API_KEY.")
-
-        openai_messages: list[dict[str, Any]] = []
-        if system:
-            openai_messages.append({"role": "system", "content": system})
-        openai_messages.extend(messages)
-
-        response = await self._openai.chat.completions.create(
-            model=model_id,
-            messages=openai_messages,
-            max_completion_tokens=max_tokens,
-        )
-        return response, model_id
-
     async def _create_message(
         self,
         *,
@@ -113,38 +71,23 @@ class ClaudeClient:
         max_tokens: int,
     ):
         selected_model, config = self._resolve_model(model)
-        provider = selected_model["provider"]
         model_id = selected_model["id"]
 
         try:
-            if provider == "anthropic":
-                return await self._create_anthropic_message(
-                    messages=messages,
-                    system=system,
-                    model_id=model_id,
-                    max_tokens=max_tokens,
-                )
-            if provider == "openai":
-                return await self._create_openai_message(
-                    messages=messages,
-                    system=system,
-                    model_id=model_id,
-                    max_tokens=max_tokens,
-                )
-            raise ValueError(f"Unsupported model provider '{provider}'")
+            return await self._create_anthropic_message(
+                messages=messages,
+                system=system,
+                model_id=model_id,
+                max_tokens=max_tokens,
+            )
         except anthropic.APIStatusError as e:
             fallback_id = config.get("fallback")
             should_fallback = (
-                provider == "anthropic"
-                and e.status_code in {429, 500, 529}
+                e.status_code in {429, 500, 529}
                 and fallback_id
                 and fallback_id != model_id
             )
             if not should_fallback:
-                raise
-
-            fallback_model, _ = self._resolve_model(fallback_id)
-            if fallback_model["provider"] != "anthropic":
                 raise
 
             logger.warning(
@@ -176,14 +119,9 @@ class ClaudeClient:
                 max_tokens=max_tokens,
             )
 
-            if hasattr(response, "content"):
-                text = response.content[0].text if response.content else ""
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
-            else:
-                text = response.choices[0].message.content or ""
-                input_tokens = response.usage.prompt_tokens if response.usage else 0
-                output_tokens = response.usage.completion_tokens if response.usage else 0
+            text = response.content[0].text if response.content else ""
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
 
             self.last_usage = {
                 "input_tokens": input_tokens,
@@ -208,27 +146,7 @@ class ClaudeClient:
     ) -> AsyncIterator[str]:
         """Stream response text chunks."""
         selected_model, config = self._resolve_model(model)
-        provider = selected_model["provider"]
         model_id = selected_model["id"]
-
-        if provider == "openai":
-            if self._openai is None:
-                raise RuntimeError("OpenAI client is not configured. Install openai and set OPENAI_API_KEY.")
-            openai_messages: list[dict[str, Any]] = []
-            if system:
-                openai_messages.append({"role": "system", "content": system})
-            openai_messages.extend(messages)
-            stream = await self._openai.chat.completions.create(
-                model=model_id,
-                messages=openai_messages,
-                max_completion_tokens=max_tokens,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    yield delta
-            return
 
         kwargs: dict[str, Any] = {
             "model": model_id,
@@ -253,18 +171,13 @@ class ClaudeClient:
                 logger.exception("LLM API stream error: {}", e)
                 raise
 
-            fallback_model, _ = self._resolve_model(fallback_id)
-            if fallback_model["provider"] != "anthropic":
-                logger.exception("LLM API stream error: {}", e)
-                raise
-
-            fallback_kwargs = {**kwargs, "model": fallback_id}
             logger.warning(
                 "LLM API stream failed on model={}, status_code={}, retrying with fallback={}",
                 model_id,
                 e.status_code,
                 fallback_id,
             )
+            fallback_kwargs = {**kwargs, "model": fallback_id}
             async with self._anthropic.messages.stream(**fallback_kwargs) as stream:
                 async for text in stream.text_stream:
                     yield text

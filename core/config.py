@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+import sqlite3
 import yaml
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -81,29 +82,69 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-
-# ---------------------------------------------------------------------------
-# Runtime model override (in-memory, not persisted to models.yaml)
-# ---------------------------------------------------------------------------
-
-_runtime_model_override: str | None = None
+_APP_DB_PATH = settings.db_dir / "app.sqlite"
+_MODEL_OVERRIDE_KEY = "current_model"
 
 
 def get_model_override() -> str | None:
-    return _runtime_model_override
+    if not _APP_DB_PATH.exists():
+        return None
+
+    conn = sqlite3.connect(str(_APP_DB_PATH))
+    try:
+        cursor = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (_MODEL_OVERRIDE_KEY,),
+        )
+        row = cursor.fetchone()
+        value = row[0].strip() if row and row[0] else ""
+        return value or None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
 
 
 def set_model_override(model_id: str | None) -> None:
-    global _runtime_model_override
-    _runtime_model_override = model_id
+    if not _APP_DB_PATH.exists():
+        return
+
+    value = (model_id or "").strip()
+    conn = sqlite3.connect(str(_APP_DB_PATH))
+    try:
+        if value:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (_MODEL_OVERRIDE_KEY, value, _now_iso()),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM app_settings WHERE key = ?",
+                (_MODEL_OVERRIDE_KEY,),
+            )
+        conn.commit()
+    except sqlite3.OperationalError:
+        return
+    finally:
+        conn.close()
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+    return datetime.now().isoformat()
 
 
 def load_models_config() -> dict[str, Any]:
     if not settings.models_file.exists():
-        return {"default": None, "fallback": None, "models": [], "providers": {}}
+        return {"default": None, "fallback": None, "models": []}
 
     raw = yaml.safe_load(settings.models_file.read_text(encoding="utf-8")) or {}
-    providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
     models = raw.get("models") if isinstance(raw.get("models"), list) else []
     default = raw.get("default")
     fallback = raw.get("fallback")
@@ -113,28 +154,27 @@ def load_models_config() -> dict[str, Any]:
         if not isinstance(item, dict):
             continue
         model_id = item.get("id")
-        provider = item.get("provider")
-        if not model_id or not provider:
+        if not model_id:
             continue
         normalized_models.append({
             "id": model_id,
-            "provider": provider,
             "label": item.get("label") or model_id,
             "enabled": item.get("enabled", True),
-            "supports_chat": item.get("supports_chat", True),
-            "supports_agent": item.get("supports_agent", provider == "anthropic"),
             "is_default": model_id == default,
             "is_fallback": model_id == fallback,
         })
 
-    override = get_model_override()
-    current = override or default
-
     return {
         "default": default,
         "fallback": fallback,
+        "models": normalized_models,
+    }
+
+
+def with_model_state(config: dict[str, Any], override: str | None) -> dict[str, Any]:
+    current = override or config.get("default")
+    return {
+        **config,
         "current": current,
         "override": override,
-        "models": normalized_models,
-        "providers": providers,
     }
