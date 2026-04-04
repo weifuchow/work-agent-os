@@ -91,8 +91,11 @@ class FeishuClient:
             sender_type = sender.sender_type  # user or bot
 
             # Ignore messages from bots (including self)
-            if sender_type == "bot":
-                logger.debug("Ignoring bot message from {}", sender_id)
+            # Log ALL sender_type values to diagnose double-reply issue
+            logger.info("Message event: sender_type={!r} sender_id={!r} msg_id={}",
+                        sender_type, sender_id, message_id)
+            if sender_type in ("bot", "app"):
+                logger.info("Ignoring bot/app message from {} (type={})", sender_id, sender_type)
                 return
 
             # Parse content — support multimodal types
@@ -140,7 +143,7 @@ class FeishuClient:
         except Exception as e:
             logger.exception("Failed to handle Feishu message event: {}", e)
 
-    def send_message(self, receive_id: str, content: str, receive_id_type: str = "chat_id", msg_type: str = "text") -> bool:
+    def send_message(self, receive_id: str, content: str, receive_id_type: str = "chat_id", msg_type: str = "text") -> dict | None:
         """Send a message to a chat or user."""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
@@ -166,10 +169,16 @@ class FeishuClient:
                 "Failed to send message: code={}, msg={}",
                 response.code, response.msg
             )
-            return False
+            return None
 
-        logger.info("Message sent to {}", receive_id)
-        return True
+        resp_data = response.data
+        result = {
+            "message_id": getattr(resp_data, "message_id", "") or "",
+            "thread_id": getattr(resp_data, "thread_id", "") or "",
+            "root_id": getattr(resp_data, "root_id", "") or "",
+        }
+        logger.info("Message sent to {} (message_id={})", receive_id, result["message_id"])
+        return result
 
     def reply_message(self, message_id: str, content: str, msg_type: str = "text",
                       reply_in_thread: bool = False) -> dict | None:

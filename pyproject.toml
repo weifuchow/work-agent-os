@@ -41,3 +41,6 @@ line-length = 100
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "e2e: real Claude API integration tests (slow, requires ANTHROPIC_API_KEY)",
+]

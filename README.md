@@ -117,6 +117,10 @@ flowchart TB
 | dispatch 回写 project | 成功后 project 写回 session，后续消息自动关联 | ✅ |
 | Scheduler 修复 | AsyncIOScheduler event loop bug 修复 | ✅ |
 | 审计日志增强 | pipeline_agent_call/result 记录完整 prompt 和输出 | ✅ |
+| 飞书话题会话 | thread_id 精确匹配，reply_in_thread 自动创建话题 | ✅ |
+| 消息表情回应 | 收到消息立即 GLANCE 回应，表示已收到 | ✅ |
+| 多模态消息解析 | image/file/video/audio/post/interactive/sticker 全类型 | ✅ |
+| 处理进度通知 | 话题内持续推送累计思考时间，不盲目重试 | ✅ |
 
 ## 架构
 
@@ -153,7 +157,8 @@ data/
 ├── models.yaml          多模型配置
 ├── projects.yaml        项目注册
 tests/
-└── test_multiturn_session.py  多轮会话 e2e 测试（7 项检查点）
+├── test_multiturn_session.py  单元测试 — pipeline 逻辑（10项，mock agent，秒级）
+└── test_e2e_routing.py        核心能力集成测试 — 真实 API，路由一致性验证（约5分钟）
 ```
 
 ## 快速开始
@@ -175,7 +180,8 @@ python -m uvicorn apps.api.main:app --port 8000  # API 服务
 cd apps/admin-ui && npm install && npm run dev  # 管理后台
 
 # 5. 运行测试
-pytest tests/test_multiturn_session.py -v
+pytest tests/test_multiturn_session.py -v          # 单元测试（秒级）
+pytest tests/test_e2e_routing.py -v -s -m e2e      # 核心能力测试（真实API，约5分钟）
 ```
 
 ## API 端点
@@ -199,35 +205,70 @@ pytest tests/test_multiturn_session.py -v
 | `POST /api/messages/{id}/reprocess` | 重新处理消息 |
 | `POST /api/playground/chat` | 模型测试对话 |
 
+## 核心能力测试
+
+系统最关键的业务指标由两套测试保障：
+
+### 路由一致性（`tests/test_e2e_routing.py`）
+
+真实 Claude API + 飞书话题模拟，验证 Orchestrator → 项目路由 → Agent Resume 完整链路：
+
+| 场景 | 对话 | 核心断言 |
+|------|------|---------|
+| **项目关联**（Scenario A） | allspark是什么 → 数据源 → sqlserver配置 | `project="allspark"` + `agent_session_id` 3轮不变 + `claude --resume <正确ID>` |
+| **非项目**（Scenario B） | radiohead对比queen → 推歌 → 为什么抓人 | `project=""` 全程 + `agent_session_id` 只写一次 |
+
+**飞书话题模拟流程**：Turn 1 无 thread_id（新对话）→ 机器人回复创建话题 → Turn 2/3 携带 thread_id 在话题内追问 → pipeline 通过 thread_id 路由到同一 session。
+
+```bash
+pytest tests/test_e2e_routing.py -v -s -m e2e
+```
+
+### Pipeline 逻辑单元测试（`tests/test_multiturn_session.py`）
+
+10 项 mock 测试，无 API 调用，秒级完成：
+
+```bash
+pytest tests/test_multiturn_session.py -v
+```
+
 ---
 
 ## 下阶段计划
 
-### Phase 8: 飞书话题会话跟踪 ✅
+### Phase 8: 飞书话题会话跟踪（已完成）
 
 **目标**: 用飞书话题（Thread）替代时间窗口，实现精确的多轮会话关联。
 
-**已完成**:
-
 - [x] 解析飞书消息中的 `thread_id` / `root_id` / `parent_id` 字段，入库存储
 - [x] Bot 回复使用 `reply_in_thread=true` 自动创建话题，`thread_id` 回写到 Session
-- [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建（移除 chat_id + 时间窗口猜测）
-- [x] 新增 `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
-- [x] 移除 `route_to_session` MCP tool，session 路由完全由 pipeline 代码层处理
+- [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建
+- [x] `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
+- [x] Session 路由完全由 pipeline 代码层处理（移除 `route_to_session` tool）
 - [x] SDK session resume：有 `agent_session_id` 时传入 `session_id` 恢复上下文
-- [x] 精简 prompt：resume 时只传新消息 + 必要 ID，首次也只传核心信息
+- [x] 精简 prompt：resume 时只传新消息 + 必要 ID
+
+### Phase 9: 飞书消息体验增强（进行中）
+
+**目标**: 提升飞书交互体验感，支持多模态内容处理。
+
+**已完成**:
+
+- [x] 收到消息立即 GLANCE（👀）表情回应，表示已收到
+- [x] 多模态消息解析：image / file / video / audio / post / interactive / sticker
+- [x] Pipeline prompt 携带 `[多模态内容]` 描述，Agent 可感知媒体类型
+- [x] 处理进度通知：模型思考中每 5 分钟在话题内推送累计时间（5min/10min/15min...）
+- [x] 智能重试：仅在 agent_run 明确失败时重试，超时不重试
+- [x] 项目注册：allsparkbox（RIOT3 部署构建包）
+
+**待完成**:
+
+- [ ] 图片下载：收到 image 消息时通过飞书 API 下载图片，传入多模态模型处理
+- [ ] 文件下载：收到 file 消息时下载到本地，读取内容传给 Agent
+- [ ] 图片消息回复：Agent 生成的图片/截图通过飞书发送
+- [ ] 飞书卡片消息回复：正文、分析过程、风险提示分块展示
+- [ ] 草稿消息飞书卡片确认按钮（一键确认/修改）
 - [ ] 管理后台按话题维度展示会话
-
-### Phase 9: 飞书消息增强
-
-**目标**: 支持图片消息、卡片消息，提升消息展示质量。
-
-- [ ] 支持图片消息接收（解析 image 类型，下载图片，传给多模态模型处理）
-- [ ] 支持图片消息回复（Agent 生成的图片/截图可通过飞书发送）
-- [ ] 支持飞书卡片消息（Interactive Card）回复
-- [ ] 回复区分：正文、分析过程、风险提示（卡片分块）
-- [ ] 支持文件消息接收
-- [ ] 草稿消息支持飞书卡片确认按钮
 
 ### Phase 10: 管理后台增强
 

@@ -1,123 +1,67 @@
-"""Message processing pipeline — single orchestrator entry point.
+"""Message processing pipeline.
 
-The orchestrator agent receives every incoming message and autonomously
-decides how to handle it: reply directly, invoke skills (intake, context,
-analysis, reply), route to sessions, link task contexts, etc.
+Two-level agent architecture:
+- Main Agent: classifies messages, dispatches to project agents
+- Project Agent: executes in project directory with full context
 
-Each run:
-1. Loads message from DB (no LLM)
-2. Builds prompt with message context
-3. Single agent_client.run() — model decides everything
-4. Extracts structured result, updates DB
+Pipeline handles ALL IO (feishu reply, DB writes). Agent only outputs JSON.
+All DB access uses raw SQL (aiosqlite) to avoid ORM cache issues.
 """
 
 import json
+import uuid
 from datetime import datetime
+from pathlib import Path
 
+import aiosqlite
 from loguru import logger
 
-from core.database import async_session_factory
-from models.db import (
-    AgentRun, AgentRunStatus, AuditLog, Message, PipelineStatus, SessionMessage,
-)
+from core.config import settings
+
+DB_PATH = str(Path(settings.db_dir) / "app.sqlite")
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator System Prompt
+# System Prompt (template — projects injected at runtime)
 # ---------------------------------------------------------------------------
 
-ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用户的电脑上。你通过飞书接收消息，需要理解消息内容并做出恰当的处理。
+SYSTEM_PROMPT_TEMPLATE = """你是用户的私人工作助理，通过飞书接收消息。
 
-## 可用 Skills（子 Agent）
+## 已注册项目
+{projects_section}
 
-你可以调用以下 skills 来完成复杂任务：
+## 核心规则
 
-- **intake**: 消息分类 — 当你需要对消息进行结构化分类时使用
-- **context**: 上下文检索 — 当你需要获取会话历史、项目知识等背景信息时使用
-- **analysis**: 问题分析 — 当你需要对复杂工作问题进行深度分析时使用
-- **reply**: 回复生成 — 当你需要生成正式的对外回复并判断风险等级时使用
-- **report**: 日报生成 — 当需要生成工作日报时使用
+1. **项目匹配优先**：如果消息涉及上方任何项目（按名称/别名/关键词匹配），你**必须调用 `dispatch_to_project` tool**，将 dispatch 返回的结果作为 reply_content。**绝对不能跳过 dispatch 用项目描述自行回答。**
+2. **所有消息必须回复**：无论是闲聊、问候、表情、系统通知，还是工作问题，都必须生成 reply_content 进行回复。
+3. 高风险操作（承诺排期/确认上线/技术拍板）使用 action=drafted。
 
-## 可用 Tools
+## 输出格式
 
-- `query_db`: 查询数据库（消息、会话、任务等）
-- `send_feishu_message`: 通过飞书发送消息到 chat_id（仅用于首次主动发消息，不创建话题）
-- `reply_to_message`: 回复指定飞书消息（创建话题或在话题内回复）— **优先使用此工具**
-- `save_bot_reply`: 保存回复到数据库（发送飞书消息后必须调用，确保回复可追溯）
-- `write_audit_log`: 写入审计日志
-- `read_memory`: 读取长期记忆（项目知识、人物画像）
-- `write_memory`: 写入长期记忆
-- `update_session`: 更新会话状态
-- `link_task_context`: 将会话关联到任务上下文（查找已有或创建新任务）
-- `list_projects`: 列出所有已注册项目（名称 + 描述），用于判断消息涉及哪个项目
-- `dispatch_to_project`: 将任务派发到指定项目目录下执行，使用该项目的 skills，返回结果
-
-## 处理策略
-
-**会话路由已由系统自动完成**：消息到达时，系统已通过 thread_id 或 chat_id 自动匹配/创建会话，prompt 中的 `db_session_id` 就是已路由好的会话 ID。你不需要手动路由。
-
-根据消息内容自主判断处理方式：
-
-### 闲聊 / 简单问候（仅限"你好""早上好""谢谢"等纯社交语）
-直接回复，不需要调用 skill。通过 `reply_to_message` 回复（传入飞书消息ID，reply_in_thread=true，db_session_id），然后调用 `save_bot_reply` 保存记录。
-
-### 所有其他消息（包括工作问题、知识问询、技术讨论、系统查询等）
-1. 使用 `link_task_context` 关联任务上下文（传入 prompt 中的 db_session_id）
-2. 如果需要执行操作获取信息（查磁盘、读文件等），可以使用 Bash/Read/Glob 等工具
-3. 通过 `reply_to_message` 回复（传入飞书消息ID，reply_in_thread=true，db_session_id），然后调用 `save_bot_reply` 保存
-4. 输出 JSON 时 `session_id` 填入 prompt 中提供的 db_session_id
-**不要静默**，所有消息都必须有回复。
-
-## 项目路由
-
-当消息涉及具体项目工作（代码修改、Bug 修复、测试、部署等）时：
-1. 调用 `list_projects` 获取可用项目列表
-2. 根据消息内容、关键词、涉及的技术栈判断属于哪个项目
-3. 调用 `dispatch_to_project` 将任务派发到对应项目目录下的 Agent
-4. 项目 Agent 在该项目目录下执行，可读取项目文件、运行命令、使用项目特定 skills
-5. 将项目 Agent 的结果纳入回复
-
-### 多轮对话（项目 session resume）
-
-当用户就同一个项目连续对话时（比如先分析问题，再确认修复方案）：
-1. 首次 dispatch 会返回 `session_id`（Agent SDK session）
-2. 系统会自动保存 `agent_session_id` 到会话，后续消息 prompt 中会传入
-3. 后续消息 dispatch 同一项目时，传入 `session_id=agent_session_id` 和 `db_session_id`
-4. 项目 Agent 会恢复之前的完整上下文（包括它读过的文件、执行过的命令、生成的方案）
-
-这样用户可以通过飞书进行多轮交互：
-- "帮我分析 allspark fcs 模块的空指针异常" → 首轮分析
-- "用 code-fixer 修一下" → resume 之前的 session，继续在同一上下文中修复
-- "方案 B 看起来更好，执行吧" → 继续 resume，确认并执行
-
-如果无法确定项目归属，先在全局范围处理，或回复询问具体项目。
-
-## 输出要求
-
-处理完成后，你的最终输出必须是一个 JSON 对象：
+最终输出必须是合法 JSON：
 ```json
-{
-  "action": "replied | drafted | silent",
-  "classified_type": "work_question | urgent_issue | task_request | chat | noise",
-  "topic": "消息主题",
-  "project_name": "路由到的项目名（如有，否则 null）",
-  "session_id": "prompt 中提供的 db_session_id",
-  "task_context_id": null,
-  "reply_content": "回复内容（如有）",
-  "thread_id": "reply_to_message 返回的 thread_id（如有，用于绑定会话到话题）",
+{{
+  "action": "replied | drafted",
+  "classified_type": "chat | work_question | urgent_issue | task_request | noise",
+  "topic": "主题",
+  "project_name": "项目名或null",
+  "reply_content": "回复内容（必填）",
   "reason": "处理理由"
-}
+}}
 ```
-
-## 注意事项
-- **回复方式**：优先用 `reply_to_message`（传入飞书消息ID + reply_in_thread=true + db_session_id），而不是 `send_feishu_message`。这会自动创建飞书话题并绑定到会话，后续用户在话题内回复会自动关联到同一会话。
-- 每次通过 `reply_to_message` 或 `send_feishu_message` 发送回复后，**必须**紧接着调用 `save_bot_reply` 保存回复到数据库
-- 每条消息都要写 `write_audit_log` 记录处理过程
-- 不要对闲聊消息调用 intake/analysis，直接回复即可
-- 高风险事项（承诺排期、确认上线、技术方案拍板）必须 draft，不能 auto
-- 回复要简洁、专业、有帮助
-- **多模态消息**：用户可能发送图片、文件、视频、语音等，prompt 中会包含 `[多模态内容]` 描述。对于图片，描述其内容（如果能获取到信息）；对于文件，了解文件用途后回复；对于语音，根据转写内容处理。如果无法直接处理媒体内容，告知用户你已收到并说明你的理解。
+- reply_content 必填，系统用它发送飞书消息
 """
+
+
+def _build_system_prompt() -> str:
+    from core.projects import get_projects
+    projects = get_projects()
+    lines = []
+    for p in projects:
+        desc = p.description.replace("\n", " ").strip()
+        lines.append(f"- **{p.name}**: {desc}")
+    section = "\n".join(lines) if lines else "（暂无注册项目）"
+    return SYSTEM_PROMPT_TEMPLATE.format(projects_section=section)
 
 
 # ---------------------------------------------------------------------------
@@ -125,399 +69,461 @@ ORCHESTRATOR_SYSTEM_PROMPT = """你是用户的私人工作助理，运行在用
 # ---------------------------------------------------------------------------
 
 async def process_message(message_id: int) -> None:
-    """Process a message through the orchestrator agent."""
-    async with async_session_factory() as db:
-        msg = await db.get(Message, message_id)
-        if not msg:
-            logger.warning("Pipeline: message {} not found", message_id)
-            return
-        if msg.pipeline_status == PipelineStatus.completed:
+    """Process a single message end-to-end."""
+    try:
+        # 1. Read message
+        msg = await _read_message(message_id)
+        if not msg or msg["pipeline_status"] == "completed":
             return
 
-        try:
-            # Mark as processing
-            msg.pipeline_status = PipelineStatus.classifying
-            await db.commit()
+        await _update_message(message_id, pipeline_status="classifying")
 
-            # ── Force session routing BEFORE agent call ──
-            # thread_id match → create new (no more chat_id + time window guessing)
-            from sqlalchemy import desc, select, func
-            from models.db import Session as DBSession, SessionMessage
+        # 2. Session routing (thread_id match or create new)
+        session_id = msg["session_id"] or await _route_session(msg)
+        if session_id:
+            await _update_message(message_id, session_id=session_id)
+            await _attach_message_to_session(message_id, session_id)
 
-            session_context = None
-            db_session_id = msg.session_id
+        # 3. Read fresh session state
+        session = await _read_session(session_id) if session_id else None
 
-            if not db_session_id and msg.chat_id:
-                # Match by thread_id (exact, no time limit)
-                if msg.thread_id:
-                    stmt = select(DBSession).where(
-                        DBSession.thread_id == msg.thread_id,
-                        DBSession.status.in_(["open", "waiting"]),
-                    ).order_by(desc(DBSession.last_active_at)).limit(1)
-                    result = await db.execute(stmt)
-                    recent_sess = result.scalar_one_or_none()
-                else:
-                    recent_sess = None
+        # 4. Audit: log before agent call
+        prompt = _build_prompt(msg, session)
+        await _audit("pipeline_agent_call", "message", str(message_id), {
+            "message_id": message_id,
+            "session": session,
+            "prompt": prompt[:2000],
+        })
 
-                if recent_sess:
-                    db_session_id = recent_sess.id
-                else:
-                    # No thread match → create new session
-                    new_sess = DBSession(
-                        session_key=f"feishu_{msg.chat_id[:16]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                        source_platform="feishu",
-                        source_chat_id=msg.chat_id,
-                        owner_user_id=msg.sender_id,
-                        title=msg.content[:64] if msg.content else "新会话",
-                        topic="",
-                        project="",
-                        priority="normal",
-                        status="open",
-                        thread_id=msg.thread_id or "",
-                        summary_path="",
-                        last_active_at=datetime.now(),
-                        message_count=0,
-                        risk_level="low",
-                        needs_manual_review=False,
-                    )
-                    db.add(new_sess)
-                    await db.commit()
-                    await db.refresh(new_sess)
-                    db_session_id = new_sess.id
+        # 5. Run agent (project resume or orchestrator)
+        agent_sid = session["agent_session_id"] if session else None
+        project = session["project"] if session else ""
 
-            # Attach message to session
-            if db_session_id:
-                sess_obj = await db.get(DBSession, db_session_id)
-                if sess_obj:
-                    msg.session_id = db_session_id
-                    sess_obj.message_count = sess_obj.message_count + 1
-                    sess_obj.last_active_at = datetime.now()
-                    sess_obj.updated_at = datetime.now()
-                    await db.commit()
+        if agent_sid and project:
+            result = await _run_project_agent(project, prompt, agent_sid)
+        else:
+            result = await _run_orchestrator(prompt)
 
-                    # Create session_message record
-                    max_seq_result = await db.execute(
-                        select(func.coalesce(func.max(SessionMessage.sequence_no), 0))
-                        .where(SessionMessage.session_id == db_session_id)
-                    )
-                    max_seq = max_seq_result.scalar() or 0
-                    db.add(SessionMessage(
-                        session_id=db_session_id,
-                        message_id=msg.id,
-                        role="user",
-                        sequence_no=max_seq + 1,
-                    ))
-                    await db.commit()
+        result_text = result.get("text", "")
+        new_agent_sid = result.get("session_id")
+        parsed = _parse_result(result_text) if not (agent_sid and project) else {
+            "action": "replied",
+            "classified_type": "work_question",
+            "topic": session["title"] if session else "",
+            "project_name": project,
+            "reply_content": result_text,
+            "reason": "resumed project session",
+        }
 
-                    session_context = {
-                        "agent_session_id": sess_obj.agent_session_id,
-                        "project": sess_obj.project,
-                        "title": sess_obj.title,
-                        "db_session_id": sess_obj.id,
-                        "thread_id": sess_obj.thread_id or "",
-                        "platform_message_id": msg.platform_message_id,
-                    }
+        # 6. Audit: log agent result
+        await _audit("pipeline_agent_result", "message", str(message_id), {
+            "agent_session_id": new_agent_sid,
+            "action": parsed.get("action"),
+            "classified_type": parsed.get("classified_type"),
+            "result_text": result_text[:1500],
+        })
 
-            # Build prompt
-            prompt = _build_prompt(msg, session_context=session_context)
+        # 7. Deliver reply via feishu (pipeline handles this, not agent)
+        reply_content = parsed.get("reply_content", "")
+        action = parsed.get("action", "replied")
+        thread_id = None
+        delivered = True
 
-            from core.config import get_model_override, load_models_config
-            selected_model = get_model_override() or load_models_config().get("default")
+        if action in ("replied", "drafted"):
+            if not reply_content:
+                # Agent said replied but gave no content — treat as failure
+                await _update_message(message_id,
+                                      pipeline_status="failed",
+                                      pipeline_error="action=replied but reply_content is empty",
+                                      processed_at=datetime.now().isoformat())
+                await _audit("pipeline_feishu_reply", "message", str(message_id), {
+                    "delivered": False,
+                    "action": action,
+                    "error": "empty reply_content",
+                })
+                logger.warning("Pipeline: message {} marked failed — empty reply_content", message_id)
+                return
+            if not msg["platform_message_id"]:
+                await _update_message(message_id,
+                                      pipeline_status="failed",
+                                      pipeline_error="missing platform_message_id, cannot deliver",
+                                      processed_at=datetime.now().isoformat())
+                logger.warning("Pipeline: message {} marked failed — no platform_message_id", message_id)
+                return
+            thread_id, delivered = await _deliver_reply(msg, reply_content, session_id)
+            await _audit("pipeline_feishu_reply", "message", str(message_id), {
+                "delivered": delivered,
+                "action": action,
+                "thread_id": thread_id,
+                "content_length": len(reply_content),
+            })
+            if not delivered:
+                await _update_message(message_id,
+                                      pipeline_status="failed",
+                                      pipeline_error="feishu reply delivery failed",
+                                      processed_at=datetime.now().isoformat())
+                logger.warning("Pipeline: message {} marked failed — feishu delivery failed", message_id)
+                return
 
-            # Audit: log the full prompt and session context before agent call
-            db.add(AuditLog(
-                event_type="pipeline_agent_call",
-                target_type="message",
-                target_id=str(msg.id),
-                detail=json.dumps({
-                    "message_id": msg.id,
-                    "chat_id": msg.chat_id,
-                    "session_context": session_context,
-                    "selected_model": selected_model,
-                    "prompt": prompt[:2000],
-                }, ensure_ascii=False),
-                operator="orchestrator",
-            ))
-            await db.commit()
-
-            # Record agent run
-            run = AgentRun(
-                message_id=msg.id,
-                agent_name="orchestrator",
-                runtime_type="agent_sdk",
-                status=AgentRunStatus.running,
-                started_at=datetime.now(),
-            )
-            db.add(run)
-            await db.commit()
-            await db.refresh(run)
-
-            # Run orchestrator agent
-            from core.orchestrator.agent_client import agent_client
-            resume_session_id = session_context.get("agent_session_id") if session_context else None
-            result = await agent_client.run(
-                prompt=prompt,
-                system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
-                max_turns=30,
-                session_id=resume_session_id,
+        # 8. Persist session state (agent_session_id, project, thread_id)
+        if session_id:
+            await _update_session_state(
+                session_id,
+                agent_session_id=new_agent_sid,
+                project=parsed.get("project_name") or "",
+                thread_id=thread_id,
             )
 
-            result_text = result.get("text", "")
-            agent_session_id = result.get("session_id")
-            used_model = result.get("model")
+        # 9. Mark completed
+        await _update_message(message_id,
+                              pipeline_status="completed",
+                              classified_type=parsed.get("classified_type", "chat"),
+                              processed_at=datetime.now().isoformat(),
+                              pipeline_error="")
 
-            # Parse structured result from agent output
-            parsed = _parse_result(result_text)
+        # 10. Record agent run
+        await _record_agent_run(message_id, session_id, new_agent_sid, result)
 
-            # Audit: log agent result with session info
-            db.add(AuditLog(
-                event_type="pipeline_agent_result",
-                target_type="message",
-                target_id=str(msg.id),
-                detail=json.dumps({
-                    "message_id": msg.id,
-                    "agent_session_id": agent_session_id,
-                    "used_model": used_model,
-                    "parsed_session_id": parsed.get("session_id"),
-                    "action": parsed.get("action"),
-                    "classified_type": parsed.get("classified_type"),
-                    "result_text": result_text[:1500],
-                }, ensure_ascii=False),
-                operator="orchestrator",
-            ))
-            await db.commit()
+        await _audit("pipeline_completed", "message", str(message_id), {
+            "action": action,
+            "classified_type": parsed.get("classified_type"),
+            "session_id": session_id,
+        })
+        logger.info("Pipeline: message {} → {} ({})",
+                     message_id, action, parsed.get("classified_type"))
 
-            # Update message with classification
-            msg.classified_type = parsed.get("classified_type", "chat")
-            # session_id already set by pre-agent routing — don't overwrite with null
-            msg.pipeline_status = PipelineStatus.completed
-            msg.processed_at = datetime.now()
-            await db.commit()
-
-            # Save bot reply if agent sent one
-            reply_content = parsed.get("reply_content", "")
-            action = parsed.get("action", "silent")
-            if reply_content and action in ("replied", "drafted"):
-                await _save_reply(db, msg, reply_content,
-                                  session_id=msg.session_id,
-                                  is_draft=(action == "drafted"))
-
-            # ── Ensure task_context exists for non-chat sessions ──
-            if msg.session_id and msg.classified_type not in ("chat", "noise"):
-                from models.db import TaskContext
-                sess_for_tc = await db.get(DBSession, msg.session_id)
-                if sess_for_tc and not sess_for_tc.task_context_id:
-                    tc = TaskContext(
-                        title=parsed.get("topic") or sess_for_tc.title or "未命名任务",
-                        description="",
-                        status="active",
-                    )
-                    db.add(tc)
-                    await db.commit()
-                    await db.refresh(tc)
-                    sess_for_tc.task_context_id = tc.id
-                    await db.commit()
-
-            # Update agent run
-            run.status = AgentRunStatus.success
-            run.ended_at = datetime.now()
-            run.output_path = result_text[:2000]
-            run.session_id = msg.session_id
-            run.cost_usd = result.get("cost_usd") or 0
-            if agent_session_id:
-                run.input_path = f"agent_session:{agent_session_id}"
-                # Persist SDK session ID to the DB session for future resume
-                if msg.session_id:
-                    db_sess = await db.get(DBSession, msg.session_id)
-                    if db_sess and not db_sess.agent_session_id:
-                        db_sess.agent_session_id = agent_session_id
-
-            # ── Persist thread_id from agent result to session ──
-            # The agent's reply_to_message tool returns thread_id;
-            # extract it from parsed result or audit logs
-            reply_thread_id = parsed.get("thread_id", "")
-            if reply_thread_id and msg.session_id:
-                db_sess = await db.get(DBSession, msg.session_id)
-                if db_sess and not db_sess.thread_id:
-                    db_sess.thread_id = reply_thread_id
-                    logger.info("Session {} bound to thread_id {}",
-                                msg.session_id, reply_thread_id)
-
-            await db.commit()
-
-            # Audit
-            db.add(AuditLog(
-                event_type="pipeline_completed",
-                target_type="message",
-                target_id=str(msg.id),
-                detail=f"action={action} type={msg.classified_type} session={msg.session_id}",
-                operator="orchestrator",
-            ))
-            await db.commit()
-
-            logger.info("Pipeline: message {} → {} ({})",
-                        msg.id, action, msg.classified_type)
-
-        except Exception as e:
-            logger.exception("Pipeline failed for message {}: {}", message_id, e)
-            async with async_session_factory() as db2:
-                m = await db2.get(Message, message_id)
-                if m:
-                    m.pipeline_status = PipelineStatus.failed
-                    m.pipeline_error = str(e)[:500]
-                    m.processed_at = datetime.now()
-                    await db2.commit()
-                db2.add(AuditLog(
-                    event_type="pipeline_failed",
-                    target_type="message",
-                    target_id=str(message_id),
-                    detail=f"error={str(e)[:200]}",
-                    operator="orchestrator",
-                ))
-                await db2.commit()
+    except Exception as e:
+        logger.exception("Pipeline failed for message {}: {}", message_id, e)
+        await _update_message(message_id,
+                              pipeline_status="failed",
+                              pipeline_error=str(e)[:500],
+                              processed_at=datetime.now().isoformat())
+        await _audit("pipeline_failed", "message", str(message_id),
+                      {"error": str(e)[:200]})
 
 
 async def reprocess_message(message_id: int) -> None:
-    """Reset and reprocess a message through the pipeline."""
-    async with async_session_factory() as db:
-        msg = await db.get(Message, message_id)
-        if not msg:
-            return
-        msg.pipeline_status = PipelineStatus.pending
-        msg.pipeline_error = ""
-        msg.classified_type = None
-        msg.session_id = None
-        msg.processed_at = None
-        await db.commit()
+    await _update_message(message_id,
+                          pipeline_status="pending",
+                          pipeline_error="",
+                          classified_type=None,
+                          session_id=None,
+                          processed_at=None)
     await process_message(message_id)
 
 
 # ---------------------------------------------------------------------------
-# Helpers (no LLM)
+# Agent execution
 # ---------------------------------------------------------------------------
 
-def _build_prompt(msg: Message, session_context: dict | None = None) -> str:
-    """Build the orchestrator prompt from a message.
+async def _run_orchestrator(prompt: str) -> dict:
+    from core.orchestrator.agent_client import agent_client
+    return await agent_client.run(
+        prompt=prompt,
+        system_prompt=_build_system_prompt(),
+        max_turns=30,
+    )
 
-    Args:
-        session_context: Optional dict with keys agent_session_id, project, title, db_session_id.
-    """
-    db_sid = session_context.get("db_session_id", "") if session_context else ""
-    platform_mid = msg.platform_message_id
 
-    # Extract multimodal info from raw_payload
-    media_desc = _extract_media_description(msg)
+async def _run_project_agent(project_name: str, prompt: str,
+                              session_id: str) -> dict:
+    from core.orchestrator.agent_client import agent_client
+    from core.projects import get_project, merge_skills
+    from skills import SKILL_REGISTRY
 
-    # Resume: SDK has full context, only send new message
-    if session_context and session_context.get("agent_session_id"):
-        project = session_context.get("project", "")
-        prompt = f"db_session_id: {db_sid} | 飞书消息ID: {platform_mid}\n\n{msg.content}"
-        if media_desc:
-            prompt += f"\n\n[多模态内容] {media_desc}"
-        if project:
-            prompt += f"\n\n项目: {project}\n请 dispatch_to_project 并传入 session_id 恢复上下文。"
+    project = get_project(project_name)
+    if not project:
+        logger.warning("Project {} not found, falling back to orchestrator", project_name)
+        return await _run_orchestrator(prompt)
+
+    merged = merge_skills(SKILL_REGISTRY, project.path)
+    system = f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
+
+    return await agent_client.run_for_project(
+        prompt=prompt,
+        system_prompt=system,
+        project_cwd=str(project.path),
+        project_agents=merged,
+        max_turns=20,
+        session_id=session_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
+
+def _build_prompt(msg: dict, session: dict | None) -> str:
+    """Build prompt from message and session context."""
+    content = msg["content"] or ""
+    media = _extract_media(msg)
+
+    # Project resume: just the user message
+    if session and session.get("agent_session_id") and session.get("project"):
+        prompt = content
+        if media:
+            prompt += f"\n\n[多模态内容] {media}"
         return prompt
 
-    # New session: minimal context
-    parts = [f"飞书消息ID: {platform_mid} | 聊天ID: {msg.chat_id} | db_session_id: {db_sid}"]
-    if media_desc:
-        parts.append(f"[多模态内容] {media_desc}")
+    # New or non-project: include IDs for orchestrator
+    parts = [f"飞书消息ID: {msg['platform_message_id']} | db_session_id: {session['id'] if session else ''}"]
+    if media:
+        parts.append(f"[多模态内容] {media}")
     parts.append("")
-    parts.append(msg.content)
+    parts.append(content)
     return "\n".join(parts)
 
 
-def _extract_media_description(msg: Message) -> str:
-    """Extract a human-readable description of multimodal content from message fields."""
-    if msg.message_type == "text" or not msg.message_type:
+def _extract_media(msg: dict) -> str:
+    if msg.get("message_type") in ("text", None, ""):
         return ""
-
-    # msg.content already contains "[图片]", "[文件: xxx]", etc. from feishu parser
-    # We also try to extract richer info from raw_payload if available
-    media_detail = ""
-    if msg.raw_payload:
-        try:
-            payload = json.loads(msg.raw_payload)
-            # Try to find content_raw in the serialized event dict
-            # The structure varies but typically: {"event": {"message": {...}}}
-            # or flat dict depending on SDK serialization
-            msg_data = _find_message_in_payload(payload)
-            if msg_data:
-                content_raw = msg_data.get("content", "")
-                try:
-                    content_data = json.loads(content_raw) if content_raw else {}
-                except (json.JSONDecodeError, TypeError):
-                    content_data = {}
-
-                msg_type = msg_data.get("message_type", msg.message_type)
-                if msg_type == "image" and content_data.get("image_key"):
-                    media_detail = f" (image_key: {content_data['image_key']})"
-                elif msg_type == "file":
-                    parts = []
-                    if content_data.get("file_name"):
-                        parts.append(f"文件名: {content_data['file_name']}")
-                    if content_data.get("file_key"):
-                        parts.append(f"file_key: {content_data['file_key']}")
-                    if parts:
-                        media_detail = f" ({', '.join(parts)})"
-                elif msg_type == "video":
-                    parts = []
-                    if content_data.get("file_name"):
-                        parts.append(f"文件名: {content_data['file_name']}")
-                    if content_data.get("video_key"):
-                        parts.append(f"video_key: {content_data['video_key']}")
-                    if parts:
-                        media_detail = f" ({', '.join(parts)})"
-        except Exception:
-            pass
-
-    return f"用户发送了{msg.content[1:-1] if msg.content.startswith('[') else msg.message_type + '消息'}{media_detail}"
+    content = msg.get("content", "")
+    label = content[1:-1] if content.startswith("[") else (msg.get("message_type", "") + "消息")
+    return f"用户发送了{label}"
 
 
-def _find_message_in_payload(payload: dict) -> dict:
-    """Recursively find message data dict in the serialized payload."""
-    if not isinstance(payload, dict):
-        return {}
-    # Direct message keys
-    if "message_type" in payload and "content" in payload:
-        return payload
-    # Nested under "event"
-    event = payload.get("event")
-    if isinstance(event, dict):
-        msg = event.get("message")
-        if isinstance(msg, dict):
-            return msg
-    # Try nested dict values
-    for v in payload.values():
-        if isinstance(v, dict):
-            result = _find_message_in_payload(v)
-            if result:
-                return result
-    return {}
+# ---------------------------------------------------------------------------
+# Session routing
+# ---------------------------------------------------------------------------
 
+async def _route_session(msg: dict) -> int | None:
+    """Match message to session by thread_id or create new."""
+    if not msg.get("chat_id"):
+        return None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Match by thread_id
+        if msg.get("thread_id"):
+            cursor = await db.execute(
+                "SELECT id FROM sessions WHERE thread_id = ? AND status IN ('open','waiting') "
+                "ORDER BY last_active_at DESC LIMIT 1",
+                (msg["thread_id"],),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+
+        # Create new session
+        now = datetime.now().isoformat()
+        key = f"feishu_{msg['chat_id'][:16]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        title = (msg.get("content") or "新会话")[:64]
+        cursor = await db.execute(
+            "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+            "title, topic, project, priority, status, thread_id, summary_path, "
+            "last_active_at, message_count, risk_level, needs_manual_review, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, "feishu", msg["chat_id"], msg.get("sender_id", ""),
+             title, "", "", "normal", "open", msg.get("thread_id", ""), "",
+             now, 0, "low", False, now, now),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def _attach_message_to_session(message_id: int, session_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Update session counters
+        now = datetime.now().isoformat()
+        await db.execute(
+            "UPDATE sessions SET message_count = message_count + 1, "
+            "last_active_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, session_id),
+        )
+        # Add session_message link
+        cursor = await db.execute(
+            "SELECT COALESCE(MAX(sequence_no), 0) FROM session_messages WHERE session_id = ?",
+            (session_id,),
+        )
+        max_seq = (await cursor.fetchone())[0]
+        await db.execute(
+            "INSERT INTO session_messages (session_id, message_id, role, sequence_no, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (session_id, message_id, "user", max_seq + 1, now),
+        )
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Reply delivery (feishu + DB)
+# ---------------------------------------------------------------------------
+
+async def _deliver_reply(msg: dict, content: str, session_id: int | None) -> tuple[str | None, bool]:
+    """Send reply to feishu and save to DB. Returns (thread_id, delivered)."""
+    delivered = False
+    thread_id = ""
+    try:
+        from core.connectors.feishu import FeishuClient
+        client = FeishuClient()
+        result = client.reply_message(
+            message_id=msg["platform_message_id"],
+            content=content[:4000],
+            reply_in_thread=True,
+        )
+        thread_id = result.get("thread_id", "") if result else ""
+        delivered = True
+        logger.info("Pipeline: delivered reply for message {}", msg["id"])
+    except Exception as e:
+        logger.warning("Pipeline: feishu reply failed for message {}: {}", msg["id"], e)
+
+    # Save bot reply to DB
+    try:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO messages (platform, platform_message_id, chat_id, "
+                "sender_id, sender_name, message_type, content, received_at, raw_payload, "
+                "thread_id, root_id, parent_id, classified_type, "
+                "session_id, pipeline_status, pipeline_error, processed_at, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (msg.get("platform", "feishu"), f"reply_{msg['platform_message_id']}",
+                 msg["chat_id"], "bot", "WorkAgent", "text", content[:4000],
+                 now, "",
+                 thread_id or "", "", "", "bot_reply",
+                 session_id, "completed", "", now, now),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("Pipeline: save bot reply failed: {}", e)
+
+    return thread_id or None, delivered
+
+
+# ---------------------------------------------------------------------------
+# Session state persistence
+# ---------------------------------------------------------------------------
+
+async def _update_session_state(session_id: int, *,
+                                 agent_session_id: str | None = None,
+                                 project: str = "",
+                                 thread_id: str | None = None) -> None:
+    """Write agent_session_id, project, thread_id to session (only if not already set)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT agent_session_id, project, thread_id FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return
+
+        current_sid, current_project, current_thread = row
+        updates, params = [], []
+
+        if not current_sid and agent_session_id:
+            updates.append("agent_session_id = ?")
+            params.append(agent_session_id)
+
+        if not current_project and project:
+            updates.append("project = ?")
+            params.append(project)
+
+        if not current_thread and thread_id:
+            updates.append("thread_id = ?")
+            params.append(thread_id)
+            logger.info("Session {} bound to thread_id {}", session_id, thread_id)
+
+        if updates:
+            updates.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(session_id)
+            await db.execute(
+                f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?", params,
+            )
+            await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# DB helpers (all raw SQL)
+# ---------------------------------------------------------------------------
+
+async def _read_message(message_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def _update_message(message_id: int, **fields) -> None:
+    if not fields:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        await db.execute(
+            f"UPDATE messages SET {set_clause} WHERE id = ?",
+            [*fields.values(), message_id],
+        )
+        await db.commit()
+
+
+async def _read_session(session_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def _audit(event_type: str, target_type: str, target_id: str,
+                 detail: dict | str) -> None:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO audit_logs (event_type, target_type, target_id, detail, "
+                "operator, created_at) VALUES (?,?,?,?,?,?)",
+                (event_type, target_type, target_id,
+                 json.dumps(detail, ensure_ascii=False) if isinstance(detail, dict) else detail,
+                 "orchestrator", datetime.now().isoformat()),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("Audit log failed: {}", e)
+
+
+async def _record_agent_run(message_id: int, session_id: int | None,
+                             agent_session_id: str | None,
+                             result: dict) -> None:
+    try:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO agent_runs (message_id, agent_name, runtime_type, "
+                "session_id, status, started_at, ended_at, cost_usd, "
+                "input_path, output_path, input_tokens, output_tokens, error_message) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (message_id, "orchestrator", "agent_sdk", session_id, "success",
+                 now, now, result.get("cost_usd", 0),
+                 f"agent_session:{agent_session_id}" if agent_session_id else "",
+                 result.get("text", "")[:2000],
+                 result.get("num_turns", 0), 0, ""),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("Record agent run failed: {}", e)
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
 
 def _parse_result(text: str) -> dict:
-    """Extract the JSON result from the agent's final output.
-
-    Tries multiple strategies to find valid JSON containing the expected
-    'action' key.  Falls back to a safe silent-action dict on failure.
-    """
+    """Extract JSON with 'action' key from agent output."""
     text = text.strip()
     if not text:
-        return _fallback_result("empty output")
+        return _fallback("empty output")
 
-    def _is_valid(d: dict) -> bool:
+    def _valid(d):
         return isinstance(d, dict) and "action" in d
 
-    # Strategy 1: entire text is JSON
+    # Try: whole text
     try:
         d = json.loads(text)
-        if _is_valid(d):
+        if _valid(d):
             return d
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strategy 2: fenced ```json ... ``` block
+    # Try: fenced ```json blocks
     if "```" in text:
         for block in text.split("```"):
             block = block.strip()
@@ -525,21 +531,18 @@ def _parse_result(text: str) -> dict:
                 block = block[4:].strip()
             try:
                 d = json.loads(block)
-                if _is_valid(d):
+                if _valid(d):
                     return d
             except (json.JSONDecodeError, ValueError):
                 continue
 
-    # Strategy 3: scan for balanced { ... } containing "action"
-    # Walk backwards through all top-level brace pairs
+    # Try: last balanced { } containing "action"
     pos = len(text)
     while pos > 0:
         end = text.rfind("}", 0, pos)
         if end == -1:
             break
-        # Find the matching opening brace by counting braces
-        depth = 0
-        start = end
+        depth, start = 0, end
         while start >= 0:
             if text[start] == "}":
                 depth += 1
@@ -549,66 +552,29 @@ def _parse_result(text: str) -> dict:
                     break
             start -= 1
         if start >= 0 and depth == 0:
-            candidate = text[start:end + 1]
             try:
-                d = json.loads(candidate)
-                if _is_valid(d):
+                d = json.loads(text[start:end + 1])
+                if _valid(d):
                     return d
             except (json.JSONDecodeError, ValueError):
                 pass
-        pos = start  # try the next occurrence further left
+        pos = start
 
-    return _fallback_result("failed to parse structured output")
+    # Parse failed but agent produced text — use it directly as reply
+    if text:
+        logger.warning("Pipeline: JSON parse failed, using raw text as reply (len={})", len(text))
+        return {
+            "action": "replied",
+            "classified_type": "chat",
+            "topic": "",
+            "project_name": None,
+            "reply_content": text,
+            "reason": "parse_failed_fallback",
+        }
+
+    return _fallback("failed to parse")
 
 
-def _fallback_result(reason: str) -> dict:
-    """Safe fallback — never uses raw output as reply content."""
-    return {
-        "action": "silent",
-        "classified_type": "chat",
-        "topic": "",
-        "reply_content": "",
-        "reason": reason,
-    }
-
-
-async def _save_reply(db, original_msg: Message, reply_content: str,
-                      session_id: int | None = None, is_draft: bool = False) -> Message:
-    """Save bot reply to messages table and link to session."""
-    from sqlalchemy import func, select
-
-    prefix = "[草稿] " if is_draft else ""
-    reply_msg = Message(
-        platform=original_msg.platform,
-        platform_message_id=f"reply_{original_msg.platform_message_id}",
-        chat_id=original_msg.chat_id,
-        sender_id="bot",
-        sender_name="WorkAgent",
-        message_type="text",
-        content=f"{prefix}{reply_content}",
-        received_at=datetime.now(),
-        classified_type="bot_reply",
-        session_id=session_id,
-        pipeline_status=PipelineStatus.completed,
-        processed_at=datetime.now(),
-    )
-    db.add(reply_msg)
-    await db.commit()
-    await db.refresh(reply_msg)
-
-    if session_id:
-        max_seq = (await db.execute(
-            select(func.coalesce(func.max(SessionMessage.sequence_no), 0))
-            .where(SessionMessage.session_id == session_id)
-        )).scalar() or 0
-
-        sm = SessionMessage(
-            session_id=session_id,
-            message_id=reply_msg.id,
-            role="assistant",
-            sequence_no=max_seq + 1,
-        )
-        db.add(sm)
-        await db.commit()
-
-    return reply_msg
+def _fallback(reason: str) -> dict:
+    return {"action": "replied", "classified_type": "chat", "topic": "",
+            "reply_content": "", "reason": reason}

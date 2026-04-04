@@ -25,7 +25,6 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ToolUseBlock,
-    ToolResultBlock,
 )
 
 from core.config import settings, get_model_override, load_models_config
@@ -87,10 +86,16 @@ async def send_feishu_message(input: dict) -> dict[str, Any]:
     try:
         from core.connectors.feishu import FeishuClient
         client = FeishuClient()
-        ok = client.send_message(receive_id=input["receive_id"], content=input["content"], receive_id_type=input.get("receive_id_type", "chat_id"))
-        return {"success": ok}
+        result = client.send_message(
+            receive_id=input["receive_id"],
+            content=input["content"],
+            receive_id_type=input.get("receive_id_type", "chat_id"),
+        )
+        if result is None:
+            return {"success": False, "delivery_type": "send", "error": "Failed to send message"}
+        return {"success": True, "delivery_type": "send", **result}
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, "delivery_type": "send", "error": str(e)}
 
 
 @tool(
@@ -114,7 +119,7 @@ async def reply_to_message(input: dict) -> dict[str, Any]:
             reply_in_thread=reply_in_thread,
         )
         if result is None:
-            return {"success": False, "error": "Failed to reply message"}
+            return {"success": False, "delivery_type": "reply", "error": "Failed to reply message"}
 
         # Auto-bind thread_id to session if provided
         thread_id = result.get("thread_id", "")
@@ -140,9 +145,9 @@ async def reply_to_message(input: dict) -> dict[str, Any]:
             except Exception as e:
                 logger.warning("Failed to bind thread_id to session: {}", e)
 
-        return {"success": True, **result}
+        return {"success": True, "delivery_type": "reply", **result}
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, "delivery_type": "reply", "error": str(e)}
 
 
 @tool(
@@ -170,7 +175,7 @@ async def save_bot_reply(input: dict) -> dict[str, Any]:
             )
             row = await cursor.fetchone()
             if not row:
-                return {"error": f"message {input['message_id']} not found"}
+                return {"success": False, "error": f"message {input['message_id']} not found"}
             platform_msg_id = row[0]
             platform = row[1]
 
@@ -178,6 +183,7 @@ async def save_bot_reply(input: dict) -> dict[str, Any]:
             prefix = "[草稿] " if input.get("is_draft") else ""
             content = f"{prefix}{input['reply_content']}"
             reply_platform_id = f"reply_{platform_msg_id}"
+            session_id = input.get("session_id")
 
             # Upsert — avoid duplicate replies
             cursor = await db.execute(
@@ -191,7 +197,6 @@ async def save_bot_reply(input: dict) -> dict[str, Any]:
                     (content, now, existing[0]),
                 )
             else:
-                session_id = input.get("session_id")
                 await db.execute(
                     "INSERT INTO messages (platform, platform_message_id, chat_id, sender_id, "
                     "sender_name, message_type, content, received_at, classified_type, session_id, "
@@ -214,10 +219,15 @@ async def save_bot_reply(input: dict) -> dict[str, Any]:
                         "VALUES (?,?,?,?,?)",
                         (session_id, reply_id, "assistant", max_seq + 1, now),
                     )
+            if session_id:
+                await db.execute(
+                    "UPDATE sessions SET last_active_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, session_id),
+                )
             await db.commit()
             return {"success": True}
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, "error": str(e)}
 
 
 @tool(
@@ -394,9 +404,11 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         async with aiosqlite.connect(str(db_path)) as db:
             now = datetime.now().isoformat()
             cursor = await db.execute(
-                "INSERT INTO agent_runs (agent_name, runtime_type, session_id, status, started_at) "
-                "VALUES (?,?,?,?,?)",
-                (f"dispatch:{project_name}", "agent_sdk", db_session_id, "running", now),
+                "INSERT INTO agent_runs (agent_name, runtime_type, session_id, status, "
+                "input_path, output_path, input_tokens, output_tokens, cost_usd, error_message, started_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (f"dispatch:{project_name}", "agent_sdk", db_session_id, "running",
+                 "", "", 0, 0, 0.0, "", now),
             )
             dispatch_run_id = cursor.lastrowid
             await db.commit()
@@ -496,6 +508,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
 # ==================== MCP Server ====================
 
+# All tools registered in MCP (project agents get full set)
 CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, reply_to_message,
                 save_bot_reply,
                 read_memory, write_memory, update_session, link_task_context,
@@ -508,6 +521,13 @@ CUSTOM_MCP_SERVER = create_sdk_mcp_server(
 )
 
 CUSTOM_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in CUSTOM_TOOLS]
+
+# Orchestrator tools: only query + dispatch (pipeline handles reply/save)
+ORCHESTRATOR_TOOL_NAMES = [
+    f"mcp__work-agent-tools__{t.name}" for t in [
+        query_db, read_memory, dispatch_to_project,
+    ]
+]
 
 
 # ==================== Subagent Transcript Hook ====================
@@ -582,12 +602,16 @@ class AgentClient:
         project_agents: Optional[dict] = None,
         exclude_tools: Optional[list[str]] = None,
         model: Optional[str] = None,
+        orchestrator_mode: bool = False,
     ) -> ClaudeAgentOptions:
         from skills import SKILL_REGISTRY
 
         builtin_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
-        allowed = builtin_tools + CUSTOM_TOOL_NAMES
+        # Orchestrator: limited tools (no message sending)
+        # Project: full tools
+        custom_tools = ORCHESTRATOR_TOOL_NAMES if orchestrator_mode else CUSTOM_TOOL_NAMES
+        allowed = builtin_tools + custom_tools
         if exclude_tools:
             allowed = [t for t in allowed if t not in exclude_tools]
 
@@ -636,6 +660,7 @@ class AgentClient:
             session_id=session_id,
             skill=skill,
             model=model,
+            orchestrator_mode=True,
         )
 
         result_text = ""
@@ -694,8 +719,6 @@ class AgentClient:
                         yield {"type": "text", "content": block.text}
                     elif isinstance(block, ToolUseBlock):
                         yield {"type": "tool_use", "tool": block.name, "input": json.dumps(block.input, ensure_ascii=False)[:500]}
-                    elif isinstance(block, ToolResultBlock):
-                        yield {"type": "tool_result", "content": str(block.content)[:500]}
 
             elif isinstance(msg, ResultMessage):
                 yield {
@@ -726,10 +749,13 @@ class AgentClient:
 
         Used by dispatch_to_project tool. Excludes recursive dispatch tools.
         """
-        # Prevent recursion: project agents cannot dispatch to other projects
+        # Project agents: no dispatch, no feishu message sending (pipeline handles delivery)
         exclude = [
             "mcp__work-agent-tools__dispatch_to_project",
             "mcp__work-agent-tools__list_projects",
+            "mcp__work-agent-tools__send_feishu_message",
+            "mcp__work-agent-tools__reply_to_message",
+            "mcp__work-agent-tools__save_bot_reply",
         ]
 
         options = self._build_options(

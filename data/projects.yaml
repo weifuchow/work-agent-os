@@ -10,14 +10,14 @@ projects:
   - name: work-agent-os
     path: D:/standard/work-agent-os
     description: >
-      个人工作助手系统。Python 3.11 + FastAPI + Claude Agent SDK + React。
-      通过飞书接收消息，Orchestrator Agent 自主决策处理。
-      有 5 个 skill agent（intake/context/analysis/reply/report）。
+      个人工作助手系统（work-agent-os）。Python 3.11 + FastAPI + Claude Agent SDK + React。
+      通过飞书接收消息，两级 Agent 架构（主 Agent + 项目 Agent）。
 
   - name: allspark
     path: D:/standard/riot/allspark
     description: >
-      Riot 调度系统 3.0（allspark）。Java 11 + Spring Boot 2.7.6 + Gradle + TDengine。
+      Riot 调度系统 3.0（allspark）。别名：riot3、RIOT3、riot3调度系统。
+      Java 11 + Spring Boot 2.7.6 + Gradle + TDengine。
       多机器人调度与控制系统：AGV 路径规划（TDSPP/A*）、死锁解决、行为树任务编排、
       设备管理（充电桩/电梯/风淋门，Modbus/S7/HTTP/SocketIO）、RBAC + JWT 安全层。
       模块：apps/ packages/ plugins/ src/ frontend/ ai/。
@@ -25,15 +25,23 @@ projects:
   - name: riot-standalone
     path: D:/standard/riot/riot-standalone
     description: >
-      Riot 2.0 单体版。Java 11 + Spring Boot + Maven 多模块。
+      Riot 2.0 单体版（riot-standalone）。别名：riot2、RIOT2。
+      Java 11 + Spring Boot + Maven 多模块。
       前代车队调度系统，模块：bootstrap/device/task/fcs（Fleet Control System）/
       brokerx/security。使用 Flyway 数据库迁移，sprint/release/master 分支流程。
 
   - name: allsparkbox
     path: D:/standard/riot/allsparkbox
     description: >
-      RIOT3 部署构建包。Docker/Podman 一键安装方案。
+      RIOT3 部署构建包（allsparkbox）。别名：部署包、安装包。
+      Docker/Podman 一键安装方案。
       涵盖：镜像构建流程（Makefile + Dockerfile）、分层镜像依赖链（base→mysql→taos→grafana→
       mosquitto→admin→allspark→mip→set→middler）、Linux/Windows 部署方法、
       端口配置、数据卷挂载、supervisord 服务管理、中控部署、Podman 适配。
       关键文件：RIOT3部署文档.md（完整部署手册）、README.md（构建指南）、images/（镜像构建脚本）。
+
+  - name: claude-code-sourcemap
+    path: D:/standard/claude-code-sourcemap
+    description: >
+      Claude Code 源码学习4项目。用于 Claude Code 源码阅读、行为分析、调用链追踪与实现细节研究。
+      重点关注 CLI/Agent Runtime/工具调用/会话恢复/流式事件与相关调试验证。
