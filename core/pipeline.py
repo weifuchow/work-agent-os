@@ -102,7 +102,7 @@ async def process_message(message_id: int) -> None:
         if agent_sid and project:
             result = await _run_project_agent(project, prompt, agent_sid)
         else:
-            result = await _run_orchestrator(prompt)
+            result = await _run_orchestrator(prompt, session_id=agent_sid)
 
         result_text = result.get("text", "")
         new_agent_sid = result.get("session_id")
@@ -116,8 +116,17 @@ async def process_message(message_id: int) -> None:
         }
 
         # 6. Audit: log agent result
+        # Read effective agent_session_id from DB (dispatch_to_project may have
+        # written the project agent's session_id directly, which differs from
+        # the orchestrator's own session_id returned in new_agent_sid).
+        effective_agent_sid = new_agent_sid
+        if session_id:
+            fresh = await _read_session(session_id)
+            if fresh and fresh.get("agent_session_id"):
+                effective_agent_sid = fresh["agent_session_id"]
+
         await _audit("pipeline_agent_result", "message", str(message_id), {
-            "agent_session_id": new_agent_sid,
+            "agent_session_id": effective_agent_sid,
             "action": parsed.get("action"),
             "classified_type": parsed.get("classified_type"),
             "result_text": result_text[:1500],
@@ -216,12 +225,13 @@ async def reprocess_message(message_id: int) -> None:
 # Agent execution
 # ---------------------------------------------------------------------------
 
-async def _run_orchestrator(prompt: str) -> dict:
+async def _run_orchestrator(prompt: str, session_id: str | None = None) -> dict:
     from core.orchestrator.agent_client import agent_client
     return await agent_client.run(
         prompt=prompt,
         system_prompt=_build_system_prompt(),
         max_turns=30,
+        session_id=session_id,
     )
 
 
@@ -238,6 +248,9 @@ async def _run_project_agent(project_name: str, prompt: str,
 
     merged = merge_skills(SKILL_REGISTRY, project.path)
     system = f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
+
+    logger.info("_run_project_agent: project={}, session_id={}, cwd={}, prompt={}",
+                project_name, session_id, str(project.path), prompt[:100])
 
     return await agent_client.run_for_project(
         prompt=prompt,
