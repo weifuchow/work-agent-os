@@ -30,6 +30,14 @@ projects:
       前代车队调度系统，模块：bootstrap/device/task/fcs（Fleet Control System）/
       brokerx/security。使用 Flyway 数据库迁移，sprint/release/master 分支流程。
 
+  - name: fms-java
+    path: D:/standard/riot/fms-java
+    description: >
+      Riot 1.0 车队管理系统（fms-java）。别名：riot1、RIOT1、fms、车队管理系统。
+      Java + Gradle 多模块项目。
+      车队管理/FMS 系统，包含 fms、service、common、configuration、api-base、
+      fms_frontend 与多个 extension 模块（tcp/rmi/dhcp/statistics/accessory）。
+
   - name: allsparkbox
     path: D:/standard/riot/allsparkbox
     description: >
