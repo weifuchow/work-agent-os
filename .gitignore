@@ -23,10 +23,15 @@ env/
 
 # Data (runtime generated)
 data/db/
+data/work_agent.db
 data/audit/*.log
 data/memory/
 data/*.restart.log
 data/reports/
+
+# Local temp and logs
+.tmp/
+*.log
 
 # Claude Code
 .claude/settings.json

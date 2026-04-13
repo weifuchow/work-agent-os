@@ -39,6 +39,8 @@ export interface SessionItem {
   title: string
   topic: string
   project: string
+  agent_session_id?: string | null
+  agent_runtime?: string
   priority: string
   status: string
   summary_path: string
@@ -137,15 +139,28 @@ export interface ModelsResponse {
   fallback: string | null
   current: string | null
   override: string | null
-  providers: Record<string, { label?: string; enabled?: boolean }>
+  runtime?: string
+  providers?: Record<string, { label?: string; enabled?: boolean }>
   models: ModelOption[]
 }
 
-export const fetchModels = () =>
-  api.get<ModelsResponse>("/models")
+export interface AgentRuntimeResponse {
+  supported: string[]
+  current: string
+  override: string | null
+}
 
-export const switchModel = (model: string) =>
-  api.post<{ old_model: string; new_model: string; current: string }>("/model/switch", { model })
+export const fetchModels = (runtime?: string) =>
+  api.get<ModelsResponse>("/models", { params: runtime ? { runtime } : undefined })
+
+export const switchModel = (model: string, runtime?: string) =>
+  api.post<{ old_model: string; new_model: string; current: string; runtime: string }>("/model/switch", { model, runtime })
+
+export const fetchAgentRuntime = () =>
+  api.get<AgentRuntimeResponse>("/agent/runtime")
+
+export const switchAgentRuntime = (runtime: string) =>
+  api.post<{ old_runtime: string; new_runtime: string; current: string }>("/agent/runtime", { runtime })
 
 export const playgroundChat = (
   messages: PlaygroundMessage[],

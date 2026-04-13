@@ -9,6 +9,7 @@ import {
   Brain,
 } from "lucide-react"
 import { cn } from "../lib/utils"
+import AgentRuntimeSwitcher from "./AgentRuntimeSwitcher"
 import ModelSwitcher from "./ModelSwitcher"
 
 const navItems = [
@@ -54,7 +55,8 @@ export default function Layout() {
 
       {/* Main content */}
       <main className="flex-1 overflow-auto flex flex-col">
-        <header className="flex items-center justify-end px-6 py-3 border-b border-gray-200 bg-white">
+        <header className="flex items-center justify-end gap-3 px-6 py-3 border-b border-gray-200 bg-white">
+          <AgentRuntimeSwitcher />
           <ModelSwitcher />
         </header>
         <div className="flex-1 overflow-auto p-6">

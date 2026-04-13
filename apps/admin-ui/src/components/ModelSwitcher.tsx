@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { fetchModels, switchModel } from "../api/client"
+import { fetchAgentRuntime, fetchModels, switchModel } from "../api/client"
 import { Cpu, Check, ChevronDown } from "lucide-react"
 import { cn } from "../lib/utils"
 
@@ -11,14 +11,22 @@ export default function ModelSwitcher() {
   const dropdownRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const { data } = useQuery({
-    queryKey: ["models"],
-    queryFn: () => fetchModels().then((r) => r.data),
+  const { data: runtimeData } = useQuery({
+    queryKey: ["agent-runtime"],
+    queryFn: () => fetchAgentRuntime().then((r) => r.data),
     refetchInterval: 10000,
+  })
+  const runtime = runtimeData?.current || "claude"
+
+  const { data } = useQuery({
+    queryKey: ["models", runtime],
+    queryFn: () => fetchModels(runtime).then((r) => r.data),
+    refetchInterval: 10000,
+    enabled: !!runtime,
   })
 
   const mutation = useMutation({
-    mutationFn: (model: string) => switchModel(model),
+    mutationFn: (model: string) => switchModel(model, runtime),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["models"] })
       setOpen(false)

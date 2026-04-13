@@ -13,8 +13,23 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import load_models_config, get_model_override, set_model_override, settings, with_model_state
+from core.config import (
+    filter_models_for_runtime,
+    load_models_config,
+    get_agent_runtime_override,
+    get_model_override,
+    set_agent_runtime_override,
+    set_model_override,
+    settings,
+    with_model_state,
+)
 from core.database import get_session
+from core.orchestrator.agent_runtime import (
+    DEFAULT_AGENT_RUNTIME,
+    SUPPORTED_AGENT_RUNTIMES,
+    get_agent_run_runtime_type,
+    normalize_agent_runtime,
+)
 from core.orchestrator.claude_client import claude_client
 from models.db import (
     AgentRun, AgentRunStatus, AuditLog, Message, Session, SessionMessage, Task,
@@ -279,19 +294,28 @@ async def get_stats(db: AsyncSession = Depends(get_session)):
 
 
 @router.get("/models")
-async def list_models():
-    return with_model_state(load_models_config(), get_model_override())
+async def list_models(runtime: Optional[str] = Query(None)):
+    resolved_runtime = normalize_agent_runtime(
+        runtime or get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+    )
+    config = filter_models_for_runtime(load_models_config(), resolved_runtime)
+    return with_model_state(config, get_model_override(resolved_runtime), resolved_runtime)
 
 
 class ModelSwitchRequest(BaseModel):
     model: str
+    runtime: Optional[str] = None
 
 
 @router.post("/model/switch")
 async def switch_model(req: ModelSwitchRequest, db: AsyncSession = Depends(get_session)):
     """Switch the runtime model override."""
-    old_model = get_model_override() or load_models_config().get("default", "unknown")
-    set_model_override(req.model)
+    runtime = normalize_agent_runtime(
+        req.runtime or get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+    )
+    config = filter_models_for_runtime(load_models_config(), runtime)
+    old_model = get_model_override(runtime) or config.get("default", "unknown")
+    set_model_override(req.model, runtime=runtime)
 
     db.add(AuditLog(
         event_type="model_switch",
@@ -300,13 +324,55 @@ async def switch_model(req: ModelSwitchRequest, db: AsyncSession = Depends(get_s
         detail=json.dumps({
             "old_model": old_model,
             "new_model": req.model,
+            "runtime": runtime,
             "source": "admin_api",
         }, ensure_ascii=False),
         operator="admin",
     ))
     await db.commit()
 
-    return {"old_model": old_model, "new_model": req.model, "current": req.model}
+    return {"old_model": old_model, "new_model": req.model, "current": req.model, "runtime": runtime}
+
+
+class AgentRuntimeSwitchRequest(BaseModel):
+    runtime: str
+
+
+@router.get("/agent/runtime")
+async def get_agent_runtime():
+    override = get_agent_runtime_override()
+    current = normalize_agent_runtime(
+        override or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+    )
+    return {
+        "supported": list(SUPPORTED_AGENT_RUNTIMES),
+        "current": current,
+        "override": override,
+    }
+
+
+@router.post("/agent/runtime")
+async def switch_agent_runtime(req: AgentRuntimeSwitchRequest, db: AsyncSession = Depends(get_session)):
+    runtime = normalize_agent_runtime(req.runtime)
+    old_runtime = normalize_agent_runtime(
+        get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+    )
+    set_agent_runtime_override(runtime)
+
+    db.add(AuditLog(
+        event_type="agent_runtime_switch",
+        target_type="agent_runtime",
+        target_id=runtime,
+        detail=json.dumps({
+            "old_runtime": old_runtime,
+            "new_runtime": runtime,
+            "source": "admin_api",
+        }, ensure_ascii=False),
+        operator="admin",
+    ))
+    await db.commit()
+
+    return {"old_runtime": old_runtime, "new_runtime": runtime, "current": runtime}
 
 
 # ---------- Playground ----------
@@ -386,6 +452,7 @@ class AgentRunRequest(BaseModel):
     max_turns: int = 30
     skill: Optional[str] = None
     session_id: Optional[str] = None
+    runtime: Optional[str] = None
 
 
 @router.get("/agent/skills")
@@ -397,13 +464,16 @@ async def list_skills():
 
 @router.post("/agent/run")
 async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_session)):
-    """Run a Claude Agent SDK task with SSE streaming events."""
+    """Run an agent task with SSE streaming events."""
     from core.orchestrator.agent_client import agent_client
+    runtime = normalize_agent_runtime(
+        req.runtime or get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+    )
 
     # Record the run
     run = AgentRun(
         agent_name=req.skill or "agent_sdk",
-        runtime_type="agent_sdk",
+        runtime_type=get_agent_run_runtime_type(runtime),
         input_path="",
         output_path="",
         status=AgentRunStatus.running,
@@ -421,6 +491,7 @@ async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_
                 max_turns=req.max_turns,
                 session_id=req.session_id,
                 skill=req.skill,
+                runtime=runtime,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -442,27 +513,27 @@ async def agent_run_stream(req: AgentRunRequest, db: AsyncSession = Depends(get_
 
 
 @router.get("/agent/sessions")
-async def list_agent_sessions():
-    """List Agent SDK sessions."""
+async def list_agent_sessions(runtime: Optional[str] = Query(None)):
+    """List agent sessions."""
     from core.orchestrator.agent_client import agent_client
-    sessions = await agent_client.list_sessions()
+    sessions = await agent_client.list_sessions(runtime=runtime)
     return {"sessions": sessions}
 
 
 @router.delete("/agent/sessions/{sid}")
-async def delete_agent_session(sid: str):
-    """Delete an Agent SDK session."""
+async def delete_agent_session(sid: str, runtime: str = Query(DEFAULT_AGENT_RUNTIME)):
+    """Delete an agent session."""
     from core.orchestrator.agent_client import agent_client
-    await agent_client.delete_session(sid)
+    await agent_client.delete_session(sid, runtime=runtime)
     return {"success": True}
 
 
 @router.get("/agent/sessions/{sid}/transcript")
-async def get_agent_transcript(sid: str):
-    """Get full transcript for an Agent SDK session (including subagent sidechains)."""
+async def get_agent_transcript(sid: str, runtime: str = Query(DEFAULT_AGENT_RUNTIME)):
+    """Get full transcript for an agent session."""
     from core.orchestrator.agent_client import agent_client
-    messages = await agent_client.get_session_messages(sid)
-    return {"session_id": sid, "messages": messages}
+    messages = await agent_client.get_session_messages(sid, runtime=runtime)
+    return {"session_id": sid, "runtime": normalize_agent_runtime(runtime), "messages": messages}
 
 
 # ---------- Pipeline ----------
@@ -934,6 +1005,8 @@ def _session_to_dict(s: Session) -> dict:
         "title": s.title,
         "topic": s.topic,
         "project": s.project,
+        "agent_session_id": s.agent_session_id,
+        "agent_runtime": s.agent_runtime,
         "priority": s.priority,
         "status": s.status,
         "summary_path": s.summary_path,

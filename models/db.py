@@ -119,6 +119,7 @@ class Session(SQLModel, table=True):
     thread_id: str = Field(default="", max_length=128, index=True)
     # Agent SDK session ID — used to resume multi-turn conversations
     agent_session_id: Optional[str] = Field(default=None, max_length=256)
+    agent_runtime: str = Field(default="claude", max_length=32)
     summary_path: str = Field(default="")
     last_active_at: datetime = Field(default_factory=_now)
     message_count: int = Field(default=0)

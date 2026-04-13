@@ -1,6 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { fetchModels, playgroundChat, type ModelOption, type PlaygroundMessage } from "../api/client"
+import {
+  fetchAgentRuntime,
+  fetchModels,
+  playgroundChat,
+  type ModelOption,
+  type PlaygroundMessage,
+} from "../api/client"
 import { Send, Loader2, Settings, Bot, MessageSquare, Wrench, RotateCcw } from "lucide-react"
 import { cn } from "../lib/utils"
 import axios from "axios"
@@ -35,6 +41,11 @@ export default function Playground() {
     queryKey: ["models"],
     queryFn: () => fetchModels().then((r) => r.data),
     enabled: mode === "chat",
+  })
+  const { data: agentRuntime } = useQuery({
+    queryKey: ["agent-runtime"],
+    queryFn: () => fetchAgentRuntime().then((r) => r.data),
+    enabled: mode === "agent",
   })
   const modelOptions: ModelOption[] = (modelsData?.models ?? []).filter((item) => item.enabled && item.supports_chat)
   const defaultModel = modelsData?.default ?? ""
@@ -236,6 +247,11 @@ export default function Playground() {
               会话: {sessionId.slice(0, 8)}...
             </span>
           )}
+          {mode === "agent" && agentRuntime && (
+            <span className="text-xs text-gray-500 bg-blue-50 text-blue-700 px-2 py-1 rounded">
+              Runtime: {agentRuntime.current}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -280,6 +296,13 @@ export default function Playground() {
           )}
           {mode === "agent" && (
             <>
+              <div>
+                <label className="text-xs font-medium text-gray-500 block mb-1">Agent Runtime</label>
+                <div className="px-3 py-2 border border-gray-200 rounded-lg text-sm bg-gray-50 text-gray-700">
+                  {agentRuntime?.current || "claude"}
+                  <span className="ml-2 text-xs text-gray-400">在页面顶栏切换 Claude / Codex</span>
+                </div>
+              </div>
               <div>
                 <label className="text-xs font-medium text-gray-500 block mb-1">Skill（可选）</label>
                 <select
@@ -330,8 +353,8 @@ export default function Playground() {
             <p className="text-sm">
               {mode === "agent"
                 ? skill
-                  ? `当前 Skill: ${skill}`
-                  : "可在设置中选择 Skill，或直接输入任务指令"
+                  ? `当前 Runtime: ${agentRuntime?.current || "claude"} · Skill: ${skill}`
+                  : `当前 Runtime: ${agentRuntime?.current || "claude"} · 可在设置中选择 Skill，或直接输入任务指令`
                 : "在下方输入消息，测试模型能力"}
             </p>
           </div>

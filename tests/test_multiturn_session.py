@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     task_context_id INTEGER,
     thread_id TEXT DEFAULT '',
     agent_session_id TEXT DEFAULT '',
+    agent_runtime TEXT DEFAULT 'claude',
     summary_path TEXT DEFAULT '',
     last_active_at TEXT,
     message_count INTEGER DEFAULT 0,
@@ -218,7 +219,12 @@ async def _set_session_thread(session_id: int, thread_id: str) -> None:
         await db.commit()
 
 
-async def _simulate_dispatch_writeback(session_id: int, project: str, agent_session_id: str) -> None:
+async def _simulate_dispatch_writeback(
+    session_id: int,
+    project: str,
+    agent_session_id: str,
+    agent_runtime: str = "claude",
+) -> None:
     """Simulate the dispatch_to_project tool writing agent_session_id + project to session.
 
     In production, this happens inside the MCP tool (agent_client.py:dispatch_to_project).
@@ -226,8 +232,8 @@ async def _simulate_dispatch_writeback(session_id: int, project: str, agent_sess
     """
     async with aiosqlite.connect(TEST_DB_PATH) as db:
         await db.execute(
-            "UPDATE sessions SET project = ?, agent_session_id = ?, updated_at = ? WHERE id = ?",
-            (project, agent_session_id, datetime.now().isoformat(), session_id),
+            "UPDATE sessions SET project = ?, agent_session_id = ?, agent_runtime = ?, updated_at = ? WHERE id = ?",
+            (project, agent_session_id, agent_runtime, datetime.now().isoformat(), session_id),
         )
         await db.commit()
 
@@ -325,6 +331,7 @@ async def test_project_first_message_persists_agent_session_id():
     # agent_session_id set by dispatch writeback
     assert session["agent_session_id"] == PROJECT_SESSION_ID, \
         f"agent_session_id: {session['agent_session_id']!r}"
+    assert session["agent_runtime"] == "claude"
 
     # Feishu reply delivered
     assert len(_feishu_replies) == 1, f"Expected 1 reply, got {len(_feishu_replies)}"
@@ -529,6 +536,7 @@ async def test_non_project_no_project_binding():
     # Orchestrator session_id IS saved (for potential resume of orchestrator context)
     assert session["agent_session_id"] == ORCH_SESSION_ID, \
         f"agent_session_id should be orchestrator session: {session['agent_session_id']!r}"
+    assert session["agent_runtime"] == "claude"
 
     # Project agent never called
     mock_proj.assert_not_called()
@@ -536,6 +544,33 @@ async def test_non_project_no_project_binding():
     assert len(_feishu_replies) == 1
 
     print(f"\n[PASS] B1: Non-project message has no project binding")
+
+
+@pytest.mark.asyncio
+async def test_non_project_runtime_persisted_from_default():
+    """Default agent runtime should be persisted onto newly created sessions."""
+    captured_kwargs: list[dict] = []
+
+    async def mock_orch(prompt, **kwargs):
+        captured_kwargs.append(kwargs)
+        return _make_orchestrator_chat_result("你好！")
+
+    from core.pipeline import process_message
+
+    with patch("core.pipeline._get_default_agent_runtime", return_value="codex"), \
+         patch("core.pipeline._run_orchestrator", AsyncMock(side_effect=mock_orch)), \
+         patch("core.pipeline._run_project_agent", AsyncMock()):
+
+        msg_id = await _insert_message("你好", "m_chat_runtime_001")
+        await process_message(msg_id)
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+
+    assert captured_kwargs[0]["runtime"] == "codex"
+    assert session["agent_runtime"] == "codex"
+
+    print("\n[PASS] B1.5: Default runtime persisted to session")
 
 
 # ---------------------------------------------------------------------------

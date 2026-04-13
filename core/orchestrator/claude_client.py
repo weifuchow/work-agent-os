@@ -6,7 +6,7 @@ from typing import Any, Optional
 import anthropic
 from loguru import logger
 
-from core.config import load_models_config, get_model_override, settings
+from core.config import get_default_model_for_runtime, load_models_config, get_model_override, settings
 
 
 class ClaudeClient:
@@ -28,7 +28,7 @@ class ClaudeClient:
     def _resolve_model(self, model: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
         config = self._models_config()
         # Priority: explicit param > runtime override > yaml default
-        selected_id = model or get_model_override() or config.get("default")
+        selected_id = model or get_model_override("claude") or get_default_model_for_runtime(config, "claude")
         if not selected_id:
             raise ValueError("No default model configured in data/models.yaml")
 

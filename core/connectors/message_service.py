@@ -91,9 +91,22 @@ async def save_and_process(session: AsyncSession, event_data: dict) -> Message |
     if content.startswith("/m "):
         model_id = content[3:].strip()
         if model_id:
-            from core.config import set_model_override, get_model_override, load_models_config
-            old_model = get_model_override() or load_models_config().get("default", "unknown")
-            set_model_override(model_id)
+            from core.config import (
+                get_agent_runtime_override,
+                get_default_model_for_runtime,
+                get_model_override,
+                load_models_config,
+                set_model_override,
+                settings,
+            )
+            from core.orchestrator.agent_runtime import DEFAULT_AGENT_RUNTIME, normalize_agent_runtime
+
+            runtime = normalize_agent_runtime(
+                get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
+            )
+            config = load_models_config()
+            old_model = get_model_override(runtime) or get_default_model_for_runtime(config, runtime) or "unknown"
+            set_model_override(model_id, runtime=runtime)
 
             # Save the command message
             msg = await save_message(session, event_data)
@@ -106,6 +119,7 @@ async def save_and_process(session: AsyncSession, event_data: dict) -> Message |
                 detail=json.dumps({
                     "old_model": old_model,
                     "new_model": model_id,
+                    "runtime": runtime,
                     "sender_id": event_data.get("sender_id", ""),
                     "chat_id": event_data.get("chat_id", ""),
                 }, ensure_ascii=False),
@@ -119,7 +133,7 @@ async def save_and_process(session: AsyncSession, event_data: dict) -> Message |
             if chat_id:
                 from core.connectors.feishu import FeishuClient
                 client = FeishuClient()
-                client.send_message(chat_id, f"模型已切换: {old_model} → {model_id}")
+                client.send_message(chat_id, f"模型已切换({runtime}): {old_model} → {model_id}")
 
             logger.info("Model switched: {} → {} (by {})", old_model, model_id,
                         event_data.get("sender_id", ""))
