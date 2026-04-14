@@ -69,7 +69,7 @@ _NPM_CODEX_EXE = (
 
 @tool(
     "query_db",
-    "对本地 SQLite 数据库执行只读 SQL 查询。表: messages, sessions, session_messages, tasks, reports, agent_runs, audit_logs。",
+    "对本地 SQLite 数据库执行只读 SQL 查询。表: messages, sessions, session_messages, tasks, reports, agent_runs, audit_logs, memory_entries。",
     {"type": "object", "properties": {"sql": {"type": "string", "description": "SELECT SQL 语句"}}, "required": ["sql"]},
 )
 async def query_db(input: dict) -> dict[str, Any]:
@@ -294,6 +294,87 @@ async def write_memory(input: dict) -> dict[str, Any]:
 
 
 @tool(
+    "search_memory_entries",
+    "检索结构化长期记忆。可按项目、作用域、类别和关键词查找项目决策、历史问题、解决方案、个人偏好等。",
+    {"type": "object", "properties": {
+        "q": {"type": "string", "description": "关键词，可匹配标题、正文、标签、项目名"},
+        "project_name": {"type": "string", "description": "项目名。传空字符串表示只看非项目记忆"},
+        "project_version": {"type": "string", "description": "项目版本号，如 3.0、v4.8.0.6"},
+        "scope": {"type": "string", "enum": ["project", "personal", "people", "general"]},
+        "category": {"type": "string", "enum": ["decision", "milestone", "issue", "solution", "preference", "person", "fact", "note"]},
+        "limit": {"type": "integer", "description": "返回条数，默认 10，最大 20"},
+    }, "required": []},
+)
+async def search_memory_entries(input: dict) -> dict[str, Any]:
+    from core.database import async_session_factory
+    from core.memory.store import ensure_memory_bootstrap, memory_entry_to_dict, search_memory_entries as _search
+
+    try:
+        async with async_session_factory() as db:
+            await ensure_memory_bootstrap(db)
+            entries = await _search(
+                db,
+                limit=input.get("limit", 10),
+                project_name=input.get("project_name"),
+                scope=input.get("scope"),
+                category=input.get("category"),
+                q=" ".join(part for part in [input.get("q"), input.get("project_version")] if part),
+            )
+            return {"items": [memory_entry_to_dict(entry) for entry in entries], "count": len(entries)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool(
+    "upsert_memory_entry",
+    "创建或更新结构化长期记忆。适合沉淀项目决策、里程碑、问题及解法、个人偏好、人物信息。",
+    {"type": "object", "properties": {
+        "entry_id": {"type": "integer", "description": "存在则更新该记忆，不传则创建"},
+        "scope": {"type": "string", "enum": ["project", "personal", "people", "general"]},
+        "project_name": {"type": "string"},
+        "project_version": {"type": "string", "description": "项目版本号，如 1.0、3.0、v4.8.0.6"},
+        "project_branch": {"type": "string", "description": "Git 分支名"},
+        "project_commit_sha": {"type": "string", "description": "Git commit 短 SHA"},
+        "project_commit_time": {"type": "string", "description": "Git commit 时间，ISO 日期时间"},
+        "category": {"type": "string", "enum": ["decision", "milestone", "issue", "solution", "preference", "person", "fact", "note"]},
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "importance": {"type": "integer", "description": "1-5"},
+        "happened_at": {"type": "string", "description": "ISO 日期或日期时间"},
+        "valid_until": {"type": "string", "description": "ISO 日期或日期时间"},
+        "source_type": {"type": "string"},
+        "source_session_id": {"type": "integer"},
+        "source_message_id": {"type": "integer"},
+        "occurrence_count": {"type": "integer"},
+    }, "required": ["title", "content"]},
+)
+async def upsert_memory_entry(input: dict) -> dict[str, Any]:
+    from core.database import async_session_factory
+    from core.memory.store import (
+        create_memory_entry,
+        get_memory_entry,
+        memory_entry_to_dict,
+        update_memory_entry as _update_memory_entry,
+    )
+
+    try:
+        async with async_session_factory() as db:
+            entry_id = input.get("entry_id")
+            if entry_id:
+                existing = await get_memory_entry(db, int(entry_id))
+                if not existing:
+                    return {"error": f"memory entry {entry_id} not found"}
+                updated = await _update_memory_entry(db, existing, input)
+                return {"action": "updated", "entry": memory_entry_to_dict(updated)}
+
+            created = await create_memory_entry(db, input)
+            return {"action": "created", "entry": memory_entry_to_dict(created)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool(
     "update_session",
     "更新工作会话的状态、标题等字段。",
     {"type": "object", "properties": {"session_id": {"type": "integer"}, "updates": {"type": "object"}}, "required": ["session_id", "updates"]},
@@ -464,15 +545,26 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 项目目录: {project.path}
 项目说明: {project.description}{skills_line}
 
+## 回复规则
+{PROJECT_AGENT_RESPONSE_RULES}
+
 ## 任务
 {task}"""
 
     if context:
         project_prompt += f"\n\n## 消息背景\n{context}"
 
-    project_prompt += "\n\n请在项目上下文中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
+    project_prompt += (
+        "\n\n请在项目上下文中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
+        "如果需要回顾项目历史决策、里程碑、已知问题或个人偏好，优先用 search_memory_entries 检索结构化记忆；"
+        "当你确认本轮产生了长期有效的项目信息或偏好信息时，可用 upsert_memory_entry 进行沉淀。"
+    )
 
-    project_system = f"你运行在项目 {project.name} 的工作目录中（{project.path}）。使用项目级 skills 完成任务。"
+    project_system = (
+        f"你运行在项目 {project.name} 的工作目录中（{project.path}）。使用项目级 skills 完成任务。"
+        "优先复用结构化长期记忆，不要重复发明已经记录的项目结论。"
+        f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
+    )
 
     try:
         result = await agent_client.run_for_project(
@@ -546,7 +638,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 # All tools registered in MCP (project agents get full set)
 CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, reply_to_message,
                 save_bot_reply,
-                read_memory, write_memory, update_session, link_task_context,
+                read_memory, write_memory, search_memory_entries, upsert_memory_entry,
+                update_session, link_task_context,
                 list_projects_tool, dispatch_to_project]
 
 PROJECT_TOOLS = [
@@ -554,6 +647,8 @@ PROJECT_TOOLS = [
     write_audit_log,
     read_memory,
     write_memory,
+    search_memory_entries,
+    upsert_memory_entry,
     update_session,
     link_task_context,
 ]
@@ -567,10 +662,20 @@ CUSTOM_MCP_SERVER = create_sdk_mcp_server(
 CUSTOM_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in CUSTOM_TOOLS]
 PROJECT_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in PROJECT_TOOLS]
 
+PROJECT_AGENT_RESPONSE_RULES = """
+处理原则：
+1. 默认先尽可能搜索代码、配置、脚本、注释、日志线索和结构化记忆，再给用户结论。
+2. 只有在你已经搜索过仍然缺少“会直接影响结论”的关键上下文时，才允许向用户追问。
+3. 在没有至少完成一次仓库内检索（Read/Grep/Glob/Bash/结构化记忆检索）之前，不允许直接向用户追问。
+4. 如果必须追问，先简短说明你已经检查过什么，再只问最少必要的问题，通常 1 个，而且必须先给出已确认的部分结论。
+5. 如果问题存在多层实现或多个可能口径，优先先给出你已经能确认的部分结论，再说明还缺哪一个关键信息。
+6. 最终输出必须是直接发给用户的自然语言正文，不要输出 JSON，不要输出 action/classified_type/topic/project_name/reply_content 等元字段。
+""".strip()
+
 # Orchestrator: separate MCP server with limited tools only.
 # allowedTools does not restrict MCP tools, so we must register a
 # dedicated server that only exposes the tools the orchestrator needs.
-ORCHESTRATOR_TOOLS = [query_db, read_memory, dispatch_to_project]
+ORCHESTRATOR_TOOLS = [query_db, read_memory, search_memory_entries, dispatch_to_project]
 
 ORCHESTRATOR_MCP_SERVER = create_sdk_mcp_server(
     name="work-agent-tools",
@@ -648,7 +753,12 @@ class AgentClient:
         config = load_models_config()
         from core.config import get_default_model_for_runtime
 
-        return model or get_model_override(runtime) or get_default_model_for_runtime(config, runtime)
+        return (
+            model
+            or get_model_override(runtime)
+            or config.get("default")
+            or get_default_model_for_runtime(config, runtime)
+        )
 
     def _get_env(self) -> dict[str, str]:
         return {

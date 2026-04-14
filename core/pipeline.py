@@ -181,14 +181,23 @@ async def _process_message_locked(message_id: int, msg: dict,
 
     result_text = result.get("text", "")
     new_agent_sid = result.get("session_id")
-    parsed = _parse_result(result_text) if not (agent_sid and project) else {
-        "action": "replied",
-        "classified_type": "work_question",
-        "topic": session["title"] if session else "",
-        "project_name": project,
-        "reply_content": result_text,
-        "reason": "resumed project session",
-    }
+    if agent_sid and project:
+        parsed = _normalize_project_result(result_text, session=session, project=project)
+        if _should_retry_project_response(parsed):
+            logger.info("Pipeline: project reply for message {} looks like premature clarification, retrying once", message_id)
+            retry_prompt = (
+                "不要先向用户澄清。你必须先搜索代码、配置、日志、注释和结构化记忆，"
+                "先给出你已经能确认的结论；只有在检索后仍然缺少会直接影响结论的关键上下文时，"
+                "最后才允许附带一个最小追问。\n\n"
+                f"用户本轮消息：{prompt}"
+            )
+            retry_result = await _run_project_agent(project, retry_prompt, agent_sid, runtime=agent_runtime)
+            result = retry_result
+            result_text = retry_result.get("text", "")
+            new_agent_sid = retry_result.get("session_id") or new_agent_sid
+            parsed = _normalize_project_result(result_text, session=session, project=project)
+    else:
+        parsed = _parse_result(result_text)
 
     # 6. Audit: log agent result
     # Read effective agent_session_id from DB (dispatch_to_project may have
@@ -404,6 +413,7 @@ async def _run_project_agent(
     runtime: str | None = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
+    from core.orchestrator.agent_client import PROJECT_AGENT_RESPONSE_RULES
     from core.projects import get_project, merge_skills
     from skills import SKILL_REGISTRY
 
@@ -413,7 +423,10 @@ async def _run_project_agent(
         return await _run_orchestrator(prompt, runtime=runtime)
 
     merged = merge_skills(SKILL_REGISTRY, project.path)
-    system = f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
+    system = (
+        f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
+        f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
+    )
 
     logger.info("_run_project_agent: project={}, session_id={}, cwd={}, prompt={}",
                 project_name, session_id, str(project.path), prompt[:100])
@@ -562,6 +575,30 @@ async def _deliver_reply(msg: dict, content: str, session_id: int | None) -> tup
                  thread_id or "", "", "", "bot_reply",
                  session_id, "completed", "", now, now),
             )
+            if session_id:
+                cursor = await db.execute(
+                    "SELECT id FROM messages WHERE platform_message_id = ?",
+                    (f"reply_{msg['platform_message_id']}",),
+                )
+                row = await cursor.fetchone()
+                reply_id = row[0] if row else None
+                if reply_id:
+                    cursor = await db.execute(
+                        "SELECT 1 FROM session_messages WHERE session_id = ? AND message_id = ?",
+                        (session_id, reply_id),
+                    )
+                    exists = await cursor.fetchone()
+                    if not exists:
+                        cursor = await db.execute(
+                            "SELECT COALESCE(MAX(sequence_no), 0) FROM session_messages WHERE session_id = ?",
+                            (session_id,),
+                        )
+                        max_seq = (await cursor.fetchone())[0]
+                        await db.execute(
+                            "INSERT INTO session_messages (session_id, message_id, role, sequence_no, created_at) "
+                            "VALUES (?,?,?,?,?)",
+                            (session_id, reply_id, "assistant", max_seq + 1, now),
+                        )
             await db.commit()
     except Exception as e:
         logger.warning("Pipeline: save bot reply failed: {}", e)
@@ -760,6 +797,67 @@ def _parse_result(text: str) -> dict:
         }
 
     return _fallback("failed to parse")
+
+
+def _normalize_project_result(
+    text: str,
+    *,
+    session: dict | None,
+    project: str,
+) -> dict:
+    parsed = _parse_result(text)
+    reply_content = parsed.get("reply_content") or text
+    action = parsed.get("action") or "replied"
+    if action not in {"replied", "drafted", "silent"}:
+        action = "replied"
+
+    return {
+        "action": action,
+        "classified_type": parsed.get("classified_type") or "work_question",
+        "topic": parsed.get("topic") or ((session or {}).get("title") or ""),
+        "project_name": parsed.get("project_name") or project,
+        "reply_content": reply_content,
+        "reason": parsed.get("reason") or "resumed project session",
+    }
+
+
+def _should_retry_project_response(parsed: dict) -> bool:
+    action = parsed.get("action") or "replied"
+    if action == "silent":
+        return False
+
+    reply = (parsed.get("reply_content") or "").strip()
+    if not reply or len(reply) > 800:
+        return False
+
+    indicators = [
+        "我先确认",
+        "先确认一下",
+        "你是想",
+        "你是指",
+        "请先说明",
+        "方便补充",
+        "需要你确认",
+        "能否补充",
+        "请补充",
+        "还是说",
+    ]
+    evidence_markers = [
+        "我检查了",
+        "我搜索了",
+        "根据代码",
+        "根据当前代码",
+        "在代码里",
+        "从代码看",
+        "搜索到",
+        "文件",
+        "`",
+        "#L",
+    ]
+
+    has_indicator = any(marker in reply for marker in indicators) or reply.endswith(("?", "？"))
+    has_evidence = any(marker in reply for marker in evidence_markers)
+    return has_indicator and not has_evidence
 
 
 def _fallback(reason: str) -> dict:

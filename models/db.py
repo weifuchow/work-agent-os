@@ -62,6 +62,24 @@ class AgentRunStatus(str, enum.Enum):
     failed = "failed"
 
 
+class MemoryScope(str, enum.Enum):
+    project = "project"
+    personal = "personal"
+    people = "people"
+    general = "general"
+
+
+class MemoryCategory(str, enum.Enum):
+    decision = "decision"
+    milestone = "milestone"
+    issue = "issue"
+    solution = "solution"
+    preference = "preference"
+    person = "person"
+    fact = "fact"
+    note = "note"
+
+
 # ---------- Models ----------
 
 class TaskContext(SQLModel, table=True):
@@ -203,4 +221,31 @@ class AppSetting(SQLModel, table=True):
 
     key: str = Field(primary_key=True, max_length=128)
     value: str = Field(default="")
+    updated_at: datetime = Field(default_factory=_now)
+
+
+class MemoryEntry(SQLModel, table=True):
+    __tablename__ = "memory_entries"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scope: str = Field(default=MemoryScope.general, max_length=32, index=True)
+    project_name: str = Field(default="", max_length=128, index=True)
+    project_version: str = Field(default="", max_length=128, index=True)
+    project_branch: str = Field(default="", max_length=256)
+    project_commit_sha: str = Field(default="", max_length=64)
+    project_commit_time: Optional[datetime] = None
+    category: str = Field(default=MemoryCategory.note, max_length=32, index=True)
+    title: str = Field(default="", max_length=256)
+    content: str = Field(default="")
+    tags_json: str = Field(default="[]")
+    source_type: str = Field(default="manual", max_length=64)
+    source_session_id: Optional[int] = Field(default=None, foreign_key="sessions.id", index=True)
+    source_message_id: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
+    importance: int = Field(default=3)
+    happened_at: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    occurrence_count: int = Field(default=1)
+    created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)

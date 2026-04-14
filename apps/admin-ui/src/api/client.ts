@@ -82,6 +82,38 @@ export interface MemoryFile {
   modified_at: string
 }
 
+export interface MemoryEntryItem {
+  id: number
+  scope: string
+  project_name: string
+  project_version: string
+  project_branch: string
+  project_commit_sha: string
+  project_commit_time: string | null
+  category: string
+  title: string
+  content: string
+  tags: string[]
+  source_type: string
+  source_session_id: number | null
+  source_message_id: number | null
+  importance: number
+  happened_at: string | null
+  valid_until: string | null
+  first_seen_at: string | null
+  last_seen_at: string | null
+  occurrence_count: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface MemoryOverviewData {
+  total: number
+  by_scope: Record<string, number>
+  by_category: Record<string, number>
+  by_project: { project_name: string; count: number }[]
+}
+
 export interface AuditLogItem {
   id: number
   event_type: string
@@ -98,6 +130,83 @@ export interface StatsData {
   tasks: number
   audit_logs: number
   classification: Record<string, number>
+}
+
+export interface TopicCount {
+  topic: string
+  count: number
+}
+
+export interface SessionBrief {
+  id: number
+  title: string
+  topic: string
+  status: string
+  message_count: number
+  risk_level?: string
+  last_active_at: string | null
+}
+
+export interface ProjectInsightItem {
+  name: string
+  description: string
+  path_exists: boolean
+  git_version: string
+  git_branch: string
+  git_commit_sha: string
+  git_commit_time: string | null
+  session_count: number
+  message_count: number
+  open_sessions: number
+  active_recent_sessions: number
+  memory_count: number
+  classification: Record<string, number>
+  memory_by_category: Record<string, number>
+  memory_highlights: { id: number; title: string; category: string; updated_at: string | null }[]
+  recent_sessions: SessionBrief[]
+  top_topics: TopicCount[]
+  last_activity_at: string | null
+}
+
+export interface PersonalInsightItem {
+  name: string
+  label: string
+  session_count: number
+  message_count: number
+  open_sessions: number
+  active_recent_sessions: number
+  memory_count: number
+  classification: Record<string, number>
+  preferences: { id: number; title: string; category: string; content: string; updated_at: string | null }[]
+  recent_sessions: SessionBrief[]
+  top_topics: TopicCount[]
+  last_activity_at: string | null
+}
+
+export interface ProjectInsightsData {
+  period_days: number
+  generated_at: string
+  overview: {
+    registered_projects: number
+    tracked_projects: number
+    project_sessions: number
+    active_project_sessions: number
+    personal_sessions: number
+    structured_memories: number
+    project_memories: number
+    personal_memories: number
+  }
+  projects: ProjectInsightItem[]
+  personal: PersonalInsightItem
+  hot_topics: { project_name: string; topic: string; count: number }[]
+}
+
+export interface ProjectSummaryData {
+  project_name: string
+  period_days: number
+  summary: string
+  generated_at: string
+  fallback?: boolean
 }
 
 export const fetchMessages = (page = 1, pageSize = 20) =>
@@ -220,5 +329,48 @@ export const updateMemoryFile = (path: string, content: string) =>
 
 export const deleteMemoryFile = (path: string) =>
   api.delete(`/memory/files/${path}`)
+
+// Structured Memory
+export const fetchMemoryEntries = (
+  page = 1,
+  pageSize = 20,
+  params?: {
+    project_name?: string
+    scope?: string
+    category?: string
+    q?: string
+  },
+) =>
+  api.get<PaginatedResponse<MemoryEntryItem>>("/memory/entries", {
+    params: { page, page_size: pageSize, ...params },
+  })
+
+export const fetchMemoryEntry = (id: number) =>
+  api.get<MemoryEntryItem>(`/memory/entries/${id}`)
+
+export const createMemoryEntry = (data: Partial<MemoryEntryItem> & { title: string; content: string }) =>
+  api.post<MemoryEntryItem>("/memory/entries", data)
+
+export const updateMemoryEntry = (id: number, data: Partial<MemoryEntryItem>) =>
+  api.put<MemoryEntryItem>(`/memory/entries/${id}`, data)
+
+export const deleteMemoryEntry = (id: number) =>
+  api.delete(`/memory/entries/${id}`)
+
+export const fetchMemoryOverview = () =>
+  api.get<MemoryOverviewData>("/memory/overview")
+
+export const consolidateMemory = () =>
+  api.post<{ consolidated: number; sessions?: number }>("/memory/consolidate")
+
+// Project Insights
+export const fetchProjectInsights = (days = 30) =>
+  api.get<ProjectInsightsData>("/projects/insights", { params: { days } })
+
+export const generateProjectSummary = (projectName: string, days = 30) =>
+  api.post<ProjectSummaryData>("/projects/insights/summary", {
+    project_name: projectName,
+    days,
+  })
 
 export default api

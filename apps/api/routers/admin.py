@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.analytics.projects import build_project_summary_context, get_project_insights
 from core.config import (
     filter_models_for_runtime,
     load_models_config,
@@ -24,6 +25,15 @@ from core.config import (
     with_model_state,
 )
 from core.database import get_session
+from core.memory.store import (
+    create_memory_entry,
+    delete_memory_entry as delete_structured_memory_entry,
+    ensure_memory_bootstrap,
+    get_memory_entry,
+    list_memory_entries,
+    memory_entry_to_dict,
+    update_memory_entry as update_structured_memory_entry,
+)
 from core.orchestrator.agent_runtime import (
     DEFAULT_AGENT_RUNTIME,
     SUPPORTED_AGENT_RUNTIMES,
@@ -32,7 +42,7 @@ from core.orchestrator.agent_runtime import (
 )
 from core.orchestrator.claude_client import claude_client
 from models.db import (
-    AgentRun, AgentRunStatus, AuditLog, Message, Session, SessionMessage, Task,
+    AgentRun, AgentRunStatus, AuditLog, MemoryEntry, Message, Session, SessionMessage, Task,
     TaskContext, TaskContextStatus,
     PipelineStatus,
 )
@@ -55,6 +65,60 @@ class PlaygroundRequest(BaseModel):
     model: str | None = None
     max_tokens: int = 4096
     stream: bool = False
+
+
+class MemoryEntryBase(BaseModel):
+    scope: str = "general"
+    project_name: str = ""
+    project_version: str = ""
+    project_branch: str = ""
+    project_commit_sha: str = ""
+    project_commit_time: datetime | None = None
+    category: str = "note"
+    title: str = ""
+    content: str = ""
+    tags: list[str] = []
+    source_type: str = "manual"
+    source_session_id: int | None = None
+    source_message_id: int | None = None
+    importance: int = 3
+    happened_at: datetime | None = None
+    valid_until: datetime | None = None
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    occurrence_count: int = 1
+
+
+class MemoryEntryCreate(MemoryEntryBase):
+    title: str
+    content: str
+
+
+class MemoryEntryUpdate(BaseModel):
+    scope: str | None = None
+    project_name: str | None = None
+    project_version: str | None = None
+    project_branch: str | None = None
+    project_commit_sha: str | None = None
+    project_commit_time: datetime | None = None
+    category: str | None = None
+    title: str | None = None
+    content: str | None = None
+    tags: list[str] | None = None
+    source_type: str | None = None
+    source_session_id: int | None = None
+    source_message_id: int | None = None
+    importance: int | None = None
+    happened_at: datetime | None = None
+    valid_until: datetime | None = None
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    occurrence_count: int | None = None
+
+
+class ProjectSummaryRequest(BaseModel):
+    project_name: str = ""
+    days: int = 30
 
 
 # ---------- Messages ----------
@@ -291,6 +355,69 @@ async def get_stats(db: AsyncSession = Depends(get_session)):
         "audit_logs": audit_count,
         "classification": {(row[0] or "unclassified"): row[1] for row in classified},
     }
+
+
+@router.get("/projects/insights")
+async def get_project_insights_endpoint(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_session),
+):
+    await ensure_memory_bootstrap(db)
+    return await get_project_insights(db, days=days)
+
+
+@router.post("/projects/insights/summary")
+async def generate_project_summary(
+    body: ProjectSummaryRequest,
+    db: AsyncSession = Depends(get_session),
+):
+    await ensure_memory_bootstrap(db)
+    context = await build_project_summary_context(db, body.project_name, days=body.days)
+    detail = context["detail"]
+
+    system_prompt = """你是项目运营分析助手。你的任务是根据项目相关会话、统计分布与热点主题，
+输出一段简洁但有决策价值的中文总结。
+
+要求：
+- 重点指出高频问题、重复出现的主题、近期活跃点
+- 如果是非项目闲聊/个人偏好，也要总结用户稳定偏好和交流倾向
+- 明确指出哪些问题值得继续沉淀为记忆或形成标准答复
+- 用 3-6 个项目符号，直接给结论，不要寒暄"""
+
+    prompt = json.dumps({
+        "project_name": body.project_name,
+        "period_days": body.days,
+        "detail": detail,
+        "sessions": context["sessions"],
+        "hot_topics": context["hot_topics"][:8],
+    }, ensure_ascii=False, indent=2)
+
+    try:
+        text = await claude_client.chat(
+            messages=[{"role": "user", "content": prompt}],
+            system=system_prompt,
+            max_tokens=1024,
+        )
+        return {
+            "project_name": body.project_name,
+            "period_days": body.days,
+            "summary": text.strip(),
+            "generated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.warning("Project summary generation failed for {}: {}", body.project_name, e)
+        fallback_topics = detail.get("top_topics", [])[:3]
+        fallback_text = "\n".join(
+            f"- 高频主题：{item['topic']}（{item['count']} 次）"
+            for item in fallback_topics
+        ) or "- 当前没有足够的数据生成问题总结。"
+        return {
+            "project_name": body.project_name,
+            "period_days": body.days,
+            "summary": fallback_text,
+            "generated_at": datetime.now().isoformat(),
+            "fallback": True,
+        }
 
 
 @router.get("/models")
@@ -905,6 +1032,102 @@ async def refresh_projects_endpoint():
 
 # ---------- Memory Files ----------
 
+@router.get("/memory/entries")
+async def list_memory_entries_endpoint(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    project_name: Optional[str] = None,
+    scope: Optional[str] = None,
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    await ensure_memory_bootstrap(db)
+    items, total = await list_memory_entries(
+        db,
+        page=page,
+        page_size=page_size,
+        project_name=project_name,
+        scope=scope,
+        category=category,
+        q=q,
+    )
+    return {
+        "items": [memory_entry_to_dict(item) for item in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/memory/entries/{entry_id}")
+async def get_memory_entry_endpoint(entry_id: int, db: AsyncSession = Depends(get_session)):
+    await ensure_memory_bootstrap(db)
+    entry = await get_memory_entry(db, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    return memory_entry_to_dict(entry)
+
+
+@router.post("/memory/entries")
+async def create_memory_entry_endpoint(
+    body: MemoryEntryCreate,
+    db: AsyncSession = Depends(get_session),
+):
+    entry = await create_memory_entry(db, body.model_dump())
+    return memory_entry_to_dict(entry)
+
+
+@router.put("/memory/entries/{entry_id}")
+async def update_memory_entry_endpoint(
+    entry_id: int,
+    body: MemoryEntryUpdate,
+    db: AsyncSession = Depends(get_session),
+):
+    entry = await get_memory_entry(db, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    updated = await update_structured_memory_entry(
+        db,
+        entry,
+        body.model_dump(exclude_unset=True),
+    )
+    return memory_entry_to_dict(updated)
+
+
+@router.delete("/memory/entries/{entry_id}")
+async def delete_memory_entry_endpoint(entry_id: int, db: AsyncSession = Depends(get_session)):
+    entry = await get_memory_entry(db, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    await delete_structured_memory_entry(db, entry)
+    return {"deleted": entry_id}
+
+
+@router.get("/memory/overview")
+async def get_memory_overview(db: AsyncSession = Depends(get_session)):
+    await ensure_memory_bootstrap(db)
+    total = (await db.execute(select(func.count(MemoryEntry.id)))).scalar() or 0
+    by_scope = (await db.execute(
+        select(MemoryEntry.scope, func.count(MemoryEntry.id)).group_by(MemoryEntry.scope)
+    )).all()
+    by_category = (await db.execute(
+        select(MemoryEntry.category, func.count(MemoryEntry.id)).group_by(MemoryEntry.category)
+    )).all()
+    by_project = (await db.execute(
+        select(MemoryEntry.project_name, func.count(MemoryEntry.id))
+        .where(MemoryEntry.project_name != "")
+        .group_by(MemoryEntry.project_name)
+        .order_by(desc(func.count(MemoryEntry.id)))
+        .limit(10)
+    )).all()
+    return {
+        "total": total,
+        "by_scope": {row[0] or "general": row[1] for row in by_scope},
+        "by_category": {row[0] or "note": row[1] for row in by_category},
+        "by_project": [{"project_name": row[0], "count": row[1]} for row in by_project],
+    }
+
 class MemoryFileUpdate(BaseModel):
     content: str
 
@@ -941,7 +1164,7 @@ async def list_memory_files():
             "category": category,
             "name": p.stem,
             "size": stat.st_size,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
         })
     return {"files": files}
 

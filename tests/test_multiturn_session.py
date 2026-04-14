@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     cost_usd REAL DEFAULT 0,
     input_path TEXT DEFAULT '',
     output_path TEXT DEFAULT '',
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
     error_message TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS task_contexts (
@@ -167,7 +169,8 @@ async def setup_test_db(tmp_path):
     orig_db = pipeline_mod.DB_PATH
     pipeline_mod.DB_PATH = TEST_DB_PATH
 
-    with patch("core.connectors.feishu.FeishuClient", side_effect=_make_mock_feishu):
+    with patch("core.connectors.feishu.FeishuClient", side_effect=_make_mock_feishu), \
+         patch("core.pipeline.get_agent_runtime_override", return_value=None):
         yield
 
     pipeline_mod.DB_PATH = orig_db
@@ -206,6 +209,18 @@ async def _get_message(msg_id: int) -> dict:
         cursor = await db.execute("SELECT * FROM messages WHERE id = ?", (msg_id,))
         row = await cursor.fetchone()
         assert row is not None, f"Message {msg_id} not found"
+        return dict(row)
+
+
+async def _get_message_by_platform_id(platform_message_id: str) -> dict:
+    async with aiosqlite.connect(TEST_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM messages WHERE platform_message_id = ?",
+            (platform_message_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f"Message {platform_message_id} not found"
         return dict(row)
 
 
@@ -730,6 +745,105 @@ async def test_agent_session_id_not_overwritten_on_project_resume():
     )
 
     print(f"\n[PASS] C: agent_session_id stability — not overwritten on resume")
+
+
+@pytest.mark.asyncio
+async def test_project_resume_json_response_only_sends_reply_content():
+    """Project resume may return orchestrator-style JSON; user should only receive reply_content."""
+    THREAD_ID = "thread_project_json_reply"
+
+    async with aiosqlite.connect(TEST_DB_PATH) as db:
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+            "title, project, status, thread_id, agent_session_id, last_active_at, "
+            "message_count, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("key_project_json_001", "feishu", CHAT_ID, SENDER_ID,
+             "allspark 冲突检测", "allspark", "open",
+             THREAD_ID, PROJECT_SESSION_ID, now, 2, now, now),
+        )
+        await db.commit()
+
+    project_json = json.dumps({
+        "action": "drafted",
+        "classified_type": "work_question",
+        "topic": "预约表冲突检测策略代码级说明",
+        "project_name": "allspark",
+        "reply_content": "这是给用户的正文，不应该把 JSON 包装发出去。",
+        "reason": "高风险代码分析，已给出草稿答复",
+    }, ensure_ascii=False)
+
+    from core.pipeline import process_message
+
+    with patch("core.pipeline._run_project_agent", AsyncMock(return_value={
+        "text": project_json,
+        "session_id": PROJECT_SESSION_ID,
+        "cost_usd": 0.02,
+        "num_turns": 2,
+    })), patch("core.pipeline._run_orchestrator", AsyncMock()):
+
+        msg_id = await _insert_message("继续看冲突检测", "m_proj_json_001", thread_id=THREAD_ID)
+        await process_message(msg_id)
+
+    assert len(_feishu_replies) == 1
+    assert _feishu_replies[0]["content"] == "这是给用户的正文，不应该把 JSON 包装发出去。"
+
+    bot_msg = await _get_message_by_platform_id("reply_m_proj_json_001")
+    assert bot_msg["content"] == "这是给用户的正文，不应该把 JSON 包装发出去。"
+
+    msg = await _get_message(msg_id)
+    assert msg["classified_type"] == "work_question"
+    assert msg["pipeline_status"] == "completed"
+
+    print("\n[PASS] C2: Project resume JSON is unwrapped to reply_content only")
+
+
+@pytest.mark.asyncio
+async def test_project_resume_clarifying_reply_retries_once():
+    """Premature clarification in project resume should trigger one internal retry before replying."""
+    THREAD_ID = "thread_project_retry"
+
+    async with aiosqlite.connect(TEST_DB_PATH) as db:
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+            "title, project, status, thread_id, agent_session_id, last_active_at, "
+            "message_count, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("key_project_retry_001", "feishu", CHAT_ID, SENDER_ID,
+             "allspark 代码分析", "allspark", "open",
+             THREAD_ID, PROJECT_SESSION_ID, now, 2, now, now),
+        )
+        await db.commit()
+
+    project_runs = AsyncMock(side_effect=[
+        {
+            "text": "我先确认一下，你是想看预约表那层的冲突配置，还是下层 pipeline？",
+            "session_id": PROJECT_SESSION_ID,
+            "cost_usd": 0.01,
+        },
+        {
+            "text": "我先按预约表这一层给你结论：当前实现入口在 MapReservationTable，最终会下钻到 ConflictDetectionPipeline。",
+            "session_id": PROJECT_SESSION_ID,
+            "cost_usd": 0.02,
+        },
+    ])
+
+    from core.pipeline import process_message
+
+    with patch("core.pipeline._run_project_agent", project_runs), \
+         patch("core.pipeline._run_orchestrator", AsyncMock()):
+
+        msg_id = await _insert_message("继续看冲突检测", "m_proj_retry_001", thread_id=THREAD_ID)
+        await process_message(msg_id)
+
+    assert project_runs.await_count == 2, f"Expected retry once, got {project_runs.await_count} calls"
+    assert len(_feishu_replies) == 1
+    assert "MapReservationTable" in _feishu_replies[0]["content"]
+    assert "我先确认一下" not in _feishu_replies[0]["content"]
+
+    print("\n[PASS] C3: Premature clarification triggers one retry before reply")
 
 
 # ---------------------------------------------------------------------------

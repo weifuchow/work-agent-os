@@ -1,7 +1,10 @@
 """Project registry — loads projects from data/projects.yaml, caches, merges skills."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import re
+import subprocess
 from typing import Any
 
 import yaml
@@ -16,6 +19,16 @@ class ProjectConfig:
     name: str
     path: Path
     description: str
+
+
+@dataclass
+class ProjectGitMeta:
+    branch: str = ""
+    commit_sha: str = ""
+    commit_time: datetime | None = None
+    describe: str = ""
+    is_dirty: bool = False
+    version_hint: str = ""
 
 
 _cache: list[ProjectConfig] | None = None
@@ -79,6 +92,99 @@ def refresh_projects() -> list[ProjectConfig]:
     global _cache
     _cache = None
     return get_projects()
+
+
+def get_project_git_meta(name: str | None = None, path: Path | None = None) -> ProjectGitMeta:
+    project_path = path.resolve() if path else None
+    if name and not project_path:
+        project = get_project(name)
+        project_path = project.path if project else None
+    if not project_path or not project_path.exists():
+        return ProjectGitMeta()
+
+    git_dir = project_path / ".git"
+    if not git_dir.exists():
+        return ProjectGitMeta()
+
+    branch = _git_capture(project_path, "rev-parse", "--abbrev-ref", "HEAD")
+    commit_sha = _git_capture(project_path, "rev-parse", "--short=12", "HEAD")
+    commit_time_raw = _git_capture(project_path, "show", "-s", "--format=%cI", "HEAD")
+    describe = _git_capture(project_path, "describe", "--tags", "--always", "--dirty")
+    dirty = bool(_git_capture(project_path, "status", "--porcelain", "-uno"))
+    version_hint = infer_version_from_git(branch=branch, describe=describe, commit_sha=commit_sha)
+
+    commit_time = None
+    if commit_time_raw:
+        try:
+            commit_time = datetime.fromisoformat(commit_time_raw)
+        except ValueError:
+            commit_time = None
+
+    return ProjectGitMeta(
+        branch=branch,
+        commit_sha=commit_sha,
+        commit_time=commit_time,
+        describe=describe,
+        is_dirty=dirty,
+        version_hint=version_hint,
+    )
+
+
+def infer_version_from_git(
+    *,
+    branch: str = "",
+    describe: str = "",
+    commit_sha: str = "",
+) -> str:
+    for source in [branch, describe]:
+        normalized = _extract_semver_like(source)
+        if normalized:
+            return normalized
+
+    clean_branch = (branch or "").strip()
+    if clean_branch and clean_branch not in {"HEAD", "main", "master", "develop", "dev"}:
+        if commit_sha:
+            return f"{clean_branch}@{commit_sha[:8]}"
+        return clean_branch
+
+    clean_describe = (describe or "").strip()
+    if clean_describe:
+        return clean_describe
+
+    return (commit_sha or "")[:8]
+
+
+def _git_capture(project_path: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _extract_semver_like(text: str) -> str:
+    if not text:
+        return ""
+
+    patterns = [
+        r"\b[vV](\d+(?:\.\d+){1,4})\b",
+        r"(?:release|hotfix|版本|version|sprint)[/_\- ]*([A-Za-z]*\d+(?:\.\d+){1,4})\b",
+        r"\b(?:RIOT|Riot|FMS|Allspark)[/_\- ]*(\d+(?:\.\d+){0,4})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def merge_skills(

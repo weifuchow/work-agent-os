@@ -34,6 +34,36 @@ def _ensure_session_runtime_column() -> None:
         conn.close()
 
 
+def _ensure_memory_entry_columns() -> None:
+    if not _db_path.exists():
+        return
+
+    conn = sqlite3.connect(str(_db_path))
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "memory_entries" not in tables:
+            return
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_entries)").fetchall()}
+        migrations = {
+            "project_version": "ALTER TABLE memory_entries ADD COLUMN project_version TEXT DEFAULT ''",
+            "project_branch": "ALTER TABLE memory_entries ADD COLUMN project_branch TEXT DEFAULT ''",
+            "project_commit_sha": "ALTER TABLE memory_entries ADD COLUMN project_commit_sha TEXT DEFAULT ''",
+            "project_commit_time": "ALTER TABLE memory_entries ADD COLUMN project_commit_time TEXT DEFAULT NULL",
+        }
+        applied = False
+        for column, ddl in migrations.items():
+            if column not in columns:
+                conn.execute(ddl)
+                applied = True
+        if applied:
+            conn.commit()
+    finally:
+        conn.close()
+
+
 async def init_db() -> None:
     """Create all tables and ensure data directories exist."""
     for d in [settings.db_dir, settings.memory_dir, settings.reports_dir,
@@ -44,6 +74,7 @@ async def init_db() -> None:
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _ensure_session_runtime_column()
+    _ensure_memory_entry_columns()
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
