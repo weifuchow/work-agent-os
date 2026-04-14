@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { fetchSession } from "../api/client"
 import { formatDate } from "../lib/utils"
 import { ArrowLeft } from "lucide-react"
+import { FeishuMessagePreview } from "../components/FeishuMessagePreview"
 
 export default function SessionDetail() {
   const { id } = useParams<{ id: string }>()
@@ -93,7 +94,7 @@ export default function SessionDetail() {
                   </span>
                   <span className="text-xs text-gray-400">{formatDate(msg.created_at)}</span>
                 </div>
-                <div className="text-sm text-gray-800 whitespace-pre-wrap">{msg.content}</div>
+                <FeishuMessagePreview message={msg} />
               </div>
             ))
           ) : (

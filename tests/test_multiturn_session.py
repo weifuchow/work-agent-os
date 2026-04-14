@@ -137,11 +137,12 @@ def _make_mock_feishu():
     """FeishuClient mock that records replies and returns a deterministic thread_id."""
     client = MagicMock()
 
-    def mock_reply(message_id, content, reply_in_thread=True):
+    def mock_reply(message_id, content, reply_in_thread=True, msg_type="text"):
         _feishu_replies.append({
             "message_id": message_id,
             "content": content,
             "reply_in_thread": reply_in_thread,
+            "msg_type": msg_type,
         })
         return {
             "message_id": f"bot_{message_id}",
@@ -787,7 +788,10 @@ async def test_project_resume_json_response_only_sends_reply_content():
         await process_message(msg_id)
 
     assert len(_feishu_replies) == 1
-    assert _feishu_replies[0]["content"] == "这是给用户的正文，不应该把 JSON 包装发出去。"
+    assert _feishu_replies[0]["msg_type"] == "interactive"
+    sent_card = json.loads(_feishu_replies[0]["content"])
+    assert sent_card["schema"] == "2.0"
+    assert "这是给用户的正文，不应该把 JSON 包装发出去。" in json.dumps(sent_card, ensure_ascii=False)
 
     bot_msg = await _get_message_by_platform_id("reply_m_proj_json_001")
     assert bot_msg["content"] == "这是给用户的正文，不应该把 JSON 包装发出去。"
@@ -840,10 +844,120 @@ async def test_project_resume_clarifying_reply_retries_once():
 
     assert project_runs.await_count == 2, f"Expected retry once, got {project_runs.await_count} calls"
     assert len(_feishu_replies) == 1
-    assert "MapReservationTable" in _feishu_replies[0]["content"]
-    assert "我先确认一下" not in _feishu_replies[0]["content"]
+    assert _feishu_replies[0]["msg_type"] == "interactive"
+    retry_card = json.loads(_feishu_replies[0]["content"])
+    retry_card_text = json.dumps(retry_card, ensure_ascii=False)
+    assert "MapReservationTable" in retry_card_text
+    assert "我先确认一下" not in retry_card_text
 
     print("\n[PASS] C3: Premature clarification triggers one retry before reply")
+
+
+@pytest.mark.asyncio
+async def test_deliver_flow_payload_sends_interactive_card():
+    """Structured flow payload should be rendered as a Feishu interactive card."""
+    from core.pipeline import _deliver_reply
+
+    payload = {
+        "format": "flow",
+        "title": "发布流程",
+        "summary": "按下面顺序执行。",
+        "steps": [
+            {"title": "准备", "detail": "确认配置与权限"},
+            {"title": "执行", "detail": "运行发布命令"},
+        ],
+        "table": {
+            "columns": [
+                {"key": "step", "label": "步骤", "type": "text"},
+                {"key": "owner", "label": "负责人", "type": "text"},
+            ],
+            "rows": [
+                {"step": "准备", "owner": "后端"},
+                {"step": "执行", "owner": "运维"},
+            ],
+        },
+        "fallback_text": "发布流程：1. 准备；2. 执行。",
+    }
+
+    thread_id, delivered = await _deliver_reply(
+        {
+            "id": 1,
+            "platform": "feishu",
+            "platform_message_id": "om_flow_001",
+            "chat_id": CHAT_ID,
+        },
+        payload,
+        session_id=None,
+    )
+
+    assert delivered is True
+    assert thread_id == "thread_om_flow_001"
+    assert len(_feishu_replies) == 1
+    assert _feishu_replies[0]["msg_type"] == "interactive"
+
+    card = json.loads(_feishu_replies[0]["content"])
+    assert card["schema"] == "2.0"
+    assert card["header"]["title"]["content"] == "发布流程"
+    assert any(elem.get("tag") == "table" for elem in card["body"]["elements"])
+
+    print("\n[PASS] C4: Structured flow payload is sent as interactive card")
+
+
+def test_normalize_project_result_accepts_structured_flow_json():
+    """Project agent may return pure structured JSON for rich Feishu rendering."""
+    from core.pipeline import _normalize_project_result
+
+    raw = json.dumps({
+        "format": "flow",
+        "title": "排查流程",
+        "steps": [{"title": "收集日志", "detail": "查看 worker.log"}],
+        "fallback_text": "先收集日志。",
+    }, ensure_ascii=False)
+
+    result = _normalize_project_result(
+        raw,
+        session={"title": "线程异常排查"},
+        project="work-agent-os",
+    )
+
+    assert result["action"] == "replied"
+    assert result["project_name"] == "work-agent-os"
+    assert result["reply_content"]["format"] == "flow"
+    assert result["reply_content"]["title"] == "排查流程"
+
+    print("\n[PASS] C5: Project structured JSON is preserved as reply payload")
+
+
+@pytest.mark.asyncio
+async def test_work_question_plain_text_is_cardified_for_feishu():
+    """Work-question plain text replies should be wrapped into an interactive card by default."""
+    from core.pipeline import _deliver_reply
+
+    thread_id, delivered = await _deliver_reply(
+        {
+            "id": 1,
+            "platform": "feishu",
+            "platform_message_id": "om_plain_work_001",
+            "chat_id": CHAT_ID,
+        },
+        "结论：当前实现会优先读取配置，然后执行调度流程。\n\n补充说明：失败时会记录审计日志。",
+        session_id=None,
+        classified_type="work_question",
+        topic="实现说明",
+    )
+
+    assert delivered is True
+    assert thread_id == "thread_om_plain_work_001"
+    assert len(_feishu_replies) == 1
+    assert _feishu_replies[0]["msg_type"] == "interactive"
+
+    card = json.loads(_feishu_replies[0]["content"])
+    assert card["header"]["title"]["content"] == "实现说明"
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "概览" in card_text
+    assert "补充说明" in card_text
+
+    print("\n[PASS] C6: Work-question plain text is auto-cardified")
 
 
 # ---------------------------------------------------------------------------

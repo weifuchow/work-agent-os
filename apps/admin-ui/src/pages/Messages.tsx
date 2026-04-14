@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { fetchMessages, reprocessMessage, processPendingMessages } from "../api/client"
 import { formatDate } from "../lib/utils"
 import { ChevronLeft, ChevronRight, RefreshCw, Play } from "lucide-react"
+import { FeishuMessagePreview } from "../components/FeishuMessagePreview"
 
 export default function Messages() {
   const [page, setPage] = useState(1)
@@ -85,8 +86,12 @@ export default function Messages() {
                   <div className="text-gray-900">{msg.sender_name || msg.sender_id}</div>
                   <div className="text-xs text-gray-400">{msg.chat_id.slice(0, 12)}...</div>
                 </td>
-                <td className="px-4 py-3 text-gray-700 max-w-md truncate">
-                  {msg.content || <span className="text-gray-300">[{msg.message_type}]</span>}
+                <td className="px-4 py-3 text-gray-700 max-w-md">
+                  {msg.content ? (
+                    <FeishuMessagePreview message={msg} compact />
+                  ) : (
+                    <span className="text-gray-300">[{msg.message_type}]</span>
+                  )}
                 </td>
                 <td className="px-4 py-3">
                   {msg.classified_type ? (

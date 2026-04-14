@@ -1,4 +1,4 @@
-"""Skill registry — discovers skills from .claude/agents/*.md."""
+"""Skill registry — discovers skills from .claude/agents/*.md or .claude/skills/*/SKILL.md."""
 
 from pathlib import Path
 from typing import Any
@@ -83,11 +83,13 @@ def _load_from_md(md_file: Path) -> tuple[str, AgentDefinition, str] | None:
 
 def discover_skills(
     agents_dir: Path | None = None,
+    skills_dir: Path | None = None,
 ) -> tuple[dict[str, AgentDefinition], dict[str, str]]:
-    """Discover skills from .claude/agents/*.md.
+    """Discover skills from .claude/agents/*.md and optional .claude/skills/*/SKILL.md.
 
     Args:
-        agents_dir: Directory to scan. Defaults to project's .claude/agents/.
+        agents_dir: Directory to scan for flat markdown agent definitions.
+        skills_dir: Directory to scan for skill folders containing SKILL.md.
 
     Returns:
         (SKILL_REGISTRY, SKILL_DESCRIPTIONS)
@@ -96,17 +98,25 @@ def discover_skills(
     registry: dict[str, AgentDefinition] = {}
     descriptions: dict[str, str] = {}
 
-    if not target_dir.exists():
-        return registry, descriptions
+    if target_dir.exists():
+        for md_file in sorted(target_dir.glob("*.md")):
+            if not md_file.is_file():
+                continue
+            result = _load_from_md(md_file)
+            if result:
+                name, defn, desc = result
+                registry[name] = defn
+                descriptions[name] = desc
 
-    for md_file in sorted(target_dir.glob("*.md")):
-        if not md_file.is_file():
-            continue
-        result = _load_from_md(md_file)
-        if result:
-            name, defn, desc = result
-            registry[name] = defn
-            descriptions[name] = desc
+    if skills_dir and skills_dir.exists():
+        for md_file in sorted(skills_dir.glob("*/SKILL.md")):
+            if not md_file.is_file():
+                continue
+            result = _load_from_md(md_file)
+            if result:
+                name, defn, desc = result
+                registry[name] = defn
+                descriptions[name] = desc
 
     return registry, descriptions
 

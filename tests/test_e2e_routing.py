@@ -77,7 +77,13 @@ class FakeFeishuClient:
         self.replies: list[dict] = []
         self._thread_id: str | None = None  # stable for the lifetime of this client
 
-    def reply_message(self, message_id: str, content: str, reply_in_thread: bool = True) -> dict:
+    def reply_message(
+        self,
+        message_id: str,
+        content: str,
+        reply_in_thread: bool = True,
+        msg_type: str = "text",
+    ) -> dict:
         if self._thread_id is None:
             # First bot reply creates the Feishu thread
             self._thread_id = f"e2e_thread_{message_id}"
@@ -86,6 +92,7 @@ class FakeFeishuClient:
             "message_id": message_id,
             "content": content,
             "thread_id": self._thread_id,
+            "msg_type": msg_type,
         })
         return {"message_id": f"bot_{message_id}", "thread_id": self._thread_id}
 

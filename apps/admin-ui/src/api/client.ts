@@ -20,6 +20,7 @@ export interface MessageItem {
   sender_name: string
   message_type: string
   content: string
+  raw_payload?: string | null
   classified_type: string | null
   session_id: number | null
   pipeline_status: string

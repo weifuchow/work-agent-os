@@ -1207,6 +1207,7 @@ def _message_to_dict(m: Message) -> dict:
         "sender_name": m.sender_name,
         "message_type": m.message_type,
         "content": m.content,
+        "raw_payload": m.raw_payload,
         "classified_type": m.classified_type,
         "session_id": m.session_id,
         "pipeline_status": m.pipeline_status,
@@ -1216,6 +1217,31 @@ def _message_to_dict(m: Message) -> dict:
         "received_at": m.received_at.isoformat() if m.received_at else None,
         "created_at": m.created_at.isoformat() if m.created_at else None,
     }
+
+
+@router.get("/feishu-images/{image_key}")
+async def proxy_feishu_image(image_key: str):
+    """Proxy Feishu image bytes for admin UI previews."""
+    from core.connectors.feishu import FeishuClient
+
+    client = FeishuClient()
+    result = client.get_image_bytes(image_key)
+    if not result:
+        raise HTTPException(status_code=404, detail="image not found")
+
+    content, file_name = result
+    media_type = "image/png"
+    if file_name and "." in file_name:
+        ext = file_name.rsplit(".", 1)[-1].lower()
+        media_type = {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "gif": "image/gif",
+            "webp": "image/webp",
+        }.get(ext, media_type)
+
+    return StreamingResponse(iter([content]), media_type=media_type)
 
 
 def _session_to_dict(s: Session) -> dict:

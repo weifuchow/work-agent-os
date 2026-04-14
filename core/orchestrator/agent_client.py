@@ -113,7 +113,12 @@ async def write_audit_log(input: dict) -> dict[str, Any]:
 @tool(
     "send_feishu_message",
     "通过飞书发送消息到 chat_id（仅用于首次主动发消息，不创建话题）。回复用户消息请优先用 reply_to_message。",
-    {"type": "object", "properties": {"receive_id": {"type": "string"}, "content": {"type": "string"}, "receive_id_type": {"type": "string", "enum": ["chat_id", "open_id"]}}, "required": ["receive_id", "content"]},
+    {"type": "object", "properties": {
+        "receive_id": {"type": "string"},
+        "content": {"type": "string", "description": "text 时传正文；post/interactive/image 时传 JSON 字符串"},
+        "msg_type": {"type": "string", "enum": ["text", "post", "interactive", "image"]},
+        "receive_id_type": {"type": "string", "enum": ["chat_id", "open_id"]},
+    }, "required": ["receive_id", "content"]},
 )
 async def send_feishu_message(input: dict) -> dict[str, Any]:
     try:
@@ -123,6 +128,7 @@ async def send_feishu_message(input: dict) -> dict[str, Any]:
             receive_id=input["receive_id"],
             content=input["content"],
             receive_id_type=input.get("receive_id_type", "chat_id"),
+            msg_type=input.get("msg_type", "text"),
         )
         if result is None:
             return {"success": False, "delivery_type": "send", "error": "Failed to send message"}
@@ -136,7 +142,8 @@ async def send_feishu_message(input: dict) -> dict[str, Any]:
     "回复指定的飞书消息。设置 reply_in_thread=true 会创建话题（首次）或在现有话题内回复。返回 message_id 和 thread_id。",
     {"type": "object", "properties": {
         "message_id": {"type": "string", "description": "要回复的飞书消息 ID（platform_message_id）"},
-        "content": {"type": "string", "description": "回复内容"},
+        "content": {"type": "string", "description": "text 时传正文；post/interactive/image 时传 JSON 字符串"},
+        "msg_type": {"type": "string", "enum": ["text", "post", "interactive", "image"]},
         "reply_in_thread": {"type": "boolean", "description": "是否在话题内回复（默认 true）"},
         "db_session_id": {"type": "integer", "description": "DB 会话 ID（可选，用于自动绑定 thread_id 到 session）"},
     }, "required": ["message_id", "content"]},
@@ -149,6 +156,7 @@ async def reply_to_message(input: dict) -> dict[str, Any]:
         result = client.reply_message(
             message_id=input["message_id"],
             content=input["content"],
+            msg_type=input.get("msg_type", "text"),
             reply_in_thread=reply_in_thread,
         )
         if result is None:
@@ -531,10 +539,10 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         logger.warning("Failed to create dispatch AgentRun: {}", e)
 
     # Merge skills: project overrides global
-    merged_agents = merge_skills(SKILL_REGISTRY, project.path)
+    merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=False)
 
     # List project-specific skills for the prompt
-    project_only = [k for k in merged_agents if k not in SKILL_REGISTRY]
+    project_only = list(merged_agents)
     skills_line = ""
     if project_only:
         skills_line = f"\n\n可用的项目 Skills: {', '.join(project_only)}"
@@ -669,7 +677,13 @@ PROJECT_AGENT_RESPONSE_RULES = """
 3. 在没有至少完成一次仓库内检索（Read/Grep/Glob/Bash/结构化记忆检索）之前，不允许直接向用户追问。
 4. 如果必须追问，先简短说明你已经检查过什么，再只问最少必要的问题，通常 1 个，而且必须先给出已确认的部分结论。
 5. 如果问题存在多层实现或多个可能口径，优先先给出你已经能确认的部分结论，再说明还缺哪一个关键信息。
-6. 最终输出必须是直接发给用户的自然语言正文，不要输出 JSON，不要输出 action/classified_type/topic/project_name/reply_content 等元字段。
+6. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
+7. `format=rich` 示例：
+   {"format":"rich","title":"标题","summary":"一句话总结","sections":[{"title":"结论","content":"核心结论"},{"title":"说明","content":"补充说明"}],"table":{"columns":[{"key":"item","label":"检查项","type":"text"}],"rows":[{"item":"配置"}]},"fallback_text":"纯文本兜底"}
+8. `format=flow` 示例：
+   {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[开始]-->B[结束]","fallback_text":"纯文本兜底"}
+9. 闲聊、问候、极短确认可以继续输出自然语言正文。
+10. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
 """.strip()
 
 # Orchestrator: separate MCP server with limited tools only.
@@ -1361,8 +1375,9 @@ class AgentClient:
             cwd=project_cwd or str(PROJECT_ROOT),
             env=self._get_env(),
             model=selected_model,
-            # Register skills as sub-agents (project-specific or global)
-            agents=project_agents or SKILL_REGISTRY,
+            # Register skills as sub-agents. For project runs, an empty dict means
+            # "no project-local skills", and must not fall back to unrelated globals.
+            agents=project_agents if project_agents is not None else SKILL_REGISTRY,
             # Capture sub-agent transcripts
             hooks={
                 "SubagentStop": [HookMatcher(hooks=[_on_subagent_stop])],

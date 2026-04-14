@@ -228,6 +228,52 @@ class FeishuClient:
                      message_id, result["thread_id"], reply_in_thread)
         return result
 
+    def upload_image(self, image_path: str) -> str | None:
+        """Upload a local image file and return image_key."""
+        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+
+        try:
+            with open(image_path, "rb") as fp:
+                request = CreateImageRequest.builder() \
+                    .request_body(
+                        CreateImageRequestBody.builder()
+                        .image_type("message")
+                        .image(fp)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.image.create(request)
+        except Exception as e:
+            logger.error("Failed to upload image {}: {}", image_path, e)
+            return None
+
+        if not response.success():
+            logger.error(
+                "Failed to upload image: code={}, msg={}",
+                response.code, response.msg
+            )
+            return None
+
+        image_key = getattr(response.data, "image_key", "") or ""
+        if image_key:
+            logger.info("Image uploaded: {} -> {}", image_path, image_key)
+        return image_key or None
+
+    def get_image_bytes(self, image_key: str) -> tuple[bytes, str | None] | None:
+        """Download image bytes by image_key."""
+        from lark_oapi.api.im.v1 import GetImageRequest
+
+        request = GetImageRequest.builder().image_key(image_key).build()
+        response = self._client.im.v1.image.get(request)
+
+        if getattr(response, "code", -1) != 0 or not getattr(response, "file", None):
+            logger.error("Failed to get image {}: code={} msg={}",
+                         image_key, getattr(response, "code", ""), getattr(response, "msg", ""))
+            return None
+
+        file_obj = response.file
+        file_obj.seek(0)
+        return file_obj.read(), getattr(response, "file_name", None)
+
 
 def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, dict]:
     """Parse Feishu message content for all supported types.

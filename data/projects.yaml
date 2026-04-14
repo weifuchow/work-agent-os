@@ -4,7 +4,7 @@
 #   path: 项目根目录的绝对路径
 #   description: 项目描述（给 orchestrator 判断路由用）
 #
-# 项目目录下如果有 .claude/agents/*.md，会被加载为该项目的 skills
+# 项目目录下如果有 .claude/agents/*.md 或 .claude/skills/*/SKILL.md，会被加载为该项目的 skills
 
 projects:
   - name: work-agent-os

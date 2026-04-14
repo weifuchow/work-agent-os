@@ -190,27 +190,29 @@ def _extract_semver_like(text: str) -> str:
 def merge_skills(
     global_skills: dict[str, AgentDefinition],
     project_path: Path,
+    include_global: bool = True,
 ) -> dict[str, AgentDefinition]:
     """Merge project-local skills over global skills (project wins on name collision).
 
-    Scans {project_path}/.claude/agents/*.md for project skills.
+    Scans {project_path}/.claude/agents/*.md and {project_path}/.claude/skills/*/SKILL.md.
     Returns a new dict; does not mutate global_skills.
     """
     from skills import discover_skills
 
     agents_dir = project_path / ".claude" / "agents"
+    skills_dir = project_path / ".claude" / "skills"
 
-    project_skills, _ = discover_skills(agents_dir=agents_dir)
+    project_skills, _ = discover_skills(agents_dir=agents_dir, skills_dir=skills_dir)
 
     if not project_skills:
-        return dict(global_skills)
+        return dict(global_skills) if include_global else {}
 
-    merged = dict(global_skills)
+    merged = dict(global_skills) if include_global else {}
     for name, defn in project_skills.items():
         if name in merged:
             logger.info("Project skill '{}' overrides global skill", name)
         merged[name] = defn
 
-    logger.info("Merged skills: {} global + {} project = {} total",
-                len(global_skills), len(project_skills), len(merged))
+    logger.info("Merged skills: {} global + {} project = {} total (include_global={})",
+                len(global_skills), len(project_skills), len(merged), include_global)
     return merged

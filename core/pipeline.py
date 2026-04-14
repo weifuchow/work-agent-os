@@ -9,10 +9,17 @@ All DB access uses raw SQL (aiosqlite) to avoid ORM cache issues.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
+import shutil
+import subprocess
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+from urllib import request as urlrequest
 
 import aiosqlite
 from loguru import logger
@@ -66,11 +73,60 @@ SYSTEM_PROMPT_TEMPLATE = """你是用户的私人工作助理，通过飞书接�
   "classified_type": "chat | work_question | urgent_issue | task_request | noise",
   "topic": "主题",
   "project_name": "项目名或null",
-  "reply_content": "回复内容（必填）",
+  "reply_content": "回复内容（必填，可为字符串或结构化对象）",
   "reason": "处理理由"
 }}
 ```
-- reply_content 必填，系统用它发送飞书消息
+- `reply_content` 必填，系统用它发送飞书消息
+- 默认情况下，`reply_content` 直接写字符串，系统会按普通文本发送
+- 如果是工作类问题，优先输出结构化对象而不是纯字符串。普通分析/说明建议用 `format=rich`，建议格式：
+```json
+{{
+  "format": "rich",
+  "title": "标题",
+  "summary": "一句话总结",
+  "sections": [
+    {{"title": "结论", "content": "核心结论"}},
+    {{"title": "说明", "content": "补充说明"}}
+  ],
+  "table": {{
+    "columns": [
+      {{"key": "item", "label": "检查项", "type": "text"}},
+      {{"key": "status", "label": "状态", "type": "text"}}
+    ],
+    "rows": [
+      {{"item": "配置", "status": "OK"}}
+    ]
+  }},
+  "fallback_text": "纯文本兜底内容"
+}}
+```
+- 如果用户询问流程、步骤、排查路径、发布链路、审批流、时序关系，优先输出结构化对象，建议格式：
+```json
+{{
+  "format": "flow",
+  "title": "流程标题",
+  "summary": "一句话说明",
+  "steps": [
+    {{"title": "步骤1", "detail": "说明"}},
+    {{"title": "步骤2", "detail": "说明"}}
+  ],
+  "table": {{
+    "columns": [
+      {{"key": "step", "label": "步骤", "type": "text"}},
+      {{"key": "owner", "label": "负责人", "type": "text"}},
+      {{"key": "output", "label": "产出", "type": "markdown"}}
+    ],
+    "rows": [
+      {{"step": "准备", "owner": "后端", "output": "检查配置"}}
+    ]
+  }},
+  "mermaid": "flowchart TD\\nA[开始] --> B[结束]",
+  "fallback_text": "纯文本兜底内容"
+}}
+```
+- `format=rich` / `format=flow` 时，系统会优先渲染为飞书卡片；有 `table` 时会渲染表格；有 `mermaid` 时会尝试转成图片嵌入卡片
+- 飞书不保证原生渲染 Mermaid，所以不要把 Mermaid 代码直接发给用户；有 `mermaid` 时请同时给出 `steps` 和 `fallback_text`
 """
 
 
@@ -83,6 +139,542 @@ def _build_system_prompt() -> str:
         lines.append(f"- **{p.name}**: {desc}")
     section = "\n".join(lines) if lines else "（暂无注册项目）"
     return SYSTEM_PROMPT_TEMPLATE.format(projects_section=section)
+
+
+def _safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _looks_like_structured_reply(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+
+    if value.get("format") in {"flow", "rich"}:
+        return True
+
+    if value.get("msg_type") in {"text", "post", "interactive", "image"}:
+        return True
+
+    semantic_keys = {"title", "summary", "steps", "sections", "table", "mermaid", "fallback_text"}
+    return any(key in value for key in semantic_keys)
+
+
+def _extract_structured_reply_payload(text: str) -> dict[str, Any] | None:
+    text = text.strip()
+    if not text:
+        return None
+
+    def _pick(value: Any) -> dict[str, Any] | None:
+        if _looks_like_structured_reply(value):
+            return value
+        if isinstance(value, dict):
+            reply_content = value.get("reply_content")
+            if _looks_like_structured_reply(reply_content):
+                return reply_content
+        return None
+
+    candidates = [text]
+    if "```" in text:
+        for block in text.split("```"):
+            block = block.strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            if block:
+                candidates.append(block)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        picked = _pick(parsed)
+        if picked:
+            return picked
+
+    return None
+
+
+def _reply_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+
+    if isinstance(content, dict):
+        fallback = content.get("fallback_text")
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+
+        raw_content = content.get("content")
+        if content.get("msg_type") == "text":
+            if isinstance(raw_content, dict):
+                return str(raw_content.get("text", "") or "")
+            return str(raw_content or "")
+
+        parts: list[str] = []
+        title = str(content.get("title", "") or "").strip()
+        summary = str(content.get("summary", "") or "").strip()
+        if title:
+            parts.append(title)
+        if summary:
+            parts.append(summary)
+
+        steps = content.get("steps") or []
+        if isinstance(steps, list):
+            rendered_steps: list[str] = []
+            for idx, step in enumerate(steps, start=1):
+                if isinstance(step, dict):
+                    step_title = str(step.get("title", "") or f"步骤{idx}").strip()
+                    detail = str(step.get("detail", "") or "").strip()
+                    rendered = f"{idx}. {step_title}"
+                    if detail:
+                        rendered += f" - {detail}"
+                    rendered_steps.append(rendered)
+                elif step:
+                    rendered_steps.append(f"{idx}. {step}")
+            if rendered_steps:
+                parts.append("\n".join(rendered_steps))
+
+        if parts:
+            return "\n\n".join(parts)
+
+    return str(content)
+
+
+def _should_cardify_text_reply(text: str, classified_type: str | None) -> bool:
+    if classified_type not in {"work_question", "urgent_issue", "task_request"}:
+        return False
+
+    stripped = (text or "").strip()
+    return bool(stripped)
+
+
+def _normalize_flow_table(table: dict[str, Any]) -> dict[str, Any] | None:
+    rows = [row for row in (table.get("rows") or []) if isinstance(row, dict)]
+    raw_columns = table.get("columns") or []
+
+    if not raw_columns and rows:
+        raw_columns = [{"key": key, "label": key, "type": "text"} for key in rows[0].keys()]
+
+    allowed_types = {"text", "lark_md", "options", "number", "persons", "date", "markdown"}
+    columns: list[dict[str, Any]] = []
+    keys: list[str] = []
+
+    for index, column in enumerate(raw_columns):
+        if isinstance(column, str):
+            key = column.strip() or f"col_{index + 1}"
+            display_name = key
+            data_type = "text"
+            width = None
+            horizontal_align = None
+            vertical_align = None
+            date_format = None
+            number_format = None
+        elif isinstance(column, dict):
+            key = str(
+                column.get("key")
+                or column.get("name")
+                or column.get("field")
+                or column.get("label")
+                or f"col_{index + 1}"
+            ).strip()
+            display_name = str(
+                column.get("label")
+                or column.get("display_name")
+                or column.get("title")
+                or key
+            ).strip()
+            data_type = str(column.get("type") or column.get("data_type") or "text").strip()
+            width = column.get("width")
+            horizontal_align = column.get("horizontal_align")
+            vertical_align = column.get("vertical_align")
+            date_format = column.get("date_format")
+            number_format = column.get("format")
+        else:
+            continue
+
+        if not key:
+            continue
+        if data_type not in allowed_types:
+            data_type = "text"
+
+        normalized_column = {
+            "name": key,
+            "display_name": display_name or key,
+            "data_type": data_type,
+        }
+        if width:
+            normalized_column["width"] = width
+        if horizontal_align:
+            normalized_column["horizontal_align"] = horizontal_align
+        if vertical_align:
+            normalized_column["vertical_align"] = vertical_align
+        if date_format and data_type == "date":
+            normalized_column["date_format"] = date_format
+        if isinstance(number_format, dict) and data_type == "number":
+            normalized_column["format"] = number_format
+
+        columns.append(normalized_column)
+        keys.append(key)
+
+    if not columns:
+        return None
+
+    normalized_rows = [{key: row.get(key, "") for key in keys} for row in rows]
+    return {
+        "tag": "table",
+        "page_size": min(max(len(normalized_rows), 1), 10),
+        "row_height": "middle",
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "grey",
+            "text_color": "default",
+            "bold": True,
+            "lines": 1,
+        },
+        "columns": columns,
+        "rows": normalized_rows,
+    }
+
+
+def _markdown_element(content: str, *, text_size: str = "normal", margin: str = "0px 0px 0px 0px") -> dict[str, Any]:
+    return {
+        "tag": "markdown",
+        "content": content,
+        "text_align": "left",
+        "text_size": text_size,
+        "margin": margin,
+    }
+
+
+def _plain_text_div(
+    content: str,
+    *,
+    text_size: str = "normal",
+    text_color: str = "default",
+    margin: str = "0px 0px 0px 0px",
+) -> dict[str, Any]:
+    return {
+        "tag": "div",
+        "text": {
+            "tag": "plain_text",
+            "content": content,
+            "text_size": text_size,
+            "text_align": "left",
+            "text_color": text_color,
+        },
+        "margin": margin,
+    }
+
+
+def _lark_md_div(
+    content: str,
+    *,
+    text_size: str = "normal",
+    margin: str = "0px 0px 0px 0px",
+) -> dict[str, Any]:
+    return {
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": content,
+            "text_size": text_size,
+            "text_align": "left",
+        },
+        "margin": margin,
+    }
+
+
+def _divider(*, margin: str = "8px 0px 8px 0px") -> dict[str, Any]:
+    return {
+        "tag": "hr",
+        "margin": margin,
+    }
+
+
+def _section_title(title: str) -> dict[str, Any]:
+    return _plain_text_div(
+        title,
+        text_size="heading",
+        text_color="blue",
+        margin="4px 0px 4px 0px",
+    )
+
+
+def _step_block(index: int, title: str, detail: str = "") -> dict[str, Any]:
+    block = {
+        "tag": "div",
+        "text": {
+            "tag": "plain_text",
+            "content": f"{index}. {title}",
+            "text_size": "normal",
+            "text_align": "left",
+            "text_color": "default",
+        },
+        "margin": "4px 0px 4px 0px",
+    }
+    detail = detail.strip()
+    if detail:
+        block["fields"] = [{
+            "is_short": False,
+            "text": {
+                "tag": "lark_md",
+                "content": detail,
+            },
+        }]
+    return block
+
+
+def _card_title_from_text(text: str) -> str:
+    lines = [line.strip(" #\t") for line in text.splitlines() if line.strip()]
+    if lines:
+        first = lines[0]
+        return first[:36]
+    return "工作助理回复"
+
+
+def _build_text_card_payload(text: str, *, title: str | None = None) -> tuple[str, str]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        clean_text = "已处理。"
+
+    paragraphs = [p.strip() for p in clean_text.split("\n\n") if p.strip()]
+    summary = paragraphs[0] if paragraphs else clean_text
+    details = "\n\n".join(paragraphs[1:]).strip()
+
+    elements: list[dict[str, Any]] = []
+    elements.append(_section_title("概览"))
+    elements.append(_lark_md_div(summary))
+    if details:
+        elements.append(_divider())
+        elements.append(_section_title("说明"))
+        elements.append(_lark_md_div(details))
+
+    card = {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": (title or _card_title_from_text(clean_text))[:100],
+            },
+            "template": "blue",
+            "padding": "12px 12px 12px 12px",
+        },
+        "body": {
+            "direction": "vertical",
+            "padding": "12px 12px 12px 12px",
+            "elements": elements,
+        },
+    }
+    return _safe_json_dumps(card), clean_text
+
+
+def _render_mermaid_to_png(mermaid_source: str) -> Path | None:
+    mermaid_source = (mermaid_source or "").strip()
+    if not mermaid_source:
+        return None
+
+    work_dir = Path(tempfile.gettempdir()) / "work-agent-os" / "mermaid"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    digest = hashlib.sha1(mermaid_source.encode("utf-8")).hexdigest()[:16]
+    source_path = work_dir / f"{digest}.mmd"
+    image_path = work_dir / f"{digest}.png"
+    source_path.write_text(mermaid_source, encoding="utf-8")
+
+    if image_path.exists() and image_path.stat().st_size > 0:
+        return image_path
+
+    commands: list[list[str]] = []
+    mmdc = shutil.which("mmdc")
+    if mmdc:
+        commands.append([mmdc, "-i", str(source_path), "-o", str(image_path), "-b", "transparent"])
+
+    for cmd in commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as e:
+            logger.warning("Pipeline: mermaid render command failed to start: {}", e)
+            continue
+
+        if proc.returncode == 0 and image_path.exists() and image_path.stat().st_size > 0:
+            return image_path
+
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        logger.warning("Pipeline: mermaid render failed (cmd={}): {}", cmd[0], stderr[:400])
+
+    # Network fallback via mermaid.ink.
+    try:
+        payload = {
+            "code": mermaid_source,
+            "mermaid": {"theme": "default"},
+        }
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        req = urlrequest.Request(
+            f"https://mermaid.ink/img/{encoded}?type=png",
+            headers={"User-Agent": "Mozilla/5.0"},
+            method="GET",
+        )
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            png_data = resp.read()
+        if png_data:
+            image_path.write_bytes(png_data)
+            if image_path.exists() and image_path.stat().st_size > 0:
+                logger.info("Pipeline: mermaid rendered via mermaid.ink fallback")
+                return image_path
+    except Exception as e:
+        logger.warning("Pipeline: mermaid render via mermaid.ink failed: {}", e)
+
+    return None
+
+
+def _build_structured_card_payload(payload: dict[str, Any], client: Any) -> tuple[str, str]:
+    card_format = str(payload.get("format", "") or "rich").strip() or "rich"
+    title = str(payload.get("title", "") or "").strip() or ("流程说明" if card_format == "flow" else "工作助理回复")
+    summary = str(payload.get("summary", "") or "").strip()
+    fallback_text = _reply_content_to_text(payload)
+
+    elements: list[dict[str, Any]] = []
+    if summary:
+        elements.append(_section_title("概览"))
+        elements.append(_lark_md_div(summary))
+
+    sections = payload.get("sections") or []
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            section_title = str(section.get("title", "") or "").strip()
+            section_content = str(section.get("content", "") or "").strip()
+            if not section_content:
+                continue
+            if elements:
+                elements.append(_divider())
+            if section_title:
+                elements.append(_section_title(section_title))
+                elements.append(_lark_md_div(section_content))
+            else:
+                elements.append(_lark_md_div(section_content))
+
+    steps = payload.get("steps") or []
+    if isinstance(steps, list) and steps:
+        if elements:
+            elements.append(_divider())
+        elements.append(_section_title("步骤"))
+        for idx, step in enumerate(steps, start=1):
+            if isinstance(step, dict):
+                step_title = str(step.get("title", "") or f"步骤{idx}").strip()
+                detail = str(step.get("detail", "") or "").strip()
+                elements.append(_step_block(idx, step_title, detail))
+            elif step:
+                elements.append(_step_block(idx, str(step)))
+
+    table = payload.get("table")
+    if isinstance(table, dict):
+        normalized_table = _normalize_flow_table(table)
+        if normalized_table:
+            if elements:
+                elements.append(_divider())
+            elements.append(_section_title("检查表"))
+            elements.append(normalized_table)
+
+    mermaid = str(payload.get("mermaid", "") or "").strip()
+    upload_image = getattr(client, "upload_image", None)
+    if mermaid and callable(upload_image):
+        image_path = _render_mermaid_to_png(mermaid)
+        if image_path:
+            image_key = upload_image(str(image_path))
+            if isinstance(image_key, str) and image_key:
+                if elements:
+                    elements.append(_divider())
+                elements.append(_section_title("流程图"))
+                elements.append(_markdown_element(f"![流程图]({image_key})"))
+
+    if not elements:
+        elements.append(_section_title("概览"))
+        elements.append(_lark_md_div(fallback_text or title))
+
+    card = {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": title[:100],
+            },
+            "template": "blue",
+            "padding": "12px 12px 12px 12px",
+        },
+        "body": {
+            "direction": "vertical",
+            "padding": "12px 12px 12px 12px",
+            "elements": elements,
+        },
+    }
+    return _safe_json_dumps(card), fallback_text
+
+
+def _prepare_feishu_reply(
+    content: Any,
+    client: Any,
+    *,
+    classified_type: str | None = None,
+    topic: str | None = None,
+) -> tuple[str, str, str]:
+    if isinstance(content, dict):
+        reply_format = content.get("format")
+        if reply_format in {"flow", "rich"} or any(key in content for key in ("steps", "sections", "table", "mermaid")):
+            body_content, db_text = _build_structured_card_payload(content, client)
+            return "interactive", body_content, db_text
+
+        msg_type = str(content.get("msg_type") or "").strip()
+        raw_content = content.get("content")
+
+        if msg_type == "text":
+            if isinstance(raw_content, dict):
+                text_content = str(raw_content.get("text", "") or "")
+            else:
+                text_content = str(raw_content or "")
+            db_text = _reply_content_to_text(content) or text_content
+            return "text", text_content, db_text
+
+        if msg_type in {"post", "interactive"}:
+            if isinstance(raw_content, str):
+                body_content = raw_content
+            else:
+                body_content = _safe_json_dumps(raw_content or {})
+            return msg_type, body_content, _reply_content_to_text(content)
+
+        if msg_type == "image":
+            image_key = str(content.get("image_key", "") or "").strip()
+            image_path = str(content.get("image_path", "") or "").strip()
+            upload_image = getattr(client, "upload_image", None)
+            if not image_key and image_path and callable(upload_image):
+                uploaded = upload_image(image_path)
+                if isinstance(uploaded, str):
+                    image_key = uploaded
+            if image_key:
+                return "image", _safe_json_dumps({"image_key": image_key}), _reply_content_to_text(content)
+
+    text_content = _reply_content_to_text(content)
+    if _should_cardify_text_reply(text_content, classified_type):
+        body_content, db_text = _build_text_card_payload(text_content, title=topic)
+        return "interactive", body_content, db_text
+    return "text", text_content, text_content
 
 
 def _get_default_agent_runtime() -> str:
@@ -243,12 +835,18 @@ async def _process_message_locked(message_id: int, msg: dict,
                                   processed_at=datetime.now().isoformat())
             logger.warning("Pipeline: message {} marked failed — no platform_message_id", message_id)
             return
-        thread_id, delivered = await _deliver_reply(msg, reply_content, session_id)
+        thread_id, delivered = await _deliver_reply(
+            msg,
+            reply_content,
+            session_id,
+            classified_type=parsed.get("classified_type"),
+            topic=parsed.get("topic"),
+        )
         await _audit("pipeline_feishu_reply", "message", str(message_id), {
             "delivered": delivered,
             "action": action,
             "thread_id": thread_id,
-            "content_length": len(reply_content),
+            "content_length": len(_reply_content_to_text(reply_content)),
         })
         if not delivered:
             await _update_message(message_id,
@@ -422,7 +1020,7 @@ async def _run_project_agent(
         logger.warning("Project {} not found, falling back to orchestrator", project_name)
         return await _run_orchestrator(prompt, runtime=runtime)
 
-    merged = merge_skills(SKILL_REGISTRY, project.path)
+    merged = merge_skills(SKILL_REGISTRY, project.path, include_global=False)
     system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
@@ -541,21 +1139,44 @@ async def _attach_message_to_session(message_id: int, session_id: int) -> None:
 # Reply delivery (feishu + DB)
 # ---------------------------------------------------------------------------
 
-async def _deliver_reply(msg: dict, content: str, session_id: int | None) -> tuple[str | None, bool]:
+async def _deliver_reply(
+    msg: dict,
+    content: Any,
+    session_id: int | None,
+    *,
+    classified_type: str | None = None,
+    topic: str | None = None,
+) -> tuple[str | None, bool]:
     """Send reply to feishu and save to DB. Returns (thread_id, delivered)."""
     delivered = False
     thread_id = ""
+    msg_type = "text"
+    db_content = _reply_content_to_text(content)
+    raw_payload = ""
     try:
         from core.connectors.feishu import FeishuClient
         client = FeishuClient()
+        msg_type, body_content, db_content = _prepare_feishu_reply(
+            content,
+            client,
+            classified_type=classified_type,
+            topic=topic,
+        )
+        raw_payload = _safe_json_dumps({
+            "msg_type": msg_type,
+            "content": body_content,
+            "db_content": db_content,
+        })
         result = client.reply_message(
             message_id=msg["platform_message_id"],
-            content=content[:4000],
+            content=body_content,
+            msg_type=msg_type,
             reply_in_thread=True,
         )
         thread_id = result.get("thread_id", "") if result else ""
-        delivered = True
-        logger.info("Pipeline: delivered reply for message {}", msg["id"])
+        delivered = result is not None
+        if delivered:
+            logger.info("Pipeline: delivered reply for message {}", msg["id"])
     except Exception as e:
         logger.warning("Pipeline: feishu reply failed for message {}: {}", msg["id"], e)
 
@@ -570,8 +1191,8 @@ async def _deliver_reply(msg: dict, content: str, session_id: int | None) -> tup
                 "session_id, pipeline_status, pipeline_error, processed_at, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (msg.get("platform", "feishu"), f"reply_{msg['platform_message_id']}",
-                 msg["chat_id"], "bot", "WorkAgent", "text", content[:4000],
-                 now, "",
+                 msg["chat_id"], "bot", "WorkAgent", msg_type, db_content[:4000],
+                 now, raw_payload,
                  thread_id or "", "", "", "bot_reply",
                  session_id, "completed", "", now, now),
             )
@@ -805,15 +1426,33 @@ def _normalize_project_result(
     session: dict | None,
     project: str,
 ) -> dict:
+    structured_reply = _extract_structured_reply_payload(text)
+    if structured_reply:
+        return {
+            "action": "replied",
+            "classified_type": "work_question",
+            "topic": (session or {}).get("title") or "",
+            "project_name": project,
+            "reply_content": structured_reply,
+            "reason": "structured project reply",
+        }
+
     parsed = _parse_result(text)
     reply_content = parsed.get("reply_content") or text
     action = parsed.get("action") or "replied"
     if action not in {"replied", "drafted", "silent"}:
         action = "replied"
 
+    classified_type = parsed.get("classified_type")
+    if (
+        classified_type in {None, "chat"}
+        and parsed.get("reason") == "parse_failed_fallback"
+    ):
+        classified_type = "work_question"
+
     return {
         "action": action,
-        "classified_type": parsed.get("classified_type") or "work_question",
+        "classified_type": classified_type or "work_question",
         "topic": parsed.get("topic") or ((session or {}).get("title") or ""),
         "project_name": parsed.get("project_name") or project,
         "reply_content": reply_content,
@@ -826,7 +1465,7 @@ def _should_retry_project_response(parsed: dict) -> bool:
     if action == "silent":
         return False
 
-    reply = (parsed.get("reply_content") or "").strip()
+    reply = _reply_content_to_text(parsed.get("reply_content")).strip()
     if not reply or len(reply) > 800:
         return False
 

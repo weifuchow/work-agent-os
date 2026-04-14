@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { fetchConversations } from "../api/client"
 import { formatDate } from "../lib/utils"
 import { ChevronLeft, ChevronRight } from "lucide-react"
+import { FeishuMessagePreview } from "../components/FeishuMessagePreview"
 
 export default function Conversations() {
   const [page, setPage] = useState(1)
@@ -65,9 +66,7 @@ export default function Conversations() {
                   </span>
                   <span className="text-xs text-gray-400">{formatDate(conv.bot_reply.created_at)}</span>
                 </div>
-                <div className="text-sm text-gray-800 whitespace-pre-wrap">
-                  {conv.bot_reply.content}
-                </div>
+                <FeishuMessagePreview message={conv.bot_reply} />
               </div>
             ) : (
               <div className="p-3 bg-gray-50 text-center text-xs text-gray-400">
