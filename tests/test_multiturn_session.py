@@ -1017,6 +1017,42 @@ async def test_agent_client_runtime_override_takes_priority_over_default():
     print(f"\n[PASS] D2: Runtime model override takes priority over default")
 
 
+@pytest.mark.asyncio
+async def test_agent_client_codex_runtime_uses_runtime_specific_default_model():
+    """
+    Codex runtime must prefer the runtime-specific default model instead of the
+    global config default. Otherwise codex can be invoked with a Claude model ID.
+    """
+    from core.orchestrator.agent_client import AgentClient
+
+    client = AgentClient()
+
+    with patch.object(client, "get_active_runtime", return_value="codex"), \
+         patch("core.orchestrator.agent_client.get_model_override", return_value=None), \
+         patch("core.orchestrator.agent_client.load_models_config", return_value={
+             "default": "claude-opus-4-6",
+             "fallback": "gpt-5.4",
+             "models": [
+                 {
+                     "id": "claude-opus-4-6",
+                     "enabled": True,
+                     "supported_runtimes": ["claude"],
+                 },
+                 {
+                     "id": "gpt-5.4",
+                     "enabled": True,
+                     "supported_runtimes": ["codex"],
+                 },
+             ],
+         }):
+        selected = client._select_model()
+
+    assert selected == "gpt-5.4", \
+        f"Codex runtime must resolve to gpt-5.4, got: {selected!r}"
+
+    print("\n[PASS] D3: Codex runtime uses runtime-specific default model")
+
+
 # ---------------------------------------------------------------------------
 # Test E: Thread routing — messages in same thread go to same session
 # ---------------------------------------------------------------------------
