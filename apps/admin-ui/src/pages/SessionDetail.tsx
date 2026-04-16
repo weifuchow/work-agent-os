@@ -2,7 +2,7 @@ import { useParams, Link } from "react-router-dom"
 import { useQuery } from "@tanstack/react-query"
 import { fetchSession } from "../api/client"
 import { formatDate } from "../lib/utils"
-import { ArrowLeft } from "lucide-react"
+import { ArrowLeft, Search } from "lucide-react"
 import { FeishuMessagePreview } from "../components/FeishuMessagePreview"
 
 export default function SessionDetail() {
@@ -25,9 +25,34 @@ export default function SessionDetail() {
       </Link>
 
       <div className="bg-white rounded-xl border border-gray-200 p-5 mb-6">
-        <h2 className="text-xl font-bold text-gray-900 mb-4">
-          {sess.title || sess.session_key}
-        </h2>
+        <div className="flex flex-col gap-3 mb-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900">
+              {sess.title || sess.session_key}
+            </h2>
+            {sess.analysis_mode && (
+              <div className="mt-2 inline-flex rounded-full bg-violet-100 px-3 py-1 text-xs font-medium text-violet-700">
+                分析会话
+              </div>
+            )}
+          </div>
+          <div className="flex flex-col gap-2 items-start lg:items-end">
+            {sess.analysis_mode && sess.triage_slug && (
+              <Link
+                to={`/triage?run=${encodeURIComponent(sess.triage_slug)}`}
+                className="inline-flex items-center gap-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-700 transition-colors"
+              >
+                <Search size={14} />
+                查看排障观察台
+              </Link>
+            )}
+            {sess.analysis_mode && sess.analysis_workspace && (
+              <div className="max-w-xl rounded-lg bg-violet-50 px-3 py-2 text-xs text-violet-700 break-all">
+                工作目录: {sess.analysis_workspace}
+              </div>
+            )}
+          </div>
+        </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <div>
             <span className="text-gray-500">状态</span>

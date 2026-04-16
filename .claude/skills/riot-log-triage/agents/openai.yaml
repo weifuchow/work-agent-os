@@ -1,0 +1,4 @@
+interface:
+  display_name: "RIOT Log Triage"
+  short_description: "分析 RIOT1/2/3 日志、现场问题与补料回合"
+  default_prompt: "请用这个技能以多轮排障方式分析一条 RIOT 项目的日志/现场问题：先检查日志包和导出规则，再梳理版本、时间、模块、调用链和关键词；大规模搜索下放到子流程；先给阶段性结论、置信度和最小补料问题，等我确认后再出正式报告。"

@@ -83,6 +83,10 @@ class Settings(BaseSettings):
         return self.data_dir / "audit"
 
     @property
+    def attachments_dir(self) -> Path:
+        return self.data_dir / "attachments"
+
+    @property
     def sessions_dir(self) -> Path:
         return self.data_dir / "sessions"
 

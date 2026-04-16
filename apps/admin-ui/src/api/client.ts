@@ -42,6 +42,9 @@ export interface SessionItem {
   project: string
   agent_session_id?: string | null
   agent_runtime?: string
+  analysis_mode?: boolean
+  analysis_workspace?: string
+  triage_slug?: string
   priority: string
   status: string
   summary_path: string
@@ -210,6 +213,60 @@ export interface ProjectSummaryData {
   fallback?: boolean
 }
 
+export interface TriageTopFile {
+  path: string
+  hits: number
+}
+
+export interface TriageEvidenceHit {
+  path: string
+  line_number: number
+  timestamp: string
+  matched_terms: string[]
+  excerpt: string
+}
+
+export interface TriageSearchRun {
+  run_id: string
+  path: string
+  created_at: string | null
+  hits_total: number
+  hits_truncated: boolean
+  matched_terms: string[]
+  unmatched_terms: string[]
+  top_files: TriageTopFile[]
+  summary_path: string
+  summary_preview: string
+  summary_content?: string
+  evidence_hits?: TriageEvidenceHit[]
+  result?: Record<string, unknown>
+}
+
+export interface TriageRunItem {
+  slug: string
+  triage_dir: string
+  state_path: string
+  project: string
+  problem_summary: string
+  phase: string
+  mode: string
+  confidence: string
+  artifact_status: string
+  search_status: string
+  evidence_chain_status: string
+  updated_at: string | null
+  created_at: string | null
+  missing_items: string[]
+  module_hypothesis: string[]
+  target_log_files: string[]
+  latest_search: TriageSearchRun | null
+}
+
+export interface TriageRunDetail extends TriageRunItem {
+  state: Record<string, unknown>
+  search_runs: TriageSearchRun[]
+}
+
 export const fetchMessages = (page = 1, pageSize = 20) =>
   api.get<PaginatedResponse<MessageItem>>("/messages", { params: { page, page_size: pageSize } })
 
@@ -373,5 +430,11 @@ export const generateProjectSummary = (projectName: string, days = 30) =>
     project_name: projectName,
     days,
   })
+
+export const fetchTriageRuns = () =>
+  api.get<{ items: TriageRunItem[]; total: number }>("/triage/runs")
+
+export const fetchTriageRunDetail = (slug: string) =>
+  api.get<TriageRunDetail>(`/triage/runs/${slug}`)
 
 export default api

@@ -7,6 +7,7 @@ from claude_agent_sdk import AgentDefinition
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_AGENTS_DIR = PROJECT_ROOT / ".claude" / "agents"
+DEFAULT_SKILLS_DIR = PROJECT_ROOT / ".claude" / "skills"
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -85,7 +86,7 @@ def discover_skills(
     agents_dir: Path | None = None,
     skills_dir: Path | None = None,
 ) -> tuple[dict[str, AgentDefinition], dict[str, str]]:
-    """Discover skills from .claude/agents/*.md and optional .claude/skills/*/SKILL.md.
+    """Discover skills from .claude/agents/*.md and .claude/skills/*/SKILL.md.
 
     Args:
         agents_dir: Directory to scan for flat markdown agent definitions.
@@ -95,6 +96,7 @@ def discover_skills(
         (SKILL_REGISTRY, SKILL_DESCRIPTIONS)
     """
     target_dir = agents_dir or DEFAULT_AGENTS_DIR
+    target_skills_dir = DEFAULT_SKILLS_DIR if skills_dir is None else skills_dir
     registry: dict[str, AgentDefinition] = {}
     descriptions: dict[str, str] = {}
 
@@ -108,8 +110,8 @@ def discover_skills(
                 registry[name] = defn
                 descriptions[name] = desc
 
-    if skills_dir and skills_dir.exists():
-        for md_file in sorted(skills_dir.glob("*/SKILL.md")):
+    if target_skills_dir and target_skills_dir.exists():
+        for md_file in sorted(target_skills_dir.glob("*/SKILL.md")):
             if not md_file.is_file():
                 continue
             result = _load_from_md(md_file)
@@ -121,5 +123,5 @@ def discover_skills(
     return registry, descriptions
 
 
-# Auto-discover on import (global skills from .claude/agents/)
+# Auto-discover on import (global skills from .claude/agents/ and .claude/skills/)
 SKILL_REGISTRY, SKILL_DESCRIPTIONS = discover_skills()

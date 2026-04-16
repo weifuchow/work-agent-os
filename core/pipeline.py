@@ -9,9 +9,11 @@ All DB access uses raw SQL (aiosqlite) to avoid ORM cache issues.
 """
 
 import asyncio
+from collections.abc import AsyncIterable
 import base64
 import hashlib
 import json
+import mimetypes
 import shutil
 import subprocess
 import tempfile
@@ -732,9 +734,20 @@ async def _process_message_locked(message_id: int, msg: dict,
     """Core processing under per-session lock (steps 3-11)."""
     # 3. Re-read fresh session state (may have been updated by prior message)
     session = await _read_session(session_id) if session_id else None
+    analysis_dir: Path | None = None
+    if session_id and await _should_prepare_analysis_workspace(msg, session, session_id):
+        analysis_dir = await _materialize_analysis_workspace(message_id, msg, session, session_id)
+        refreshed = await _read_message(message_id)
+        if refreshed:
+            msg = refreshed
 
     # 4. Audit: log before agent call
     prompt = _build_prompt(msg, session)
+    if analysis_dir:
+        prompt += (
+            f"\n\n[分析工作目录] {analysis_dir}"
+            f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
+        )
     await _audit("pipeline_agent_call", "message", str(message_id), {
         "message_id": message_id,
         "session": session,
@@ -747,9 +760,10 @@ async def _process_message_locked(message_id: int, msg: dict,
     agent_runtime = normalize_agent_runtime(
         (session or {}).get("agent_runtime") or _get_default_agent_runtime()
     )
+    agent_input = _build_agent_input(msg, session, agent_runtime, prompt)
 
     if agent_sid and project:
-        result = await _run_project_agent(project, prompt, agent_sid, runtime=agent_runtime)
+        result = await _run_project_agent(project, agent_input, agent_sid, runtime=agent_runtime)
         # Fallback: context overflow → compact session then retry
         if (
             agent_runtime == "claude"
@@ -765,11 +779,11 @@ async def _process_message_locked(message_id: int, msg: dict,
                 if compacted:
                     await _audit("context_compacted", "session", str(session_id),
                                   {"agent_session_id": agent_sid, "trigger": "overflow"})
-                    result = await _run_project_agent(project, prompt, agent_sid)
+                    result = await _run_project_agent(project, agent_input, agent_sid)
                 else:
                     logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
     else:
-        result = await _run_orchestrator(prompt, session_id=agent_sid, runtime=agent_runtime)
+        result = await _run_orchestrator(agent_input, session_id=agent_sid, runtime=agent_runtime)
 
     result_text = result.get("text", "")
     new_agent_sid = result.get("session_id")
@@ -990,7 +1004,7 @@ def _get_input_tokens(result: dict) -> int:
 # ---------------------------------------------------------------------------
 
 async def _run_orchestrator(
-    prompt: str,
+    prompt: str | AsyncIterable[dict[str, Any]],
     session_id: str | None = None,
     runtime: str | None = None,
 ) -> dict:
@@ -1006,7 +1020,7 @@ async def _run_orchestrator(
 
 async def _run_project_agent(
     project_name: str,
-    prompt: str,
+    prompt: str | AsyncIterable[dict[str, Any]],
     session_id: str,
     runtime: str | None = None,
 ) -> dict:
@@ -1020,14 +1034,15 @@ async def _run_project_agent(
         logger.warning("Project {} not found, falling back to orchestrator", project_name)
         return await _run_orchestrator(prompt, runtime=runtime)
 
-    merged = merge_skills(SKILL_REGISTRY, project.path, include_global=False)
+    merged = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
     system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
 
+    prompt_preview = prompt[:100] if isinstance(prompt, str) else "[multimodal prompt]"
     logger.info("_run_project_agent: project={}, session_id={}, cwd={}, prompt={}",
-                project_name, session_id, str(project.path), prompt[:100])
+                project_name, session_id, str(project.path), prompt_preview)
 
     return await agent_client.run_for_project(
         prompt=prompt,
@@ -1063,6 +1078,403 @@ def _build_prompt(msg: dict, session: dict | None) -> str:
     parts.append("")
     parts.append(content)
     return "\n".join(parts)
+
+
+def _parse_media_info(msg: dict) -> dict[str, Any]:
+    raw = msg.get("media_info_json") or ""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_agent_input(
+    msg: dict,
+    session: dict | None,
+    runtime: str,
+    prompt_text: str,
+) -> str | AsyncIterable[dict[str, Any]]:
+    if runtime != "claude":
+        return prompt_text
+
+    media_info = _parse_media_info(msg)
+    media_type = str(media_info.get("type") or "")
+    if media_type == "image":
+        local_path = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
+    elif media_type == "post" and media_info.get("has_image"):
+        local_paths = media_info.get("local_paths") or []
+        local_path = str(local_paths[0] if local_paths else media_info.get("local_path") or "").strip()
+    else:
+        return prompt_text
+
+    if not local_path:
+        return prompt_text
+
+    image_path = Path(local_path)
+    if not image_path.exists():
+        return prompt_text
+
+    mime_type = str(media_info.get("mime_type") or "").strip() or (
+        mimetypes.guess_type(image_path.name)[0] or "image/png"
+    )
+
+    try:
+        image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    except OSError as e:
+        logger.warning("Pipeline: failed to read image attachment {}: {}", image_path, e)
+        return prompt_text
+
+    payload = {
+        "type": "user",
+        "session_id": "",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image", "data": image_b64, "mimeType": mime_type},
+            ],
+        },
+        "parent_tool_use_id": None,
+    }
+
+    class _SinglePromptStream:
+        def __aiter__(self):
+            async def _gen():
+                yield payload
+
+            return _gen()
+
+    return _SinglePromptStream()
+
+
+_ANALYSIS_KEYWORDS = (
+    "分析",
+    "排查",
+    "定位",
+    "根因",
+    "原因",
+    "结论",
+    "帮我看",
+    "帮忙看",
+    "看下问题",
+    "看下日志",
+    "日志分析",
+    "异常堆栈",
+    "5why",
+    "5 why",
+)
+
+
+def _analysis_requested(msg: dict) -> bool:
+    content = str(msg.get("content") or "").strip().lower()
+    media_info = _parse_media_info(msg)
+    if any(keyword in content for keyword in _ANALYSIS_KEYWORDS):
+        return True
+    if media_info.get("type") in {"image", "post"} and (
+        ("图片" in content and "什么" in content)
+        or ("图" in content and "什么" in content)
+        or ("识别" in content)
+        or ("看图" in content)
+    ):
+        return True
+    return False
+
+
+def _slugify_text(value: str, max_length: int = 48) -> str:
+    normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in (value or "").strip())
+    normalized = "-".join(part for part in normalized.split("-") if part)
+    return (normalized or "analysis")[:max_length].rstrip("-_")
+
+
+def _triage_base_dir() -> Path:
+    return settings.project_root / ".triage"
+
+
+def _triage_dir_for_session(session_id: int, session: dict | None, msg: dict) -> Path:
+    existing = str((session or {}).get("analysis_workspace") or "").strip()
+    if existing:
+        return Path(existing)
+    seed = (session or {}).get("title") or (session or {}).get("topic") or str(msg.get("content") or "")
+    slug = _slugify_text(seed)
+    return _triage_base_dir() / f"session-{session_id}-{slug}"
+
+
+def _has_media(msg: dict) -> bool:
+    media_info = _parse_media_info(msg)
+    return bool(media_info.get("type"))
+
+
+async def _session_has_triage_workspace(session_id: int) -> bool:
+    base = _triage_base_dir()
+    if not base.exists():
+        return False
+    prefix = f"session-{session_id}-"
+    return any(child.is_dir() and child.name.startswith(prefix) for child in base.iterdir())
+
+
+async def _should_prepare_analysis_workspace(msg: dict, session: dict | None, session_id: int | None) -> bool:
+    if not session_id:
+        return False
+    if session and bool(session.get("analysis_mode")):
+        return True
+    if await _session_has_triage_workspace(session_id):
+        return True
+    return _analysis_requested(msg)
+
+
+async def _bind_session_analysis_workspace(session_id: int, triage_dir: Path) -> None:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sessions SET analysis_mode = 1, analysis_workspace = ?, updated_at = ? WHERE id = ?",
+                (str(triage_dir.resolve()), datetime.now().isoformat(), session_id),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("Pipeline: failed to bind analysis workspace for session {}: {}", session_id, e)
+
+
+def _triage_state_payload(session_id: int, session: dict | None, msg: dict, triage_dir: Path) -> dict[str, Any]:
+    now = datetime.now().isoformat()
+    return {
+        "project": (session or {}).get("project", ""),
+        "mode": "structured",
+        "phase": "initialized",
+        "problem_summary": ((session or {}).get("title") or msg.get("content") or "")[:200],
+        "version_info": {"value": "", "status": "missing"},
+        "artifact_completeness": {"status": "unknown", "notes": []},
+        "time_alignment": {"problem_time": "", "log_time_format": "", "timezone": "", "status": "unknown"},
+        "module_hypothesis": [],
+        "target_log_files": [],
+        "call_chain_status": "pending",
+        "keyword_package_status": "pending",
+        "search_status": "pending",
+        "evidence_chain_status": "weak",
+        "confidence": "low",
+        "missing_items": [],
+        "user_confirmation": {"formal_report": False},
+        "search_artifacts": {"last_result_json": "", "last_result_md": ""},
+        "session_id": session_id,
+        "work_dir": str(triage_dir.resolve()),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _sanitize_filename(name: str, fallback: str) -> str:
+    candidate = (name or "").strip().replace("\\", "_").replace("/", "_")
+    candidate = "".join(ch for ch in candidate if ch not in '<>:"|?*').strip(" .")
+    return candidate or fallback
+
+
+def _guess_attachment_suffix(file_name: str, media_type: str) -> str:
+    suffix = Path(file_name).suffix
+    if suffix:
+        return suffix
+    if media_type == "image":
+        return ".png"
+    if media_type == "audio":
+        return ".audio"
+    if media_type == "video":
+        return ".video"
+    return ".bin"
+
+
+async def _download_message_media_to_workspace(msg: dict, triage_dir: Path) -> dict[str, Any]:
+    media_info = _parse_media_info(msg)
+    media_type = str(media_info.get("type") or "").strip()
+    if media_type not in {"image", "file", "audio", "video", "post"}:
+        return media_info
+
+    if media_type == "post":
+        image_keys = [str(item).strip() for item in (media_info.get("image_keys") or []) if str(item).strip()]
+        if not image_keys:
+            return media_info
+
+        attachments_root = triage_dir / "01-intake" / "attachments"
+        target_dir = attachments_root / str(msg["platform_message_id"])
+        target_dir.mkdir(parents=True, exist_ok=True)
+        original_dir = target_dir / "original"
+        original_dir.mkdir(parents=True, exist_ok=True)
+
+        from core.connectors.feishu import FeishuClient
+
+        client = FeishuClient()
+        local_paths: list[str] = []
+        for index, image_key in enumerate(image_keys, start=1):
+            payload = client.get_image_bytes(
+                image_key,
+                message_id=str(msg.get("platform_message_id") or ""),
+                resource_type="image",
+            )
+            if not payload:
+                continue
+            data, downloaded_name = payload
+            base_name = _sanitize_filename(downloaded_name or f"post-image-{index}", fallback=f"post-image-{index}.png")
+            suffix = _guess_attachment_suffix(base_name, "image")
+            if not Path(base_name).suffix:
+                base_name = f"{base_name}{suffix}"
+            target_file = original_dir / base_name
+            target_file.write_bytes(data)
+            local_paths.append(str(target_file.resolve()))
+
+        if local_paths:
+            media_info.update({
+                "download_status": "downloaded",
+                "local_paths": local_paths,
+                "local_path": local_paths[0],
+                "mime_type": "image/png",
+                "proxy_url": f"/api/messages/{msg['id']}/attachment",
+            })
+        else:
+            media_info["download_status"] = "failed"
+
+        manifest_path = target_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({
+                "message_id": msg["id"],
+                "platform_message_id": msg["platform_message_id"],
+                "message_type": msg["message_type"],
+                "media_info": media_info,
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return media_info
+
+    attachments_root = triage_dir / "01-intake" / "attachments"
+    target_dir = attachments_root / str(msg["platform_message_id"])
+    target_dir.mkdir(parents=True, exist_ok=True)
+    original_dir = target_dir / "original"
+    original_dir.mkdir(parents=True, exist_ok=True)
+
+    local_path_value = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
+    local_path = Path(local_path_value) if local_path_value else None
+    if local_path and local_path.exists():
+        data = local_path.read_bytes()
+        downloaded_name = local_path.name
+    else:
+        remote_key = (
+            media_info.get("image_key")
+            or media_info.get("file_key")
+            or media_info.get("video_key")
+            or ""
+        )
+        if not remote_key:
+            return media_info
+
+        from core.connectors.feishu import FeishuClient
+
+        client = FeishuClient()
+        payload: tuple[bytes, str | None] | None = None
+        if media_type == "image":
+            payload = client.get_image_bytes(str(remote_key))
+        else:
+            payload = client.get_file_bytes(
+                str(remote_key),
+                message_id=str(msg.get("platform_message_id") or ""),
+                resource_type=media_type,
+            )
+
+        if not payload:
+            media_info["download_status"] = "failed"
+            return media_info
+
+        data, downloaded_name = payload
+
+    base_name = _sanitize_filename(
+        downloaded_name or str(media_info.get("file_name") or ""),
+        fallback=f"{media_type}_{msg['platform_message_id']}",
+    )
+    suffix = _guess_attachment_suffix(base_name, media_type)
+    if not Path(base_name).suffix:
+        base_name = f"{base_name}{suffix}"
+
+    target_file = original_dir / base_name
+    target_file.write_bytes(data)
+    mime_type = mimetypes.guess_type(target_file.name)[0] or (
+        "image/png" if media_type == "image" else "application/octet-stream"
+    )
+
+    media_info.update({
+        "download_status": "downloaded",
+        "local_path": str(target_file.resolve()),
+        "size_bytes": len(data),
+        "mime_type": mime_type,
+        "proxy_url": f"/api/messages/{msg['id']}/attachment",
+    })
+
+    manifest_path = target_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({
+            "message_id": msg["id"],
+            "platform_message_id": msg["platform_message_id"],
+            "message_type": msg["message_type"],
+            "media_info": media_info,
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return media_info
+
+
+async def _persist_message_media_state(message_id: int, media_info: dict[str, Any]) -> None:
+    await _update_message(
+        message_id,
+        media_info_json=json.dumps(media_info, ensure_ascii=False),
+        attachment_path=str(media_info.get("local_path") or ""),
+    )
+
+
+async def _materialize_analysis_workspace(message_id: int, msg: dict, session: dict | None, session_id: int) -> Path:
+    triage_dir = _triage_dir_for_session(session_id, session, msg)
+    intake_dir = triage_dir / "01-intake"
+    attachments_dir = intake_dir / "attachments"
+    messages_dir = intake_dir / "messages"
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    messages_dir.mkdir(parents=True, exist_ok=True)
+    (triage_dir / "search-runs").mkdir(parents=True, exist_ok=True)
+
+    state_path = triage_dir / "00-state.json"
+    if not state_path.exists():
+        state_path.write_text(
+            json.dumps(_triage_state_payload(session_id, session, msg, triage_dir), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    await _bind_session_analysis_workspace(session_id, triage_dir)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            (session_id,),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+
+    for row in rows:
+        media_info = _parse_media_info(row)
+        if media_info.get("type") in {"image", "file", "audio", "video"}:
+            media_info = await _download_message_media_to_workspace(row, triage_dir)
+            await _persist_message_media_state(row["id"], media_info)
+            row["media_info_json"] = json.dumps(media_info, ensure_ascii=False)
+            row["attachment_path"] = str(media_info.get("local_path") or "")
+
+        snapshot_path = messages_dir / f"{row['id']}.json"
+        snapshot = {
+            "id": row["id"],
+            "platform_message_id": row.get("platform_message_id", ""),
+            "message_type": row.get("message_type", ""),
+            "content": row.get("content", ""),
+            "thread_id": row.get("thread_id", ""),
+            "created_at": row.get("created_at", ""),
+            "media_info": _parse_media_info(row),
+            "attachment_path": row.get("attachment_path", ""),
+            "raw_payload": row.get("raw_payload", ""),
+        }
+        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    return triage_dir
 
 
 def _extract_media(msg: dict) -> str:

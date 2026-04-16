@@ -7,6 +7,7 @@ import {
   FlaskConical,
   ScrollText,
   Brain,
+  Search,
 } from "lucide-react"
 import { cn } from "../lib/utils"
 import AgentRuntimeSwitcher from "./AgentRuntimeSwitcher"
@@ -18,6 +19,7 @@ const navItems = [
   { to: "/messages", icon: MessageSquare, label: "消息记录" },
   { to: "/sessions", icon: Layers, label: "任务与会话" },
   { to: "/memory", icon: Brain, label: "记忆管理" },
+  { to: "/triage", icon: Search, label: "日志排障" },
   { to: "/playground", icon: FlaskConical, label: "模型测试" },
   { to: "/audit-logs", icon: ScrollText, label: "审计日志" },
 ]

@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
@@ -1030,6 +1030,35 @@ async def refresh_projects_endpoint():
     return {"refreshed": len(projects), "projects": [p.name for p in projects]}
 
 
+# ---------- Triage ----------
+
+@router.get("/triage/runs")
+async def list_triage_runs():
+    base = _triage_base_dir()
+    if not base.exists():
+        return {"items": [], "total": 0}
+
+    runs: list[dict[str, Any]] = []
+    for state_path in base.rglob("00-state.json"):
+        run_dir = state_path.parent
+        try:
+            runs.append(_triage_run_to_dict(run_dir, include_detail=False))
+        except Exception as e:
+            logger.warning("Failed to load triage run {}: {}", run_dir, e)
+
+    runs.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return {"items": runs, "total": len(runs)}
+
+
+@router.get("/triage/runs/{run_slug:path}")
+async def get_triage_run_detail(run_slug: str):
+    run_dir = _validate_triage_run_path(run_slug)
+    state_path = run_dir / "00-state.json"
+    if not state_path.exists():
+        raise HTTPException(status_code=404, detail="triage run not found")
+    return _triage_run_to_dict(run_dir, include_detail=True)
+
+
 # ---------- Memory Files ----------
 
 @router.get("/memory/entries")
@@ -1146,6 +1175,137 @@ def _validate_memory_path(file_path: str) -> Path:
     return target
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _triage_base_dir() -> Path:
+    return _repo_root() / ".triage"
+
+
+def _validate_triage_run_path(run_slug: str) -> Path:
+    base = _triage_base_dir().resolve()
+    target = (base / run_slug).resolve()
+    if not str(target).startswith(str(base)):
+        raise HTTPException(status_code=400, detail="invalid triage path")
+    return target
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_text_file(path: Path, *, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+
+
+def _message_media_info(message: Message) -> dict[str, Any]:
+    raw = getattr(message, "media_info_json", "") or ""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _triage_slug_from_workspace(workspace: str) -> str:
+    value = (workspace or "").strip()
+    if not value:
+        return ""
+    try:
+        base = _triage_base_dir().resolve()
+        target = Path(value).resolve()
+        if str(target).startswith(str(base)):
+            return str(target.relative_to(base)).replace("\\", "/")
+    except Exception:
+        return ""
+    return ""
+
+
+def _search_run_to_dict(search_dir: Path, *, include_content: bool) -> dict[str, Any]:
+    result_path = search_dir / "search_results.json"
+    summary_path = search_dir / "evidence_summary.md"
+    result = _read_json_file(result_path) or {}
+    created_at = datetime.fromtimestamp(search_dir.stat().st_mtime).isoformat()
+
+    payload = {
+        "run_id": search_dir.name,
+        "path": str(search_dir),
+        "created_at": created_at,
+        "hits_total": result.get("hits_total", 0),
+        "hits_truncated": result.get("hits_truncated", False),
+        "matched_terms": result.get("matched_terms", []),
+        "unmatched_terms": result.get("unmatched_terms", []),
+        "top_files": result.get("top_files", [])[:5],
+        "summary_path": str(summary_path) if summary_path.exists() else "",
+        "summary_preview": _read_text_file(summary_path, max_chars=1200),
+        "evidence_hits": result.get("evidence_hits", [])[:8],
+    }
+    if include_content:
+        payload["summary_content"] = _read_text_file(summary_path, max_chars=12000)
+        payload["result"] = result
+    return payload
+
+
+def _collect_search_runs(run_dir: Path, *, include_content: bool) -> list[dict[str, Any]]:
+    search_root = run_dir / "search-runs"
+    if not search_root.exists():
+        return []
+
+    items = []
+    for child in search_root.iterdir():
+        if child.is_dir():
+            try:
+                items.append(_search_run_to_dict(child, include_content=include_content))
+            except Exception as e:
+                logger.warning("Failed to load triage search run {}: {}", child, e)
+    items.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return items
+
+
+def _triage_run_to_dict(run_dir: Path, *, include_detail: bool) -> dict[str, Any]:
+    state_path = run_dir / "00-state.json"
+    state = _read_json_file(state_path)
+    if not state:
+        raise FileNotFoundError(state_path)
+
+    base = _triage_base_dir().resolve()
+    slug = str(run_dir.resolve().relative_to(base)).replace("\\", "/")
+    search_runs = _collect_search_runs(run_dir, include_content=include_detail)
+    latest_search = search_runs[0] if search_runs else None
+
+    payload: dict[str, Any] = {
+        "slug": slug,
+        "triage_dir": str(run_dir.resolve()),
+        "state_path": str(state_path.resolve()),
+        "project": state.get("project", ""),
+        "problem_summary": state.get("problem_summary", ""),
+        "phase": state.get("phase", ""),
+        "mode": state.get("mode", ""),
+        "confidence": state.get("confidence", ""),
+        "artifact_status": (state.get("artifact_completeness") or {}).get("status", ""),
+        "search_status": state.get("search_status", ""),
+        "evidence_chain_status": state.get("evidence_chain_status", ""),
+        "updated_at": state.get("updated_at") or state.get("created_at"),
+        "created_at": state.get("created_at"),
+        "missing_items": state.get("missing_items", []),
+        "module_hypothesis": state.get("module_hypothesis", []),
+        "target_log_files": state.get("target_log_files", []),
+        "latest_search": latest_search,
+    }
+
+    if include_detail:
+        payload["state"] = state
+        payload["search_runs"] = search_runs
+    return payload
+
+
 @router.get("/memory/files")
 async def list_memory_files():
     """List all memory files under data/memory/."""
@@ -1197,7 +1357,28 @@ async def delete_memory_file(file_path: str):
     target.unlink()
     return {"deleted": file_path}
 
+
+@router.get("/messages/{message_id}/attachment")
+async def proxy_message_attachment(message_id: int, db: AsyncSession = Depends(get_session)):
+    msg = await db.get(Message, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="message not found")
+
+    media_info = _message_media_info(msg)
+    local_path_value = str(media_info.get("local_path") or getattr(msg, "attachment_path", "") or "").strip()
+    if not local_path_value:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    local_path = Path(local_path_value).resolve()
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="attachment not found")
+
+    media_type = str(media_info.get("mime_type") or "").strip() or "application/octet-stream"
+    file_name = local_path.name
+    headers = {"Content-Disposition": f'inline; filename="{file_name}"'}
+    return StreamingResponse(iter([local_path.read_bytes()]), media_type=media_type, headers=headers)
+
 def _message_to_dict(m: Message) -> dict:
+    media_info = _message_media_info(m)
     return {
         "id": m.id,
         "platform": m.platform,
@@ -1208,6 +1389,8 @@ def _message_to_dict(m: Message) -> dict:
         "message_type": m.message_type,
         "content": m.content,
         "raw_payload": m.raw_payload,
+        "media_info": media_info,
+        "attachment_path": getattr(m, "attachment_path", ""),
         "classified_type": m.classified_type,
         "session_id": m.session_id,
         "pipeline_status": m.pipeline_status,
@@ -1245,6 +1428,7 @@ async def proxy_feishu_image(image_key: str):
 
 
 def _session_to_dict(s: Session) -> dict:
+    analysis_workspace = getattr(s, "analysis_workspace", "") or ""
     return {
         "id": s.id,
         "session_key": s.session_key,
@@ -1256,6 +1440,9 @@ def _session_to_dict(s: Session) -> dict:
         "project": s.project,
         "agent_session_id": s.agent_session_id,
         "agent_runtime": s.agent_runtime,
+        "analysis_mode": getattr(s, "analysis_mode", False),
+        "analysis_workspace": analysis_workspace,
+        "triage_slug": _triage_slug_from_workspace(analysis_workspace),
         "priority": s.priority,
         "status": s.status,
         "summary_path": s.summary_path,

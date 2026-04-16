@@ -34,6 +34,28 @@ def _ensure_session_runtime_column() -> None:
         conn.close()
 
 
+def _ensure_session_analysis_columns() -> None:
+    if not _db_path.exists():
+        return
+
+    conn = sqlite3.connect(str(_db_path))
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        migrations = {
+            "analysis_mode": "ALTER TABLE sessions ADD COLUMN analysis_mode INTEGER DEFAULT 0",
+            "analysis_workspace": "ALTER TABLE sessions ADD COLUMN analysis_workspace TEXT DEFAULT ''",
+        }
+        applied = False
+        for column, ddl in migrations.items():
+            if column not in columns:
+                conn.execute(ddl)
+                applied = True
+        if applied:
+            conn.commit()
+    finally:
+        conn.close()
+
+
 def _ensure_memory_entry_columns() -> None:
     if not _db_path.exists():
         return
@@ -64,17 +86,47 @@ def _ensure_memory_entry_columns() -> None:
         conn.close()
 
 
+def _ensure_message_media_columns() -> None:
+    if not _db_path.exists():
+        return
+
+    conn = sqlite3.connect(str(_db_path))
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "messages" not in tables:
+            return
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        migrations = {
+            "media_info_json": "ALTER TABLE messages ADD COLUMN media_info_json TEXT DEFAULT ''",
+            "attachment_path": "ALTER TABLE messages ADD COLUMN attachment_path TEXT DEFAULT ''",
+        }
+        applied = False
+        for column, ddl in migrations.items():
+            if column not in columns:
+                conn.execute(ddl)
+                applied = True
+        if applied:
+            conn.commit()
+    finally:
+        conn.close()
+
+
 async def init_db() -> None:
     """Create all tables and ensure data directories exist."""
     for d in [settings.db_dir, settings.memory_dir, settings.reports_dir,
-              settings.audit_dir, settings.sessions_dir]:
+              settings.audit_dir, settings.sessions_dir, settings.attachments_dir]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _ensure_session_runtime_column()
+    _ensure_session_analysis_columns()
     _ensure_memory_entry_columns()
+    _ensure_message_media_columns()
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

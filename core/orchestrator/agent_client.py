@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 from typing import Any, Optional
 
@@ -538,8 +538,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     except Exception as e:
         logger.warning("Failed to create dispatch AgentRun: {}", e)
 
-    # Merge skills: project overrides global
-    merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=False)
+    # Merge skills: project overrides global while inheriting shared workflow skills
+    merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
 
     # List project-specific skills for the prompt
     project_only = list(merged_agents)
@@ -767,11 +767,12 @@ class AgentClient:
         config = load_models_config()
         from core.config import get_default_model_for_runtime
 
+        runtime_default = get_default_model_for_runtime(config, runtime)
         return (
             model
             or get_model_override(runtime)
+            or runtime_default
             or config.get("default")
-            or get_default_model_for_runtime(config, runtime)
         )
 
     def _get_env(self) -> dict[str, str]:
@@ -885,6 +886,57 @@ class AgentClient:
             "is_error": data.get("is_error", False),
             "usage": data.get("usage", {}),
             "model": model,
+        }
+
+    async def _run_sdk_query(
+        self,
+        *,
+        prompt: str | AsyncIterable[dict[str, Any]],
+        options: ClaudeAgentOptions,
+        log_scope: str,
+    ) -> dict[str, Any]:
+        stderr_lines: list[str] = []
+        options.stderr = lambda line: stderr_lines.append(line)
+
+        result_text = ""
+        result_session_id = options.resume
+        result_meta: dict[str, Any] = {}
+
+        try:
+            async for msg in query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage) and msg.content:
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            result_text = block.text
+                elif isinstance(msg, ResultMessage):
+                    result_session_id = msg.session_id
+                    result_meta = {
+                        "duration_ms": msg.duration_ms,
+                        "num_turns": msg.num_turns,
+                        "cost_usd": msg.total_cost_usd,
+                        "is_error": msg.is_error,
+                        "usage": msg.usage or {},
+                    }
+        except Exception as e:
+            stderr_text = "\n".join(stderr_lines[-20:])
+            if result_meta.get("is_error") and result_text:
+                logger.warning(
+                    "Agent CLI error ({}): {} (returning result: {})\nStderr:\n{}",
+                    log_scope,
+                    e,
+                    result_text[:100],
+                    stderr_text,
+                )
+            else:
+                logger.error("Agent CLI failed ({}): {}\nStderr:\n{}", log_scope, e, stderr_text)
+                detail = f"{e}\nStderr: {stderr_text}" if stderr_text else str(e)
+                raise RuntimeError(detail) from e
+
+        return {
+            "text": result_text,
+            "session_id": result_session_id,
+            "model": options.model,
+            **result_meta,
         }
 
     def _render_skill_block(
@@ -1392,7 +1444,7 @@ class AgentClient:
 
     async def run(
         self,
-        prompt: str,
+        prompt: str | AsyncIterable[dict[str, Any]],
         system_prompt: str = "",
         max_turns: int = 30,
         session_id: Optional[str] = None,
@@ -1407,7 +1459,7 @@ class AgentClient:
         if resolved_runtime == "codex":
             try:
                 return await self._run_codex(
-                    prompt=prompt,
+                    prompt=prompt if isinstance(prompt, str) else "[multimodal prompt omitted for codex runtime]",
                     system_prompt=system_prompt,
                     max_turns=max_turns,
                     session_id=session_id,
@@ -1421,10 +1473,10 @@ class AgentClient:
 
         # If a specific skill is requested, prepend instruction to use it
         try:
-            if skill:
+            if skill and isinstance(prompt, str):
                 prompt = f"请使用 {skill} agent 来处理以下内容：\n\n{prompt}"
 
-            if session_id:
+            if session_id and isinstance(prompt, str):
                 selected_model = self._select_model(model)
                 return await self._run_cli_resume(
                     prompt=prompt,
@@ -1434,7 +1486,6 @@ class AgentClient:
                     system_prompt=system_prompt or None,
                 )
 
-            stderr_lines: list[str] = []
             options = self._build_options(
                 system_prompt=system_prompt,
                 max_turns=max_turns,
@@ -1443,43 +1494,11 @@ class AgentClient:
                 model=model,
                 orchestrator_mode=True,
             )
-            options.stderr = lambda line: stderr_lines.append(line)
-
-            result_text = ""
-            result_session_id = session_id
-            result_meta = {}
-
-            try:
-                async for msg in query(prompt=prompt, options=options):
-                    if isinstance(msg, AssistantMessage) and msg.content:
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                result_text = block.text
-                    elif isinstance(msg, ResultMessage):
-                        result_session_id = msg.session_id
-                        result_meta = {
-                            "duration_ms": msg.duration_ms,
-                            "num_turns": msg.num_turns,
-                            "cost_usd": msg.total_cost_usd,
-                            "is_error": msg.is_error,
-                            "usage": msg.usage or {},
-                        }
-            except Exception as e:
-                stderr_text = "\n".join(stderr_lines[-20:])
-                if result_meta.get("is_error") and result_text:
-                    logger.warning("Agent CLI error (orchestrator): {} (returning result: {})\nStderr:\n{}",
-                                   e, result_text[:100], stderr_text)
-                else:
-                    logger.error("Agent CLI failed (orchestrator): {}\nStderr:\n{}", e, stderr_text)
-                    detail = f"{e}\nStderr: {stderr_text}" if stderr_text else str(e)
-                    raise RuntimeError(detail) from e
-
-            return {
-                "text": result_text,
-                "session_id": result_session_id,
-                "model": options.model,
-                **result_meta,
-            }
+            return await self._run_sdk_query(
+                prompt=prompt,
+                options=options,
+                log_scope="orchestrator",
+            )
         finally:
             _ACTIVE_AGENT_RUNTIME.reset(token)
 
@@ -1550,7 +1569,7 @@ class AgentClient:
 
     async def run_for_project(
         self,
-        prompt: str,
+        prompt: str | AsyncIterable[dict[str, Any]],
         system_prompt: str,
         project_cwd: str,
         project_agents: dict,
@@ -1572,7 +1591,7 @@ class AgentClient:
         try:
             if resolved_runtime == "codex":
                 return await self._run_codex(
-                    prompt=prompt,
+                    prompt=prompt if isinstance(prompt, str) else "[multimodal prompt omitted for codex runtime]",
                     system_prompt=system_prompt,
                     max_turns=max_turns,
                     session_id=session_id,
@@ -1582,7 +1601,7 @@ class AgentClient:
                     scope="project",
                 )
 
-            if session_id:
+            if session_id and isinstance(prompt, str):
                 selected_model = self._select_model(model)
                 return await self._run_cli_resume(
                     prompt=prompt,
@@ -1593,7 +1612,6 @@ class AgentClient:
                     system_prompt=system_prompt,
                 )
 
-            stderr_lines: list[str] = []
             options = self._build_options(
                 system_prompt=system_prompt,
                 max_turns=max_turns,
@@ -1603,43 +1621,11 @@ class AgentClient:
                 exclude_tools=[name for name in CUSTOM_TOOL_NAMES if name not in PROJECT_TOOL_NAMES],
                 model=model,
             )
-            options.stderr = lambda line: stderr_lines.append(line)
-
-            result_text = ""
-            result_session_id = None
-            result_meta = {}
-
-            try:
-                async for msg in query(prompt=prompt, options=options):
-                    if isinstance(msg, AssistantMessage) and msg.content:
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                result_text = block.text
-                    elif isinstance(msg, ResultMessage):
-                        result_session_id = msg.session_id
-                        result_meta = {
-                            "duration_ms": msg.duration_ms,
-                            "num_turns": msg.num_turns,
-                            "cost_usd": msg.total_cost_usd,
-                            "is_error": msg.is_error,
-                            "usage": msg.usage or {},
-                        }
-            except Exception as e:
-                stderr_text = "\n".join(stderr_lines[-20:])
-                if result_meta.get("is_error") and result_text:
-                    logger.warning("Agent CLI error (project={}): {} (returning result: {})\nStderr:\n{}",
-                                   project_cwd, e, result_text[:100], stderr_text)
-                else:
-                    logger.error("Agent CLI failed (project={}): {}\nStderr:\n{}", project_cwd, e, stderr_text)
-                    detail = f"{e}\nStderr: {stderr_text}" if stderr_text else str(e)
-                    raise RuntimeError(detail) from e
-
-            return {
-                "text": result_text,
-                "session_id": result_session_id,
-                "model": options.model,
-                **result_meta,
-            }
+            return await self._run_sdk_query(
+                prompt=prompt,
+                options=options,
+                log_scope=f"project={project_cwd}",
+            )
         finally:
             _ACTIVE_AGENT_RUNTIME.reset(token)
 

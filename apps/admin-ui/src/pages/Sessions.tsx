@@ -28,12 +28,22 @@ function SessionCard({ sess }: { sess: SessionItem }) {
             <span className={`px-1.5 py-0.5 rounded-full text-xs ${statusColors[sess.status] || "bg-gray-100"}`}>
               {sess.status}
             </span>
+            {sess.analysis_mode && (
+              <span className="px-1.5 py-0.5 rounded-full text-xs bg-violet-100 text-violet-700">
+                分析会话
+              </span>
+            )}
           </div>
           <div className="text-xs text-gray-500 mt-1">
             {sess.topic && <span>主题: {sess.topic} · </span>}
             {sess.project && <span>项目: {sess.project} · </span>}
             消息数: {sess.message_count}
           </div>
+          {sess.analysis_mode && sess.analysis_workspace && (
+            <div className="text-xs text-violet-600 mt-1 break-all">
+              工作目录: {sess.analysis_workspace}
+            </div>
+          )}
         </div>
         <div className="text-xs text-gray-400 whitespace-nowrap">
           {formatDate(sess.last_active_at)}

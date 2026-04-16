@@ -9,6 +9,7 @@ import SessionDetail from "./pages/SessionDetail"
 import Playground from "./pages/Playground"
 import AuditLogs from "./pages/AuditLogs"
 import Memory from "./pages/Memory"
+import Triage from "./pages/Triage"
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -31,6 +32,7 @@ export default function App() {
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/sessions/:id" element={<SessionDetail />} />
             <Route path="/memory" element={<Memory />} />
+            <Route path="/triage" element={<Triage />} />
             <Route path="/playground" element={<Playground />} />
             <Route path="/audit-logs" element={<AuditLogs />} />
           </Route>

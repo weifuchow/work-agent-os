@@ -2,7 +2,6 @@
 
 import json
 import os
-import tempfile
 from typing import Callable, Optional
 
 import lark_oapi as lark
@@ -258,16 +257,74 @@ class FeishuClient:
             logger.info("Image uploaded: {} -> {}", image_path, image_key)
         return image_key or None
 
-    def get_image_bytes(self, image_key: str) -> tuple[bytes, str | None] | None:
+    def get_image_bytes(
+        self,
+        image_key: str,
+        *,
+        message_id: str | None = None,
+        resource_type: str = "image",
+    ) -> tuple[bytes, str | None] | None:
         """Download image bytes by image_key."""
         from lark_oapi.api.im.v1 import GetImageRequest
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
         request = GetImageRequest.builder().image_key(image_key).build()
         response = self._client.im.v1.image.get(request)
 
         if getattr(response, "code", -1) != 0 or not getattr(response, "file", None):
+            if message_id:
+                fallback_request = (
+                    GetMessageResourceRequest.builder()
+                    .message_id(message_id)
+                    .file_key(image_key)
+                    .type(resource_type)
+                    .build()
+                )
+                fallback_response = self._client.im.v1.message_resource.get(fallback_request)
+                if getattr(fallback_response, "code", -1) == 0 and getattr(fallback_response, "file", None):
+                    file_obj = fallback_response.file
+                    file_obj.seek(0)
+                    return file_obj.read(), getattr(fallback_response, "file_name", None)
+
             logger.error("Failed to get image {}: code={} msg={}",
                          image_key, getattr(response, "code", ""), getattr(response, "msg", ""))
+            return None
+
+        file_obj = response.file
+        file_obj.seek(0)
+        return file_obj.read(), getattr(response, "file_name", None)
+
+    def get_file_bytes(
+        self,
+        file_key: str,
+        *,
+        message_id: str | None = None,
+        resource_type: str = "file",
+    ) -> tuple[bytes, str | None] | None:
+        """Download file bytes by file_key."""
+        from lark_oapi.api.im.v1 import GetFileRequest
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        request = GetFileRequest.builder().file_key(file_key).build()
+        response = self._client.im.v1.file.get(request)
+
+        if getattr(response, "code", -1) != 0 or not getattr(response, "file", None):
+            if message_id:
+                fallback_request = (
+                    GetMessageResourceRequest.builder()
+                    .message_id(message_id)
+                    .file_key(file_key)
+                    .type(resource_type)
+                    .build()
+                )
+                fallback_response = self._client.im.v1.message_resource.get(fallback_request)
+                if getattr(fallback_response, "code", -1) == 0 and getattr(fallback_response, "file", None):
+                    file_obj = fallback_response.file
+                    file_obj.seek(0)
+                    return file_obj.read(), getattr(fallback_response, "file_name", None)
+
+            logger.error("Failed to get file {}: code={} msg={}",
+                         file_key, getattr(response, "code", ""), getattr(response, "msg", ""))
             return None
 
         file_obj = response.file
@@ -317,9 +374,17 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
 
     elif message_type == "post":
         # Rich text post — extract plain text from all content sections
-        title = data.get("title", "")
+        post_payload = data
+        if not isinstance(post_payload.get("content"), list):
+            for value in post_payload.values():
+                if isinstance(value, dict) and isinstance(value.get("content"), list):
+                    post_payload = value
+                    break
+
+        title = post_payload.get("title", "")
         paragraphs = []
-        for lang_content in data.get("content", []):
+        image_keys: list[str] = []
+        for lang_content in post_payload.get("content", []):
             if not isinstance(lang_content, list):
                 continue
             for block in lang_content:
@@ -332,6 +397,10 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
                             paragraphs.append(block.get("user_name", "@user"))
                         elif block.get("tag") == "a":
                             paragraphs.append(block.get("text", "") or block.get("href", ""))
+                        elif block.get("tag") == "img":
+                            image_key = block.get("image_key", "")
+                            if image_key:
+                                image_keys.append(image_key)
                     continue
                 for elem in block:
                     if not isinstance(elem, dict):
@@ -342,9 +411,15 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
                         paragraphs.append(elem.get("user_name", "@user"))
                     elif elem.get("tag") == "a":
                         paragraphs.append(elem.get("text", "") or elem.get("href", ""))
+                    elif elem.get("tag") == "img":
+                        image_key = elem.get("image_key", "")
+                        if image_key:
+                            image_keys.append(image_key)
         body_text = "\n".join(paragraphs)
-        content = f"{title}\n{body_text}" if title else body_text
-        media_info = {"type": "post", "title": title}
+        if image_keys and not body_text:
+            body_text = "[图片]"
+        content = f"{title}\n{body_text}" if title and body_text else (title or body_text)
+        media_info = {"type": "post", "title": title, "image_keys": image_keys, "has_image": bool(image_keys)}
 
     elif message_type == "interactive":
         # Interactive card — extract card elements text

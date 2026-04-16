@@ -1,0 +1,40 @@
+# RIOT2 / riot-standalone
+
+## Identity
+
+- 项目别名：`riot-standalone`、`riot2`、`RIOT2`
+- 主要技术栈：Java 11、Spring Boot、Maven 多模块
+- 日志栈：以 `log4j2` 为主
+
+## Start Here
+
+- 如果问题来自“导出日志”附件，先看导出实现：
+  - `bootstrap/riot-bootstrap-core/src/main/java/sr/riot/logfile/LogFileController.java`
+  - `bootstrap/riot-bootstrap-core/src/main/java/sr/riot/logfile/LogFileService.java`
+- 环境配置入口可先看：
+  - `bootstrap/riot-bootstrap-core/src/main/resources/application-local.properties`
+  - `bootstrap/riot-bootstrap-core/src/main/resources/application-dev.properties`
+  - `bootstrap/riot-bootstrap-core/src/main/resources/application-test.properties`
+- 这些配置会把 `logging.config` 指向 `classpath:log4j2/log4j2-local.xml` 或 `log4j2.xml`。
+- 设备侧单独入口可看：
+  - `device/riot-device-bootstrap/src/main/resources/log4j2/log4j2.xml`
+  - `device/riot-device-bootstrap/src/main/resources/log4j2/log4j2_appender.xml`
+
+## Practical Logging Notes
+
+- `LogFileService.findAndCommandZipFile(...)` 会先按类型分组、按日期筛选日志，再复制到临时目录并统一打成 `.zip`。
+- 这意味着用户给你的附件可能不是原始目录，而是“按时间窗聚合后再压缩”的导出包。
+- 设备侧 `log4j2.xml` 中：
+  - `APP_NAME=riot-device`
+  - `LOG_HOME=/data/logs/${APP_NAME}`
+- RollingFile 输出规则：
+  - 当前文件：`${LOG_HOME}/${APP_NAME}-${HOST_NAME}.log`
+  - 滚动文件：`${LOG_HOME}/${APP_NAME}-${HOST_NAME}-%d{yyyy-MM-dd}.%i.log.gz`
+- 不同模块可能有各自的 `log4j2*.xml`，不要假设全项目只有一套日志配置。
+
+## Search Priorities
+
+- 第一轮先判断附件是运行时原始 `.log/.log.gz`，还是 `LogFileService` 二次生成的 `.zip`。
+- 先锁定是 bootstrap、device、brokerx、fcs 还是其他模块。
+- 再在该模块下搜索 `log4j2*.xml`、异常类、日志文本和相关接口路径。
+- 如果现场只给了一个异常类或接口报错，先从模块配置反推它会落到哪个日志目录和文件模式。
