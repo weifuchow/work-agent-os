@@ -9,6 +9,7 @@ build/
 
 # Virtual environments
 .venv/
+.venvs/
 venv/
 env/
 
@@ -23,14 +24,18 @@ env/
 
 # Data (runtime generated)
 data/db/
+data/attachments/
 data/work_agent.db
 data/audit/*.log
 data/memory/
+data/mempalace/
 data/*.restart.log
 data/reports/
+data/sessions/
 
 # Local temp and logs
 .tmp/
+.triage/
 *.log
 
 # Claude Code
