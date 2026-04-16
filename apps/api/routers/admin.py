@@ -1269,6 +1269,40 @@ def _collect_search_runs(run_dir: Path, *, include_content: bool) -> list[dict[s
     return items
 
 
+def _read_decision_artifact(path: Path) -> dict[str, Any] | None:
+    payload = _read_json_file(path)
+    if payload is None:
+        return None
+    return {
+        "path": str(path.resolve()),
+        "payload": payload,
+    }
+
+
+def _read_analysis_trace(run_dir: Path, *, include_content: bool) -> dict[str, Any] | None:
+    process_dir = run_dir / "02-process"
+    trace_json_path = process_dir / "analysis_trace.json"
+    trace_md_path = process_dir / "analysis_trace.md"
+    trace_json = _read_json_file(trace_json_path)
+    markdown_preview = _read_text_file(trace_md_path, max_chars=3000)
+
+    if not trace_json and not markdown_preview:
+        return None
+
+    payload: dict[str, Any] = {
+        "path": str(trace_json_path.resolve()) if trace_json_path.exists() else "",
+        "markdown_path": str(trace_md_path.resolve()) if trace_md_path.exists() else "",
+        "markdown_preview": markdown_preview,
+        "runtime": (trace_json or {}).get("runtime", ""),
+        "rollout_path": (trace_json or {}).get("rollout_path", ""),
+        "steps": (trace_json or {}).get("steps", [])[:16],
+    }
+    if include_content:
+        payload["markdown_content"] = _read_text_file(trace_md_path, max_chars=12000)
+        payload["trace"] = trace_json or {}
+    return payload
+
+
 def _triage_run_to_dict(run_dir: Path, *, include_detail: bool) -> dict[str, Any]:
     state_path = run_dir / "00-state.json"
     state = _read_json_file(state_path)
@@ -1279,6 +1313,9 @@ def _triage_run_to_dict(run_dir: Path, *, include_detail: bool) -> dict[str, Any
     slug = str(run_dir.resolve().relative_to(base)).replace("\\", "/")
     search_runs = _collect_search_runs(run_dir, include_content=include_detail)
     latest_search = search_runs[0] if search_runs else None
+    routing_decision = _read_decision_artifact(run_dir / "02-process" / "routing_decision.json")
+    final_decision = _read_decision_artifact(run_dir / "02-process" / "final_decision.json")
+    analysis_trace = _read_analysis_trace(run_dir, include_content=include_detail)
 
     payload: dict[str, Any] = {
         "slug": slug,
@@ -1298,11 +1335,17 @@ def _triage_run_to_dict(run_dir: Path, *, include_detail: bool) -> dict[str, Any
         "module_hypothesis": state.get("module_hypothesis", []),
         "target_log_files": state.get("target_log_files", []),
         "latest_search": latest_search,
+        "has_process_trace": bool(routing_decision or final_decision or analysis_trace),
+        "route_mode": ((routing_decision or {}).get("payload") or {}).get("route_mode", ""),
+        "final_action": ((final_decision or {}).get("payload") or {}).get("action", ""),
     }
 
     if include_detail:
         payload["state"] = state
         payload["search_runs"] = search_runs
+        payload["routing_decision"] = routing_decision
+        payload["final_decision"] = final_decision
+        payload["analysis_trace"] = analysis_trace
     return payload
 
 

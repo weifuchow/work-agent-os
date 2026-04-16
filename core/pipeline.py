@@ -14,8 +14,10 @@ import base64
 import hashlib
 import json
 import mimetypes
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from datetime import datetime
@@ -735,14 +737,19 @@ async def _process_message_locked(message_id: int, msg: dict,
     # 3. Re-read fresh session state (may have been updated by prior message)
     session = await _read_session(session_id) if session_id else None
     analysis_dir: Path | None = None
+    ones_artifacts: dict[str, Any] | None = None
     if session_id and await _should_prepare_analysis_workspace(msg, session, session_id):
         analysis_dir = await _materialize_analysis_workspace(message_id, msg, session, session_id)
         refreshed = await _read_message(message_id)
         if refreshed:
             msg = refreshed
+    if _ones_link_detected(msg):
+        ones_artifacts = await _fetch_ones_task_artifacts(msg)
 
     # 4. Audit: log before agent call
     prompt = _build_prompt(msg, session)
+    if ones_artifacts:
+        prompt += _build_ones_artifact_context(ones_artifacts)
     if analysis_dir:
         prompt += (
             f"\n\n[分析工作目录] {analysis_dir}"
@@ -754,15 +761,19 @@ async def _process_message_locked(message_id: int, msg: dict,
         "prompt": prompt[:2000],
     })
 
-    # 5. Run agent (project resume or orchestrator)
+    # 5. Run agent (project resume, direct ONES route, or orchestrator)
     agent_sid = session["agent_session_id"] if session else None
     project = session["project"] if session else ""
     agent_runtime = normalize_agent_runtime(
         (session or {}).get("agent_runtime") or _get_default_agent_runtime()
     )
     agent_input = _build_agent_input(msg, session, agent_runtime, prompt)
+    direct_project = None
+    active_project = project
+    route_mode = "orchestrator"
 
     if agent_sid and project:
+        route_mode = "project_resume"
         result = await _run_project_agent(project, agent_input, agent_sid, runtime=agent_runtime)
         # Fallback: context overflow → compact session then retry
         if (
@@ -783,25 +794,47 @@ async def _process_message_locked(message_id: int, msg: dict,
                 else:
                     logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
     else:
-        result = await _run_orchestrator(agent_input, session_id=agent_sid, runtime=agent_runtime)
+        direct_project = await _try_direct_project_route(msg, session)
+        if direct_project:
+            active_project = direct_project["project_name"]
+            route_mode = "direct_project"
+            await _audit("pipeline_direct_route", "message", str(message_id), {
+                "project_name": active_project,
+                "confidence": direct_project["confidence"],
+                "score": direct_project["score"],
+                "task_ref": direct_project["task_ref"],
+                "task_url": direct_project["task_url"],
+                "reasons": direct_project["reasons"],
+            })
+            project_prompt = direct_project["prompt"]
+            if ones_artifacts:
+                project_prompt += _build_ones_artifact_context(ones_artifacts)
+            result = await _run_project_agent(
+                active_project,
+                project_prompt,
+                None,
+                runtime=agent_runtime,
+            )
+        else:
+            result = await _run_orchestrator(agent_input, session_id=agent_sid, runtime=agent_runtime)
 
     result_text = result.get("text", "")
     new_agent_sid = result.get("session_id")
-    if agent_sid and project:
-        parsed = _normalize_project_result(result_text, session=session, project=project)
+    if active_project:
+        parsed = _normalize_project_result(result_text, session=session, project=active_project)
         if _should_retry_project_response(parsed):
             logger.info("Pipeline: project reply for message {} looks like premature clarification, retrying once", message_id)
             retry_prompt = (
                 "不要先向用户澄清。你必须先搜索代码、配置、日志、注释和结构化记忆，"
                 "先给出你已经能确认的结论；只有在检索后仍然缺少会直接影响结论的关键上下文时，"
                 "最后才允许附带一个最小追问。\n\n"
-                f"用户本轮消息：{prompt}"
+                f"用户本轮消息：{direct_project['prompt'] if direct_project else prompt}"
             )
-            retry_result = await _run_project_agent(project, retry_prompt, agent_sid, runtime=agent_runtime)
+            retry_result = await _run_project_agent(active_project, retry_prompt, new_agent_sid or agent_sid, runtime=agent_runtime)
             result = retry_result
             result_text = retry_result.get("text", "")
             new_agent_sid = retry_result.get("session_id") or new_agent_sid
-            parsed = _normalize_project_result(result_text, session=session, project=project)
+            parsed = _normalize_project_result(result_text, session=session, project=active_project)
     else:
         parsed = _parse_result(result_text)
 
@@ -876,9 +909,40 @@ async def _process_message_locked(message_id: int, msg: dict,
             session_id,
             agent_session_id=new_agent_sid,
             agent_runtime=agent_runtime,
-            project=parsed.get("project_name") or "",
+            project=parsed.get("project_name") or active_project or "",
             thread_id=thread_id,
         )
+
+    trace_requested = analysis_dir is not None or _should_capture_process_trace(msg, session, parsed)
+    if session_id and trace_requested:
+        try:
+            trace_session = await _read_session(session_id)
+            if trace_session:
+                analysis_dir = await _materialize_analysis_workspace(message_id, msg, trace_session, session_id)
+                effective_agent_sid = (
+                    str((trace_session.get("agent_session_id") or effective_agent_sid or new_agent_sid or "")).strip()
+                )
+                analysis_trace = _extract_rollout_trace(agent_runtime, effective_agent_sid or new_agent_sid)
+                _write_process_trace_artifacts(
+                    analysis_dir,
+                    message_id=message_id,
+                    session_id=session_id,
+                    msg=msg,
+                    session=trace_session,
+                    prompt=prompt,
+                    agent_runtime=agent_runtime,
+                    pre_project=project,
+                    route_mode=route_mode,
+                    direct_project=direct_project,
+                    ones_artifacts=ones_artifacts,
+                    parsed=parsed,
+                    result_text=result_text,
+                    new_agent_sid=new_agent_sid,
+                    effective_agent_sid=effective_agent_sid,
+                    analysis_trace=analysis_trace,
+                )
+        except Exception as e:
+            logger.warning("Pipeline: failed to persist analysis trace for message {}: {}", message_id, e)
 
     # 9. Mark completed
     await _update_message(message_id,
@@ -901,12 +965,12 @@ async def _process_message_locked(message_id: int, msg: dict,
     # 11. Proactive compaction — also under session lock (runs in background
     #     but acquires the same lock so it won't overlap with the next message)
     effective_sid = effective_agent_sid or new_agent_sid
-    if effective_sid and project and agent_runtime == "claude":
+    if effective_sid and active_project and agent_runtime == "claude":
         input_tokens = _get_input_tokens(result)
         ctx_window = _get_context_window(result.get("model"))
         if input_tokens > ctx_window * _COMPACT_THRESHOLD:
             from core.projects import get_project as _get_proj
-            proj = _get_proj(project)
+            proj = _get_proj(active_project)
             if proj:
                 logger.info("Pipeline: proactive compact for session {} "
                             "(tokens={}, threshold={})",
@@ -1021,7 +1085,7 @@ async def _run_orchestrator(
 async def _run_project_agent(
     project_name: str,
     prompt: str | AsyncIterable[dict[str, Any]],
-    session_id: str,
+    session_id: str | None,
     runtime: str | None = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
@@ -1053,6 +1117,37 @@ async def _run_project_agent(
         session_id=session_id,
         runtime=runtime,
     )
+
+
+async def _try_direct_project_route(msg: dict, session: dict | None) -> dict[str, Any] | None:
+    if session and session.get("project"):
+        return None
+    if session and int(session.get("message_count") or 0) > 1:
+        return None
+
+    content = str(msg.get("content") or "").strip()
+    if not content or "ones." not in content.lower():
+        return None
+
+    from core.ones_routing import extract_ones_task_link, try_direct_project_route
+
+    if not extract_ones_task_link(content):
+        return None
+
+    decision = await try_direct_project_route(content)
+    if not decision:
+        return None
+
+    return {
+        "project_name": decision.project_name,
+        "prompt": decision.build_project_prompt(content),
+        "confidence": decision.confidence,
+        "score": decision.score,
+        "reasons": decision.reasons,
+        "task_ref": decision.task_ref,
+        "task_url": decision.task_url,
+        "task_summary": decision.task_summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1262,6 +1357,468 @@ def _triage_state_payload(session_id: int, session: dict | None, msg: dict, tria
         "created_at": now,
         "updated_at": now,
     }
+
+
+def _write_json_artifact(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_text_artifact(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def _truncate_text(value: Any, limit: int = 800) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _ones_link_detected(msg: dict) -> bool:
+    content = str(msg.get("content") or "").strip()
+    if not content or "ones." not in content.lower():
+        return False
+    try:
+        from core.ones_routing import extract_ones_task_link
+    except Exception:
+        return False
+    return bool(extract_ones_task_link(content))
+
+
+def _extract_ones_link(msg: dict) -> str:
+    content = str(msg.get("content") or "").strip()
+    if not content:
+        return ""
+    try:
+        from core.ones_routing import extract_ones_task_link
+    except Exception:
+        return ""
+    extracted = extract_ones_task_link(content)
+    return extracted[2] if extracted else ""
+
+
+def _find_existing_ones_task_artifacts(task_ref: str) -> dict[str, Any] | None:
+    ones_root = settings.project_root / ".ones"
+    if not task_ref or not ones_root.exists():
+        return None
+    for task_dir in sorted(ones_root.glob(f"*_{task_ref}")):
+        task_json_path = task_dir / "task.json"
+        if not task_json_path.exists():
+            continue
+        try:
+            payload = json.loads(task_json_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            continue
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _collect_ones_downloaded_files(ones_result: dict[str, Any]) -> list[dict[str, str]]:
+    paths = (ones_result.get("paths") or {}) if isinstance(ones_result, dict) else {}
+    messages_json_path = str(paths.get("messages_json") or "").strip()
+    if not messages_json_path:
+        return []
+    try:
+        payload = json.loads(Path(messages_json_path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+
+    files: list[dict[str, str]] = []
+    for item in payload.get("description_images", []) or []:
+        path = str(item.get("path") or "").strip()
+        if path:
+            files.append({
+                "label": str(item.get("label") or "").strip() or Path(path).name,
+                "path": path,
+                "uuid": str(item.get("uuid") or "").strip(),
+            })
+    for item in payload.get("attachment_downloads", []) or []:
+        path = str(item.get("path") or "").strip()
+        if path:
+            files.append({
+                "label": str(item.get("label") or "").strip() or Path(path).name,
+                "path": path,
+                "uuid": str(item.get("uuid") or "").strip(),
+            })
+    return files
+
+
+def _ones_cli_script_path() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    return codex_home / "skills" / "ones" / "scripts" / "ones_cli.py"
+
+
+async def _fetch_ones_task_artifacts(msg: dict) -> dict[str, Any] | None:
+    task_url = _extract_ones_link(msg)
+    if not task_url:
+        return None
+
+    try:
+        from core.ones_routing import extract_ones_task_link
+    except Exception:
+        return None
+
+    extracted = extract_ones_task_link(task_url)
+    if not extracted:
+        return None
+    _, task_ref, _ = extracted
+
+    existing = _find_existing_ones_task_artifacts(task_ref)
+    if existing:
+        return existing
+
+    script_path = _ones_cli_script_path()
+    if not script_path.exists():
+        logger.warning("Pipeline: ONES CLI not found at {}", script_path)
+        return None
+
+    def _run_fetch() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(script_path), "fetch-task", task_url],
+            cwd=str(settings.project_root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    try:
+        completed = await asyncio.to_thread(_run_fetch)
+    except Exception as e:
+        logger.warning("Pipeline: ONES fetch-task failed for {}: {}", task_ref, e)
+        return None
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        logger.warning(
+            "Pipeline: ONES fetch-task non-zero for {}: rc={} stdout={} stderr={}",
+            task_ref,
+            completed.returncode,
+            _truncate_text(stdout, limit=400),
+            _truncate_text(stderr, limit=400),
+        )
+        return None
+
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning("Pipeline: ONES fetch-task output not valid JSON for {}", task_ref)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        logger.warning("Pipeline: ONES fetch-task reported failure for {}: {}", task_ref, payload.get("error"))
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+def _build_ones_artifact_context(ones_result: dict[str, Any] | None) -> str:
+    if not ones_result:
+        return ""
+
+    task = ones_result.get("task") or {}
+    project = ones_result.get("project") or {}
+    counts = ones_result.get("counts") or {}
+    paths = ones_result.get("paths") or {}
+    downloaded = _collect_ones_downloaded_files(ones_result)
+    payload = {
+        "task": {
+            "number": task.get("number"),
+            "uuid": task.get("uuid"),
+            "summary": task.get("summary"),
+            "status_name": task.get("status_name"),
+            "issue_type_name": task.get("issue_type_name"),
+            "url": task.get("url"),
+        },
+        "project": {
+            "display_name": project.get("display_name"),
+            "business_project_name": project.get("business_project_name"),
+            "confidence": project.get("confidence"),
+        },
+        "counts": counts,
+        "paths": {
+            "task_dir": paths.get("task_dir", ""),
+            "task_json": paths.get("task_json", ""),
+            "messages_json": paths.get("messages_json", ""),
+            "report_md": paths.get("report_md", ""),
+        },
+        "downloaded_files": downloaded[:12],
+    }
+    return "\n\n[ONES 下载产物]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _should_capture_process_trace(msg: dict, session: dict | None, parsed: dict) -> bool:
+    if session and (
+        bool(session.get("analysis_mode"))
+        or str(session.get("analysis_workspace") or "").strip()
+    ):
+        return True
+    if _analysis_requested(msg):
+        return True
+    if _ones_link_detected(msg):
+        return True
+    return (parsed.get("classified_type") or "") in {"urgent_issue", "task_request"}
+
+
+def _extract_rollout_tool_call_detail(name: str, arguments: Any) -> str:
+    raw = str(arguments or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _truncate_text(raw, limit=600)
+
+    if isinstance(parsed, dict):
+        if name == "shell_command":
+            return _truncate_text(parsed.get("command", ""), limit=600)
+        return _truncate_text(json.dumps(parsed, ensure_ascii=False), limit=600)
+    return _truncate_text(parsed, limit=600)
+
+
+def _extract_rollout_tool_output_detail(output: Any) -> str:
+    text = str(output or "").strip()
+    if not text:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    preview = "\n".join(lines[:8])
+    return _truncate_text(preview, limit=1000)
+
+
+def _summarize_codex_rollout(
+    rollout_path: Path | None,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    call_names: dict[str, str] = {}
+    steps: list[dict[str, Any]] = []
+
+    for event in events:
+        timestamp = event.get("timestamp")
+        event_type = event.get("type")
+        payload = event.get("payload") or {}
+
+        if event_type == "event_msg" and payload.get("type") == "agent_message":
+            message = str(payload.get("message") or "").strip()
+            if message:
+                steps.append({
+                    "timestamp": timestamp,
+                    "kind": "commentary",
+                    "title": str(payload.get("phase") or "agent update"),
+                    "detail": _truncate_text(message, limit=1600),
+                })
+            continue
+
+        if event_type != "response_item":
+            continue
+
+        payload_type = payload.get("type")
+        if payload_type == "function_call":
+            call_id = str(payload.get("call_id") or "")
+            name = str(payload.get("name") or "tool")
+            if call_id:
+                call_names[call_id] = name
+            steps.append({
+                "timestamp": timestamp,
+                "kind": "tool_call",
+                "title": name,
+                "detail": _extract_rollout_tool_call_detail(name, payload.get("arguments")),
+            })
+            continue
+
+        if payload_type == "function_call_output":
+            call_id = str(payload.get("call_id") or "")
+            name = call_names.get(call_id, "tool")
+            detail = _extract_rollout_tool_output_detail(payload.get("output"))
+            if detail:
+                steps.append({
+                    "timestamp": timestamp,
+                    "kind": "tool_output",
+                    "title": f"{name} output",
+                    "detail": detail,
+                })
+            continue
+
+        if payload_type == "custom_tool_call":
+            name = str(payload.get("name") or "custom_tool")
+            steps.append({
+                "timestamp": timestamp,
+                "kind": "tool_call",
+                "title": name,
+                "detail": _truncate_text(payload.get("status") or "", limit=200),
+            })
+
+    for index, step in enumerate(steps, start=1):
+        step["index"] = index
+
+    return {
+        "runtime": "codex",
+        "rollout_path": str(rollout_path) if rollout_path else "",
+        "steps": steps[:80],
+    }
+
+
+def _render_analysis_trace_markdown(
+    *,
+    routing_decision: dict[str, Any],
+    final_decision: dict[str, Any],
+    analysis_trace: dict[str, Any] | None,
+) -> str:
+    lines = [
+        "# Analysis Process",
+        "",
+        f"- Route mode: `{routing_decision.get('route_mode', 'unknown')}`",
+        f"- ONES link detected: `{'yes' if routing_decision.get('ones_link_detected') else 'no'}`",
+        f"- Pre-project: `{routing_decision.get('pre_project') or '-'}`",
+        f"- Final project: `{final_decision.get('project_name') or '-'}`",
+        f"- Action: `{final_decision.get('action') or '-'}`",
+        f"- Classified type: `{final_decision.get('classified_type') or '-'}`",
+    ]
+
+    rollout_path = ""
+    if analysis_trace:
+        rollout_path = str(analysis_trace.get("rollout_path") or "")
+    if rollout_path:
+        lines.append(f"- Rollout: `{rollout_path}`")
+
+    final_reason = str(final_decision.get("reason") or "").strip()
+    if final_reason:
+        lines.extend(["", "## Final Reason", "", final_reason])
+
+    if analysis_trace and analysis_trace.get("steps"):
+        lines.extend(["", "## Steps", ""])
+        for step in analysis_trace["steps"]:
+            title = str(step.get("title") or step.get("kind") or "step")
+            timestamp = str(step.get("timestamp") or "").strip()
+            lines.append(f"{step.get('index', '?')}. {title}{f' ({timestamp})' if timestamp else ''}")
+            detail = str(step.get("detail") or "").strip()
+            if detail:
+                lines.append("")
+                lines.append("```text")
+                lines.append(detail)
+                lines.append("```")
+                lines.append("")
+
+    return "\n".join(lines)
+
+
+def _extract_rollout_trace(agent_runtime: str, agent_session_id: str | None) -> dict[str, Any] | None:
+    if agent_runtime != "codex" or not agent_session_id:
+        return None
+    try:
+        from core.orchestrator.agent_client import agent_client
+
+        rollout_path, events = agent_client._read_codex_rollout(agent_session_id)
+    except Exception as e:
+        logger.warning("Pipeline: failed to read codex rollout for {}: {}", agent_session_id, e)
+        return None
+    if not rollout_path:
+        return None
+    return _summarize_codex_rollout(rollout_path, events)
+
+
+def _update_triage_state_after_process(
+    state_path: Path,
+    *,
+    project: str,
+) -> None:
+    if not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+    if project:
+        state["project"] = project
+    state["updated_at"] = datetime.now().isoformat()
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_process_trace_artifacts(
+    triage_dir: Path,
+    *,
+    message_id: int,
+    session_id: int | None,
+    msg: dict,
+    session: dict | None,
+    prompt: str,
+    agent_runtime: str,
+    pre_project: str,
+    route_mode: str,
+    direct_project: dict[str, Any] | None,
+    ones_artifacts: dict[str, Any] | None,
+    parsed: dict[str, Any],
+    result_text: str,
+    new_agent_sid: str | None,
+    effective_agent_sid: str | None,
+    analysis_trace: dict[str, Any] | None,
+) -> None:
+    process_dir = triage_dir / "02-process"
+    process_dir.mkdir(parents=True, exist_ok=True)
+
+    routing_decision = {
+        "message_id": message_id,
+        "session_id": session_id,
+        "platform_message_id": msg.get("platform_message_id", ""),
+        "problem_summary": ((session or {}).get("title") or msg.get("content") or "")[:200],
+        "agent_runtime": agent_runtime,
+        "pre_project": pre_project,
+        "route_mode": route_mode,
+        "ones_link_detected": _ones_link_detected(msg),
+        "ones_artifacts": {
+            "task_dir": str(((ones_artifacts or {}).get("paths") or {}).get("task_dir") or ""),
+            "report_md": str(((ones_artifacts or {}).get("paths") or {}).get("report_md") or ""),
+            "downloaded_files": _collect_ones_downloaded_files(ones_artifacts),
+        } if ones_artifacts else None,
+        "direct_project": direct_project or None,
+        "effective_agent_session_id": effective_agent_sid or new_agent_sid or "",
+        "rollout_path": (analysis_trace or {}).get("rollout_path", ""),
+        "prompt_excerpt": _truncate_text(prompt, limit=2000),
+        "created_at": datetime.now().isoformat(),
+    }
+
+    reply_content = parsed.get("reply_content")
+    final_decision: dict[str, Any] = {
+        "message_id": message_id,
+        "session_id": session_id,
+        "action": parsed.get("action", ""),
+        "classified_type": parsed.get("classified_type", ""),
+        "topic": parsed.get("topic", ""),
+        "project_name": parsed.get("project_name", ""),
+        "reason": parsed.get("reason", ""),
+        "agent_runtime": agent_runtime,
+        "result_session_id": new_agent_sid or "",
+        "effective_agent_session_id": effective_agent_sid or "",
+        "rollout_path": (analysis_trace or {}).get("rollout_path", ""),
+        "reply_preview": _truncate_text(_reply_content_to_text(reply_content), limit=2000),
+        "result_text_preview": _truncate_text(result_text, limit=2000),
+        "created_at": datetime.now().isoformat(),
+    }
+    if isinstance(reply_content, dict):
+        final_decision["reply_content"] = reply_content
+
+    _write_json_artifact(process_dir / "routing_decision.json", routing_decision)
+    _write_json_artifact(process_dir / "final_decision.json", final_decision)
+    if analysis_trace:
+        _write_json_artifact(process_dir / "analysis_trace.json", analysis_trace)
+    _write_text_artifact(
+        process_dir / "analysis_trace.md",
+        _render_analysis_trace_markdown(
+            routing_decision=routing_decision,
+            final_decision=final_decision,
+            analysis_trace=analysis_trace,
+        ),
+    )
+    _update_triage_state_after_process(
+        triage_dir / "00-state.json",
+        project=str(final_decision.get("project_name") or pre_project or ""),
+    )
 
 
 def _sanitize_filename(name: str, fallback: str) -> str:

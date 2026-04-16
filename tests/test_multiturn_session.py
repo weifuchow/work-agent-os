@@ -688,6 +688,109 @@ async def test_noise_message_no_reply():
     print(f"\n[PASS] B3: Noise message is silent (no feishu reply)")
 
 
+@pytest.mark.asyncio
+async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
+    """High-confidence ONES routing should dispatch to project agent on the first turn."""
+    from core.pipeline import process_message
+
+    direct_route = {
+        "project_name": "allspark",
+        "prompt": "用户直接发送了 ONES 工单链接，系统已预路由到项目 `allspark`。",
+        "confidence": "high",
+        "score": 7,
+        "reasons": ["命中领域关键词: 调度, 自动充电, 充电桩"],
+        "task_ref": "1FmsdpJjHT3JPyWL",
+        "task_url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+        "task_summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
+    }
+
+    project_calls: list[dict] = []
+
+    async def mock_project(project_name, prompt, session_id, **kwargs):
+        project_calls.append({
+            "project_name": project_name,
+            "prompt": prompt,
+            "session_id": session_id,
+        })
+        return {
+            "text": "先给出结论：当前问题更像调度侧自动充电任务生成链路异常。",
+            "session_id": PROJECT_SESSION_ID,
+            "cost_usd": 0.02,
+        }
+
+    with patch("core.pipeline._try_direct_project_route", AsyncMock(return_value=direct_route)), \
+         patch("core.pipeline._run_project_agent", AsyncMock(side_effect=mock_project)) as mock_proj, \
+         patch("core.pipeline._run_orchestrator", AsyncMock()) as mock_orch:
+        msg_id = await _insert_message(
+            "帮我分析这个 ONES：#149268 https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+            "m_direct_ones_001",
+        )
+        await process_message(msg_id)
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+
+    assert msg["pipeline_status"] == "completed"
+    assert session["project"] == "allspark"
+    assert session["agent_session_id"] == PROJECT_SESSION_ID
+    assert mock_orch.await_count == 0, "Direct ONES route should not call orchestrator"
+    assert mock_proj.await_count == 1
+    assert project_calls[0]["project_name"] == "allspark"
+    assert project_calls[0]["session_id"] is None
+    assert project_calls[0]["prompt"] == direct_route["prompt"]
+    assert len(_feishu_replies) == 1
+
+    print("\n[PASS] A4: Direct ONES route skips orchestrator and enters project agent")
+
+
+@pytest.mark.asyncio
+async def test_direct_ones_route_only_applies_on_first_turn():
+    """Direct ONES route must not hijack later turns in an existing non-project session."""
+    from core.pipeline import process_message
+
+    async with aiosqlite.connect(TEST_DB_PATH) as db:
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+            "title, project, status, thread_id, agent_session_id, last_active_at, "
+            "message_count, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("key_direct_ones_existing", "feishu", CHAT_ID, SENDER_ID,
+             "已有非项目会话", "", "open",
+             "thread_direct_ones_existing", "", now, 3, now, now),
+        )
+        await db.commit()
+
+    with patch("core.pipeline._run_orchestrator", AsyncMock(return_value={
+        "text": json.dumps({
+            "action": "replied",
+            "classified_type": "chat",
+            "topic": "",
+            "project_name": None,
+            "reply_content": "继续按原流程处理。",
+            "reason": "orchestrator fallback",
+        }, ensure_ascii=False),
+        "session_id": ORCH_SESSION_ID,
+        "cost_usd": 0.001,
+    })) as mock_orch, \
+         patch("core.pipeline._run_project_agent", AsyncMock()) as mock_proj:
+        msg_id = await _insert_message(
+            "顺便看这个 https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+            "m_direct_ones_existing_001",
+            thread_id="thread_direct_ones_existing",
+        )
+        await process_message(msg_id)
+
+    assert mock_orch.await_count == 1
+    assert mock_proj.await_count == 0
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+    assert session["project"] == ""
+
+    print("\n[PASS] A5: Direct ONES route only applies on the first turn")
+
+
 # ---------------------------------------------------------------------------
 # Test C: agent_session_id stability — not overwritten on resume
 # ---------------------------------------------------------------------------
@@ -1051,6 +1154,24 @@ async def test_agent_client_codex_runtime_uses_runtime_specific_default_model():
         f"Codex runtime must resolve to gpt-5.4, got: {selected!r}"
 
     print("\n[PASS] D3: Codex runtime uses runtime-specific default model")
+
+
+def test_codex_exec_timeout_defaults_to_20_minutes(monkeypatch):
+    from core.orchestrator.agent_client import _codex_exec_timeout_seconds
+
+    monkeypatch.delenv("CODEX_EXEC_TIMEOUT_SECONDS", raising=False)
+
+    assert _codex_exec_timeout_seconds(20) == 1200
+    assert _codex_exec_timeout_seconds(30) == 1200
+
+
+def test_codex_exec_timeout_env_override(monkeypatch):
+    from core.orchestrator.agent_client import _codex_exec_timeout_seconds
+
+    monkeypatch.setenv("CODEX_EXEC_TIMEOUT_SECONDS", "1800")
+
+    assert _codex_exec_timeout_seconds(20) == 1800
+    assert _codex_exec_timeout_seconds(80) == 2400
 
 
 # ---------------------------------------------------------------------------

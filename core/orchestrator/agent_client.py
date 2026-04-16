@@ -63,6 +63,19 @@ _NPM_CODEX_EXE = (
     / "codex"
     / "codex.exe"
 )
+_DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 1200
+
+
+def _codex_exec_timeout_seconds(max_turns: int) -> int:
+    raw = str(os.environ.get("CODEX_EXEC_TIMEOUT_SECONDS", "")).strip()
+    configured = 0
+    if raw:
+        try:
+            configured = int(raw)
+        except ValueError:
+            configured = 0
+    floor = configured if configured > 0 else _DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS
+    return max(floor, max_turns * 30)
 
 
 # ==================== Custom Tools ====================
@@ -1179,11 +1192,12 @@ class AgentClient:
         env = {**os.environ, **self._get_codex_env()}
 
         logger.info(
-            "Codex run: scope={}, cwd={}, model={}, resume={}",
+            "Codex run: scope={}, cwd={}, model={}, resume={}, timeout_s={}",
             scope,
             cwd or str(PROJECT_ROOT),
             selected_model,
             bool(session_id),
+            _codex_exec_timeout_seconds(max_turns),
         )
 
         proc = await asyncio.create_subprocess_exec(
@@ -1198,7 +1212,7 @@ class AgentClient:
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(codex_prompt.encode("utf-8")),
-                timeout=max(300, max_turns * 30),
+                timeout=_codex_exec_timeout_seconds(max_turns),
             )
         except asyncio.TimeoutError:
             proc.kill()

@@ -242,6 +242,30 @@ export interface TriageSearchRun {
   result?: Record<string, unknown>
 }
 
+export interface TriageProcessArtifact {
+  path: string
+  payload: Record<string, unknown>
+}
+
+export interface TriageTraceStep {
+  index: number
+  timestamp: string
+  kind: string
+  title: string
+  detail: string
+}
+
+export interface TriageAnalysisTrace {
+  path: string
+  markdown_path: string
+  markdown_preview: string
+  markdown_content?: string
+  runtime: string
+  rollout_path: string
+  steps: TriageTraceStep[]
+  trace?: Record<string, unknown>
+}
+
 export interface TriageRunItem {
   slug: string
   triage_dir: string
@@ -260,11 +284,17 @@ export interface TriageRunItem {
   module_hypothesis: string[]
   target_log_files: string[]
   latest_search: TriageSearchRun | null
+  has_process_trace: boolean
+  route_mode: string
+  final_action: string
 }
 
 export interface TriageRunDetail extends TriageRunItem {
   state: Record<string, unknown>
   search_runs: TriageSearchRun[]
+  routing_decision: TriageProcessArtifact | null
+  final_decision: TriageProcessArtifact | null
+  analysis_trace: TriageAnalysisTrace | null
 }
 
 export const fetchMessages = (page = 1, pageSize = 20) =>

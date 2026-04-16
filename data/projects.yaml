@@ -17,6 +17,7 @@ projects:
     path: D:/standard/riot/allspark
     description: >
       Riot 调度系统 3.0（allspark）。别名：riot3、RIOT3、riot3调度系统。
+      版本线索：3.x、v3.x、RIOT3.0。
       Java 11 + Spring Boot 2.7.6 + Gradle + TDengine。
       多机器人调度与控制系统：AGV 路径规划（TDSPP/A*）、死锁解决、行为树任务编排、
       设备管理（充电桩/电梯/风淋门，Modbus/S7/HTTP/SocketIO）、RBAC + JWT 安全层。
@@ -26,6 +27,7 @@ projects:
     path: D:/standard/riot/riot-standalone
     description: >
       Riot 2.0 单体版（riot-standalone）。别名：riot2、RIOT2。
+      版本线索：2.x、v2.x、RIOT2.0。
       Java 11 + Spring Boot + Maven 多模块。
       前代车队调度系统，模块：bootstrap/device/task/fcs（Fleet Control System）/
       brokerx/security。使用 Flyway 数据库迁移，sprint/release/master 分支流程。
@@ -34,6 +36,7 @@ projects:
     path: D:/standard/riot/fms-java
     description: >
       Riot 1.0 车队管理系统（fms-java）。别名：riot1、RIOT1、fms、车队管理系统。
+      版本线索：4.x、v4.x、FMS/RIoT版本 4.x。
       Java + Gradle 多模块项目。
       车队管理/FMS 系统，包含 fms、service、common、configuration、api-base、
       fms_frontend 与多个 extension 模块（tcp/rmi/dhcp/statistics/accessory）。
@@ -42,6 +45,7 @@ projects:
     path: D:/standard/riot/allsparkbox
     description: >
       RIOT3 部署构建包（allsparkbox）。别名：部署包、安装包。
+      关键词线索：docker、podman、镜像、部署、supervisord、安装。
       Docker/Podman 一键安装方案。
       涵盖：镜像构建流程（Makefile + Dockerfile）、分层镜像依赖链（base→mysql→taos→grafana→
       mosquitto→admin→allspark→mip→set→middler）、Linux/Windows 部署方法、

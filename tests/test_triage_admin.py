@@ -47,6 +47,32 @@ def test_triage_run_to_dict_collects_latest_search(monkeypatch, tmp_path):
         }],
     })
     (search_dir / "evidence_summary.md").write_text("# summary\n\n关键证据\n", encoding="utf-8")
+    _write_json(run_dir / "02-process" / "routing_decision.json", {
+        "route_mode": "direct_project",
+        "ones_link_detected": True,
+        "pre_project": "",
+    })
+    _write_json(run_dir / "02-process" / "final_decision.json", {
+        "action": "drafted",
+        "project_name": "allspark",
+        "classified_type": "urgent_issue",
+    })
+    _write_json(run_dir / "02-process" / "analysis_trace.json", {
+        "runtime": "codex",
+        "rollout_path": "C:/Users/Standard/.codex/sessions/demo.jsonl",
+        "steps": [
+            {
+                "index": 1,
+                "timestamp": "2026-04-15T13:35:00+00:00",
+                "kind": "commentary",
+                "title": "fetch ones",
+                "detail": "先抓 ONES 工单和附件。",
+            }
+        ],
+    })
+    (run_dir / "02-process" / "analysis_trace.md").write_text(
+        "# Analysis Process\n\n1. fetch ones\n", encoding="utf-8"
+    )
 
     monkeypatch.setattr(admin_mod, "_triage_base_dir", lambda: triage_root)
 
@@ -58,6 +84,14 @@ def test_triage_run_to_dict_collects_latest_search(monkeypatch, tmp_path):
     assert payload["latest_search"]["hits_total"] == 2
     assert payload["latest_search"]["top_files"][0]["path"] == "reservation.log"
     assert payload["search_runs"][0]["summary_content"].startswith("# summary")
+    assert payload["has_process_trace"] is True
+    assert payload["route_mode"] == "direct_project"
+    assert payload["final_action"] == "drafted"
+    assert payload["routing_decision"]["payload"]["ones_link_detected"] is True
+    assert payload["final_decision"]["payload"]["project_name"] == "allspark"
+    assert payload["analysis_trace"]["runtime"] == "codex"
+    assert payload["analysis_trace"]["steps"][0]["title"] == "fetch ones"
+    assert payload["analysis_trace"]["markdown_content"].startswith("# Analysis Process")
 
 
 def test_validate_triage_run_path_blocks_traversal(monkeypatch, tmp_path):

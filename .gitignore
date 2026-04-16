@@ -21,6 +21,9 @@ env/
 
 # Environment
 .env
+.ones.env
+ones.env
+.ones/
 
 # Data (runtime generated)
 data/db/

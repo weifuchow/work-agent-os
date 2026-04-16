@@ -117,6 +117,9 @@ export default function Triage() {
                   <span>证据链 {run.evidence_chain_status || "weak"}</span>
                   <span>缺口 {run.missing_items.length}</span>
                   <span>命中 {run.latest_search?.hits_total ?? 0}</span>
+                  {run.route_mode ? <span>路由 {run.route_mode}</span> : null}
+                  {run.final_action ? <span>动作 {run.final_action}</span> : null}
+                  {run.has_process_trace ? <span>过程已记录</span> : null}
                 </div>
 
                 {run.missing_items.length > 0 && (
@@ -165,6 +168,63 @@ export default function Triage() {
                 <InfoBlock title="模块假设" items={detail.module_hypothesis} empty="暂无模块假设" />
                 <InfoBlock title="目标日志文件" items={detail.target_log_files} empty="暂无目标文件" />
                 <InfoBlock title="缺失项" items={detail.missing_items} empty="当前无缺失项" />
+              </div>
+
+              <div className="rounded-3xl border border-gray-200 bg-white p-4">
+                <div className="text-xs font-medium uppercase tracking-[0.18em] text-gray-400">分析过程</div>
+                {detail.has_process_trace ? (
+                  <div className="mt-3 space-y-4">
+                    <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+                      {detail.route_mode ? <Badge label={`路由 ${detail.route_mode}`} /> : null}
+                      {detail.final_action ? <Badge label={`动作 ${detail.final_action}`} /> : null}
+                      {readArtifactValue(detail.final_decision, "project_name") ? (
+                        <Badge label={`最终项目 ${readArtifactValue(detail.final_decision, "project_name")}`} />
+                      ) : null}
+                      {detail.analysis_trace?.runtime ? (
+                        <Badge label={`运行时 ${detail.analysis_trace.runtime}`} />
+                      ) : null}
+                    </div>
+
+                    {detail.analysis_trace?.rollout_path ? (
+                      <div className="rounded-2xl bg-gray-50 px-3 py-2 text-xs text-gray-600">
+                        rollout: {detail.analysis_trace.rollout_path}
+                      </div>
+                    ) : null}
+
+                    {detail.analysis_trace?.steps && detail.analysis_trace.steps.length > 0 ? (
+                      <div className="space-y-3">
+                        {detail.analysis_trace.steps.map((step) => (
+                          <div key={`${step.index}-${step.timestamp}`} className="rounded-2xl border border-gray-200 p-4">
+                            <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                              <div className="text-sm font-medium text-gray-900">
+                                {step.index}. {step.title}
+                              </div>
+                              <div className="text-xs text-gray-400">
+                                {step.kind}{step.timestamp ? ` · ${formatDate(step.timestamp)}` : ""}
+                              </div>
+                            </div>
+                            <pre className="mt-3 overflow-auto rounded-2xl bg-gray-50 p-3 text-xs leading-5 text-gray-700 whitespace-pre-wrap">
+                              {step.detail}
+                            </pre>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-400">当前没有可展示的过程步骤。</div>
+                    )}
+
+                    {detail.analysis_trace?.markdown_content || detail.analysis_trace?.markdown_preview ? (
+                      <div className="rounded-2xl bg-gray-50 p-4">
+                        <div className="text-xs font-medium uppercase tracking-[0.18em] text-gray-400">Trace 摘要</div>
+                        <pre className="mt-3 whitespace-pre-wrap text-sm leading-6 text-gray-700">
+                          {detail.analysis_trace?.markdown_content || detail.analysis_trace?.markdown_preview}
+                        </pre>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="mt-3 text-sm text-gray-400">当前没有已落盘的分析过程。</div>
+                )}
               </div>
 
               <div className="rounded-3xl bg-slate-50 p-4">
@@ -326,4 +386,12 @@ function chipTone(confidence: string, inverse: boolean) {
   if (confidence === "high") return "bg-emerald-50 text-emerald-700"
   if (confidence === "medium") return "bg-amber-50 text-amber-700"
   return "bg-gray-100 text-gray-600"
+}
+
+function readArtifactValue(
+  artifact: { payload: Record<string, unknown> } | null | undefined,
+  key: string,
+) {
+  const value = artifact?.payload?.[key]
+  return typeof value === "string" ? value : ""
 }

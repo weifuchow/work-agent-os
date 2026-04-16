@@ -76,6 +76,126 @@ def test_analysis_requested_for_image_question():
     assert pipeline_mod._analysis_requested(msg) is True
 
 
+def test_should_capture_process_trace_for_ones_and_urgent_issue():
+    import core.pipeline as pipeline_mod
+
+    ones_msg = {
+        "content": "请看这个 https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+    }
+    assert pipeline_mod._should_capture_process_trace(
+        ones_msg,
+        session=None,
+        parsed={"classified_type": "chat"},
+    ) is True
+
+    ordinary_msg = {"content": "收到"}
+    assert pipeline_mod._should_capture_process_trace(
+        ordinary_msg,
+        session=None,
+        parsed={"classified_type": "urgent_issue"},
+    ) is True
+
+
+def test_summarize_codex_rollout_collects_commentary_and_tool_steps(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    rollout_path = tmp_path / "rollout.jsonl"
+    rollout_path.write_text("", encoding="utf-8")
+    events = [
+        {
+            "timestamp": "2026-04-16T05:50:14Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "commentary",
+                "message": "先抓 ONES 工单。",
+            },
+        },
+        {
+            "timestamp": "2026-04-16T05:51:21Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell_command",
+                "arguments": json.dumps({"command": "python ones_cli.py fetch-task 'link'"}, ensure_ascii=False),
+            },
+        },
+        {
+            "timestamp": "2026-04-16T05:51:27Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Exit code: 0\nOutput:\nfetch ok\n",
+            },
+        },
+    ]
+
+    summary = pipeline_mod._summarize_codex_rollout(rollout_path, events)
+
+    assert summary["runtime"] == "codex"
+    assert summary["rollout_path"] == str(rollout_path)
+    assert len(summary["steps"]) == 3
+    assert summary["steps"][0]["kind"] == "commentary"
+    assert summary["steps"][1]["kind"] == "tool_call"
+    assert "fetch-task" in summary["steps"][1]["detail"]
+    assert summary["steps"][2]["kind"] == "tool_output"
+
+
+@pytest.mark.asyncio
+async def test_fetch_ones_task_artifacts_uses_existing_task_dir(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    ones_root = tmp_path / ".ones" / "124548_jHLdrkhKn19k2SMU"
+    ones_root.mkdir(parents=True, exist_ok=True)
+    task_json = ones_root / "task.json"
+    task_json.write_text(json.dumps({
+        "task": {"uuid": "jHLdrkhKn19k2SMU", "number": 124548, "summary": "demo"},
+        "paths": {"task_dir": str(ones_root), "task_json": str(task_json)},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr(pipeline_mod, "settings", SimpleNamespace(project_root=tmp_path))
+
+    msg = {
+        "content": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/jHLdrkhKn19k2SMU",
+    }
+
+    payload = await pipeline_mod._fetch_ones_task_artifacts(msg)
+
+    assert payload is not None
+    assert payload["task"]["uuid"] == "jHLdrkhKn19k2SMU"
+    assert payload["paths"]["task_dir"] == str(ones_root)
+
+
+def test_build_ones_artifact_context_includes_downloaded_files(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    messages_json = tmp_path / "messages.json"
+    messages_json.write_text(json.dumps({
+        "description_images": [{"label": "desc-img", "path": "D:/tmp/desc.png", "uuid": "img-1"}],
+        "attachment_downloads": [{"label": "detail_log.zip", "path": "D:/tmp/detail_log.zip", "uuid": "att-1"}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    ones_result = {
+        "task": {"number": 124548, "uuid": "jHLdrkhKn19k2SMU", "summary": "demo"},
+        "project": {"display_name": "东莞台达七厂东莞SMT车间项目", "confidence": "high"},
+        "counts": {"downloaded_message_attachments": 1},
+        "paths": {
+            "task_dir": "D:/tmp/.ones/124548_jHLdrkhKn19k2SMU",
+            "task_json": "D:/tmp/.ones/124548_jHLdrkhKn19k2SMU/task.json",
+            "messages_json": str(messages_json),
+            "report_md": "D:/tmp/.ones/124548_jHLdrkhKn19k2SMU/report.md",
+        },
+    }
+
+    context = pipeline_mod._build_ones_artifact_context(ones_result)
+
+    assert "[ONES 下载产物]" in context
+    assert "detail_log.zip" in context
+    assert "messages.json" in context
+
+
 @pytest.mark.asyncio
 async def test_materialize_analysis_workspace_downloads_related_session_media(tmp_path, monkeypatch):
     import core.pipeline as pipeline_mod
@@ -148,7 +268,7 @@ async def test_download_message_media_to_workspace_for_post_images(tmp_path):
     import core.pipeline as pipeline_mod
 
     fake_client = SimpleNamespace(
-        get_image_bytes=lambda image_key: (b"\x89PNGpost-image", "post.png"),
+        get_image_bytes=lambda image_key, *args, **kwargs: (b"\x89PNGpost-image", "post.png"),
         get_file_bytes=lambda *args, **kwargs: None,
     )
 
