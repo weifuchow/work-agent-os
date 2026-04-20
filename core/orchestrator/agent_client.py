@@ -517,7 +517,12 @@ async def list_projects_tool(input: dict) -> dict[str, Any]:
     }, "required": ["project_name", "task"]},
 )
 async def dispatch_to_project(input: dict) -> dict[str, Any]:
-    from core.projects import get_project, merge_skills
+    from core.projects import (
+        build_project_runtime_prompt_block,
+        get_project,
+        merge_skills,
+        prepare_project_runtime_context,
+    )
     from skills import SKILL_REGISTRY
 
     runtime = agent_client.get_active_runtime()
@@ -553,6 +558,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
     # Merge skills: project overrides global while inheriting shared workflow skills
     merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
+    runtime_context = prepare_project_runtime_context(project_name)
+    runtime_block = build_project_runtime_prompt_block(runtime_context)
 
     # List project-specific skills for the prompt
     project_only = list(merged_agents)
@@ -564,7 +571,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     project_prompt = f"""你是项目 "{project.name}" 的工作 Agent。
 
 项目目录: {project.path}
-项目说明: {project.description}{skills_line}
+项目说明: {project.description}{skills_line}{runtime_block}
 
 ## 回复规则
 {PROJECT_AGENT_RESPONSE_RULES}
@@ -584,6 +591,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     project_system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。使用项目级 skills 完成任务。"
         "优先复用结构化长期记忆，不要重复发明已经记录的项目结论。"
+        f"{runtime_block}"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
 
@@ -591,7 +599,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         result = await agent_client.run_for_project(
             prompt=project_prompt,
             system_prompt=project_system,
-            project_cwd=str(project.path),
+            project_cwd=str(getattr(runtime_context, "execution_path", project.path)),
             project_agents=merged_agents,
             max_turns=20,
             session_id=resume_session_id,
@@ -690,13 +698,15 @@ PROJECT_AGENT_RESPONSE_RULES = """
 3. 在没有至少完成一次仓库内检索（Read/Grep/Glob/Bash/结构化记忆检索）之前，不允许直接向用户追问。
 4. 如果必须追问，先简短说明你已经检查过什么，再只问最少必要的问题，通常 1 个，而且必须先给出已确认的部分结论。
 5. 如果问题存在多层实现或多个可能口径，优先先给出你已经能确认的部分结论，再说明还缺哪一个关键信息。
-6. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
-7. `format=rich` 示例：
+6. 对 ONES / 现场问题，先做证据完整性检查。若缺少问题时间、相关日志/异常堆栈、业务 ID、配置截图/配置片段等关键证据，先要求最小补料，不要直接分析根因。
+7. 对 ONES / 现场问题，现场证据只能来自当前工单、当前会话补料和仓库内能确认的代码/配置事实。不要把本机或仓库里其他无关历史日志当作现场证据；若引用，只能标注为实现参考。
+8. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
+9. `format=rich` 示例：
    {"format":"rich","title":"标题","summary":"一句话总结","sections":[{"title":"结论","content":"核心结论"},{"title":"说明","content":"补充说明"}],"table":{"columns":[{"key":"item","label":"检查项","type":"text"}],"rows":[{"item":"配置"}]},"fallback_text":"纯文本兜底"}
-8. `format=flow` 示例：
+10. `format=flow` 示例：
    {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[开始]-->B[结束]","fallback_text":"纯文本兜底"}
-9. 闲聊、问候、极短确认可以继续输出自然语言正文。
-10. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
+11. 闲聊、问候、极短确认可以继续输出自然语言正文。
+12. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
 """.strip()
 
 # Orchestrator: separate MCP server with limited tools only.

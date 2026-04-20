@@ -34,6 +34,8 @@ KEY_FIELDS = (
     "FMS/RIoT版本",
     "SROS版本",
     "SRC/SRTOS版本",
+    "一级问题根因分类",
+    "产品名称-底盘/软件",
     "现场临时处理方案",
     "进展更新",
 )
@@ -45,13 +47,6 @@ PROJECT_ALIASES = {
 }
 PROJECT_DOMAIN_KEYWORDS = {
     "allspark": (
-        "调度",
-        "自动充电",
-        "充电任务",
-        "充电桩",
-        "订单",
-        "停靠点",
-        "导航",
         "reservation",
         "mapf",
         "mrs",
@@ -84,6 +79,32 @@ PROJECT_DOMAIN_KEYWORDS = {
         "安装",
         "supervisord",
         "makefile",
+    ),
+}
+PROJECT_GENERIC_DOMAIN_KEYWORDS = {
+    "allspark": (
+        "调度",
+        "自动充电",
+        "充电任务",
+        "充电桩",
+        "停靠点",
+        "导航",
+        "快速充电",
+    ),
+    "riot-standalone": (
+        "自动充电",
+        "充电任务",
+        "充电桩",
+        "停靠点",
+        "快速充电",
+    ),
+    "fms-java": (
+        "自动充电",
+        "充电任务",
+        "充电桩",
+        "停靠点",
+        "快速充电",
+        "电量阈值",
     ),
 }
 VERSION_MAJOR_TO_PROJECT = {
@@ -122,10 +143,13 @@ class OnesRouteDecision:
         return (
             f"用户直接发送了一个 ONES 工单链接，系统已将该请求预路由到项目 `{self.project_name}`。\n"
             "不要先要求用户重新解释项目，也不要先要求用户重新粘贴 ONES 链接。\n"
-            "先基于当前项目代码库和下面的 ONES 摘要开始工作；如果当前项目里有 ONES 相关 skill，可直接使用补全附件和评论。\n\n"
+            "处理顺序必须是：先检查证据是否完整，再决定是否开始分析；如果缺少关键证据，就先要求最小补料，不要直接下结论。\n"
+            "现场证据只能来自当前 ONES 工单、当前会话里用户提供的日志/截图/附件，以及你在仓库里能确认的代码/配置事实。\n"
+            "不要把本机或仓库里其他无关历史日志当成现场证据；这类日志最多只能作为实现参考，并且必须明确区分。\n"
+            "如果当前项目里有 ONES 相关 skill，可直接使用补全附件和评论。\n\n"
             f"原始用户消息:\n{user_message}\n\n"
             f"ONES 摘要:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-            "请直接开始分析。只有在缺少会改变结论的关键上下文时，最后再追问。"
+            "只有在证据完整时才开始分析。若仍缺少会改变结论的关键上下文，最后只问最少必要的问题。"
         )
 
 
@@ -222,8 +246,58 @@ def _named_fields(task: dict[str, Any], fields: list[dict[str, Any]]) -> dict[st
     for item in task.get("field_values", []):
         field = by_uuid.get(item.get("field_uuid"))
         if field:
-            result[field.get("name", item["field_uuid"])] = item.get("value")
+            result[field.get("name", item["field_uuid"])] = _decode_field_value(item.get("value"), field)
     return result
+
+
+def _field_option_map(field: dict[str, Any]) -> dict[str, str]:
+    options = field.get("options") or []
+    if not isinstance(options, list):
+        return {}
+    result: dict[str, str] = {}
+    for option in options:
+        uuid = str(option.get("uuid") or "").strip()
+        value = str(option.get("value") or "").strip()
+        if uuid and value:
+            result[uuid] = value
+    return result
+
+
+def _decode_field_value(value: Any, field: dict[str, Any]) -> Any:
+    option_map = _field_option_map(field)
+    if not option_map:
+        return value
+    if isinstance(value, list):
+        decoded = [option_map.get(str(item).strip(), item) for item in value]
+        return decoded
+    return option_map.get(str(value).strip(), value)
+
+
+def _stringify_field_value(value: Any) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def _collect_version_project_hints(key_fields: dict[str, Any]) -> list[dict[str, str]]:
+    hints: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for field_name in VERSION_FIELDS:
+        rendered = _stringify_field_value(key_fields.get(field_name))
+        major = _major_version(rendered)
+        hinted_project = VERSION_MAJOR_TO_PROJECT.get(major)
+        if not hinted_project:
+            continue
+        key = (field_name, rendered, hinted_project)
+        if key in seen:
+            continue
+        seen.add(key)
+        hints.append({
+            "field": field_name,
+            "value": rendered,
+            "project": hinted_project,
+        })
+    return hints
 
 
 def _major_version(value: str | None) -> int | None:
@@ -284,18 +358,23 @@ def score_project_routes(
     for project_name, keywords in PROJECT_DOMAIN_KEYWORDS.items():
         hits = [keyword for keyword in keywords if keyword.lower() in blob_lower]
         if hits:
-            domain_score = min(len(hits) * 2, 8)
-            if project_name == "allsparkbox" and len(hits) >= 2:
-                domain_score += 2
+            domain_score = min(len(hits) * 3, 6)
             scores[project_name] += domain_score
-            reasons[project_name].append(f"命中领域关键词: {', '.join(hits[:4])}")
+            reasons[project_name].append(f"命中特征领域关键词: {', '.join(hits[:4])}")
 
-    for field_name in VERSION_FIELDS:
-        major = _major_version(str(key_fields.get(field_name) or ""))
-        hinted_project = VERSION_MAJOR_TO_PROJECT.get(major)
-        if hinted_project:
-            scores[hinted_project] += 4
-            reasons[hinted_project].append(f"{field_name} 命中 {major}.x 版本线索")
+    for project_name, keywords in PROJECT_GENERIC_DOMAIN_KEYWORDS.items():
+        hits = [keyword for keyword in keywords if keyword.lower() in blob_lower]
+        if hits:
+            domain_score = min(len(hits), 2)
+            scores[project_name] += domain_score
+            reasons[project_name].append(f"命中通用领域关键词: {', '.join(hits[:4])}")
+
+    for hint in _collect_version_project_hints(key_fields):
+        weight = 6 if hint["field"] == "所属迭代" else 4
+        scores[hint["project"]] += weight
+        reasons[hint["project"]].append(
+            f"{hint['field']} 命中 {hint['value']} -> {hint['project']}"
+        )
 
     return {
         name: {"score": scores[name], "reasons": reasons[name]}
@@ -325,12 +404,22 @@ def choose_project_route(
     second_score = ordered[1][1]["score"] if len(ordered) > 1 else 0
     top_score = top_meta["score"]
     margin = top_score - second_score
+    version_hints = _collect_version_project_hints(key_fields)
+    version_projects = {item["project"] for item in version_hints}
 
     confidence = "low"
     if top_score >= 6 and margin >= 2:
         confidence = "high"
     elif top_score >= 4 and margin >= 2:
         confidence = "medium"
+
+    if len(version_projects) > 1 and (top_score < 14 or margin < 6):
+        conflict_reason = "版本线索冲突: " + "; ".join(
+            f"{item['field']}={item['value']} -> {item['project']}"
+            for item in version_hints
+        )
+        reasons = [*top_meta["reasons"], conflict_reason]
+        return None, "low", top_score, reasons
 
     if confidence == "low":
         return None, confidence, top_score, top_meta["reasons"]
@@ -400,7 +489,7 @@ async def try_direct_project_route(user_message: str) -> OnesRouteDecision | Non
         user_message=user_message,
         task_summary=str(task.get("summary") or ""),
         task_description=str(task.get("desc") or ""),
-        ones_project_name=str(task.get("project_uuid") or ""),
+        ones_project_name=ones_project_name,
         business_project_name=business_project_name,
         key_fields=key_fields,
     )

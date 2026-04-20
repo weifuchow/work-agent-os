@@ -15,6 +15,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,13 @@ from urllib import request as urlrequest
 import aiosqlite
 from loguru import logger
 
-from core.config import settings, get_agent_runtime_override
+from core.config import (
+    get_agent_runtime_override,
+    get_default_model_for_runtime,
+    get_model_override,
+    load_models_config,
+    settings,
+)
 from core.orchestrator.agent_runtime import (
     DEFAULT_AGENT_RUNTIME,
     get_agent_run_runtime_type,
@@ -253,6 +260,78 @@ def _should_cardify_text_reply(text: str, classified_type: str | None) -> bool:
     return bool(stripped)
 
 
+def _infer_reply_reasoning_level(
+    model_id: str | None,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_model = str(model_id or "").strip().lower()
+    usage = usage if isinstance(usage, dict) else {}
+
+    try:
+        reasoning_tokens = int(usage.get("reasoning_output_tokens") or 0)
+    except (TypeError, ValueError):
+        reasoning_tokens = 0
+
+    if reasoning_tokens >= 1800:
+        level = "high"
+    elif reasoning_tokens >= 400:
+        level = "medium"
+    elif any(marker in normalized_model for marker in ("haiku", "mini", "flash", "nano")):
+        level = "low"
+    elif any(marker in normalized_model for marker in ("opus", "gpt-5.4", "o3", "o4")):
+        level = "high"
+    elif normalized_model:
+        level = "medium"
+    else:
+        level = "medium"
+
+    return {
+        "model": model_id or "",
+        "reasoning_level": level,
+        "reasoning_output_tokens": reasoning_tokens,
+    }
+
+
+def _select_reply_presentation(
+    content: Any,
+    *,
+    classified_type: str | None,
+    model_id: str | None,
+    usage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(content, dict):
+        explicit = str(
+            content.get("reply_style")
+            or content.get("card_variant")
+            or content.get("presentation")
+            or ""
+        ).strip()
+        if explicit:
+            reasoning = _infer_reply_reasoning_level(model_id, usage)
+            return {
+                "variant": explicit,
+                "model": reasoning["model"],
+                "reasoning_level": reasoning["reasoning_level"],
+                "reasoning_output_tokens": reasoning["reasoning_output_tokens"],
+            }
+
+    reasoning = _infer_reply_reasoning_level(model_id, usage)
+    variant = "plain"
+    if classified_type in {"work_question", "urgent_issue", "task_request"}:
+        if reasoning["reasoning_level"] == "low":
+            variant = "plain"
+        elif reasoning["reasoning_level"] == "high":
+            variant = "deep"
+        else:
+            variant = "standard"
+    return {
+        "variant": variant,
+        "model": reasoning["model"],
+        "reasoning_level": reasoning["reasoning_level"],
+        "reasoning_output_tokens": reasoning["reasoning_output_tokens"],
+    }
+
+
 def _normalize_flow_table(table: dict[str, Any]) -> dict[str, Any] | None:
     rows = [row for row in (table.get("rows") or []) if isinstance(row, dict)]
     raw_columns = table.get("columns") or []
@@ -406,6 +485,64 @@ def _section_title(title: str) -> dict[str, Any]:
     )
 
 
+def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
+    if not project_context:
+        return []
+
+    display_name = str(
+        getattr(project_context, "business_project_name", "") or getattr(project_context, "running_project", "")
+    ).strip()
+    lines = []
+
+    running_project = str(getattr(project_context, "running_project", "") or "").strip()
+    if running_project:
+        lines.append(f"- 运行的项目：`{running_project}`")
+    if display_name:
+        lines.append(f"- 项目名称：`{display_name}`")
+
+    execution_path = str(getattr(project_context, "execution_path", "") or "").strip()
+    project_path = str(getattr(project_context, "project_path", "") or "").strip()
+    if execution_path:
+        lines.append(f"- 目录：`{execution_path}`")
+    elif project_path:
+        lines.append(f"- 目录：`{project_path}`")
+    if project_path and execution_path and project_path != execution_path:
+        lines.append(f"- 主仓库：`{project_path}`")
+
+    current_branch = str(getattr(project_context, "current_branch", "") or "").strip()
+    if current_branch:
+        lines.append(f"- 当前分支：`{current_branch}`")
+
+    current_version = str(getattr(project_context, "current_version", "") or "").strip()
+    if current_version:
+        lines.append(f"- 当前版本：`{current_version}`")
+
+    target_branch = str(getattr(project_context, "target_branch", "") or "").strip()
+    if target_branch:
+        lines.append(f"- 对齐分支：`{target_branch}`")
+
+    target_tag = str(getattr(project_context, "target_tag", "") or "").strip()
+    if target_tag:
+        lines.append(f"- 对应 Tag：`{target_tag}`")
+
+    version_field = str(getattr(project_context, "version_source_field", "") or "").strip()
+    version_value = str(getattr(project_context, "version_source_value", "") or "").strip()
+    if version_field and version_value:
+        lines.append(f"- 版本线索：`{version_field} = {version_value}`")
+
+    worktree_path = str(getattr(project_context, "recommended_worktree", "") or "").strip()
+    if worktree_path:
+        lines.append(f"- 建议 worktree：`{worktree_path}`")
+
+    if not lines:
+        return []
+
+    return [
+        _section_title("运行信息"),
+        _lark_md_div("\n".join(lines)),
+    ]
+
+
 def _step_block(index: int, title: str, detail: str = "") -> dict[str, Any]:
     block = {
         "tag": "div",
@@ -438,7 +575,13 @@ def _card_title_from_text(text: str) -> str:
     return "工作助理回复"
 
 
-def _build_text_card_payload(text: str, *, title: str | None = None) -> tuple[str, str]:
+def _build_text_card_payload(
+    text: str,
+    *,
+    title: str | None = None,
+    variant: str = "standard",
+    project_context: Any = None,
+) -> tuple[str, str]:
     clean_text = (text or "").strip()
     if not clean_text:
         clean_text = "已处理。"
@@ -448,11 +591,19 @@ def _build_text_card_payload(text: str, *, title: str | None = None) -> tuple[st
     details = "\n\n".join(paragraphs[1:]).strip()
 
     elements: list[dict[str, Any]] = []
-    elements.append(_section_title("概览"))
+    runtime_elements = _project_runtime_elements(project_context)
+    if runtime_elements:
+        elements.extend(runtime_elements)
+    summary_title = "结论" if variant == "deep" else "概览"
+    detail_title = "补充说明" if variant == "deep" else "说明"
+    header_template = "green" if variant == "deep" else "blue"
+    if elements:
+        elements.append(_divider())
+    elements.append(_section_title(summary_title))
     elements.append(_lark_md_div(summary))
     if details:
         elements.append(_divider())
-        elements.append(_section_title("说明"))
+        elements.append(_section_title(detail_title))
         elements.append(_lark_md_div(details))
 
     card = {
@@ -465,7 +616,7 @@ def _build_text_card_payload(text: str, *, title: str | None = None) -> tuple[st
                 "tag": "plain_text",
                 "content": (title or _card_title_from_text(clean_text))[:100],
             },
-            "template": "blue",
+            "template": header_template,
             "padding": "12px 12px 12px 12px",
         },
         "body": {
@@ -544,15 +695,32 @@ def _render_mermaid_to_png(mermaid_source: str) -> Path | None:
     return None
 
 
-def _build_structured_card_payload(payload: dict[str, Any], client: Any) -> tuple[str, str]:
+def _build_structured_card_payload(
+    payload: dict[str, Any],
+    client: Any,
+    *,
+    variant: str = "standard",
+    project_context: Any = None,
+) -> tuple[str, str]:
     card_format = str(payload.get("format", "") or "rich").strip() or "rich"
     title = str(payload.get("title", "") or "").strip() or ("流程说明" if card_format == "flow" else "工作助理回复")
     summary = str(payload.get("summary", "") or "").strip()
     fallback_text = _reply_content_to_text(payload)
+    header_template = {
+        "supplement": "orange",
+        "deep": "green",
+        "standard": "blue",
+        "flow": "blue",
+    }.get(variant, "blue")
 
     elements: list[dict[str, Any]] = []
+    runtime_elements = _project_runtime_elements(project_context)
+    if runtime_elements:
+        elements.extend(runtime_elements)
     if summary:
-        elements.append(_section_title("概览"))
+        if elements:
+            elements.append(_divider())
+        elements.append(_section_title("当前状态" if variant == "supplement" else "概览"))
         elements.append(_lark_md_div(summary))
 
     sections = payload.get("sections") or []
@@ -620,7 +788,7 @@ def _build_structured_card_payload(payload: dict[str, Any], client: Any) -> tupl
                 "tag": "plain_text",
                 "content": title[:100],
             },
-            "template": "blue",
+            "template": header_template,
             "padding": "12px 12px 12px 12px",
         },
         "body": {
@@ -638,12 +806,27 @@ def _prepare_feishu_reply(
     *,
     classified_type: str | None = None,
     topic: str | None = None,
-) -> tuple[str, str, str]:
+    model_id: str | None = None,
+    usage: dict[str, Any] | None = None,
+    project_context: Any = None,
+) -> tuple[str, str, str, dict[str, Any]]:
+    presentation = _select_reply_presentation(
+        content,
+        classified_type=classified_type,
+        model_id=model_id,
+        usage=usage,
+    )
+    variant = str(presentation.get("variant") or "plain")
     if isinstance(content, dict):
         reply_format = content.get("format")
         if reply_format in {"flow", "rich"} or any(key in content for key in ("steps", "sections", "table", "mermaid")):
-            body_content, db_text = _build_structured_card_payload(content, client)
-            return "interactive", body_content, db_text
+            body_content, db_text = _build_structured_card_payload(
+                content,
+                client,
+                variant=variant,
+                project_context=project_context,
+            )
+            return "interactive", body_content, db_text, presentation
 
         msg_type = str(content.get("msg_type") or "").strip()
         raw_content = content.get("content")
@@ -654,14 +837,14 @@ def _prepare_feishu_reply(
             else:
                 text_content = str(raw_content or "")
             db_text = _reply_content_to_text(content) or text_content
-            return "text", text_content, db_text
+            return "text", text_content, db_text, presentation
 
         if msg_type in {"post", "interactive"}:
             if isinstance(raw_content, str):
                 body_content = raw_content
             else:
                 body_content = _safe_json_dumps(raw_content or {})
-            return msg_type, body_content, _reply_content_to_text(content)
+            return msg_type, body_content, _reply_content_to_text(content), presentation
 
         if msg_type == "image":
             image_key = str(content.get("image_key", "") or "").strip()
@@ -672,19 +855,30 @@ def _prepare_feishu_reply(
                 if isinstance(uploaded, str):
                     image_key = uploaded
             if image_key:
-                return "image", _safe_json_dumps({"image_key": image_key}), _reply_content_to_text(content)
+                return "image", _safe_json_dumps({"image_key": image_key}), _reply_content_to_text(content), presentation
 
     text_content = _reply_content_to_text(content)
-    if _should_cardify_text_reply(text_content, classified_type):
-        body_content, db_text = _build_text_card_payload(text_content, title=topic)
-        return "interactive", body_content, db_text
-    return "text", text_content, text_content
+    if variant != "plain" and _should_cardify_text_reply(text_content, classified_type):
+        body_content, db_text = _build_text_card_payload(
+            text_content,
+            title=topic,
+            variant=variant,
+            project_context=project_context,
+        )
+        return "interactive", body_content, db_text, presentation
+    return "text", text_content, text_content, presentation
 
 
 def _get_default_agent_runtime() -> str:
     return normalize_agent_runtime(
         get_agent_runtime_override() or settings.default_agent_runtime or DEFAULT_AGENT_RUNTIME
     )
+
+
+def _get_effective_model_for_runtime(runtime: str | None) -> str | None:
+    resolved_runtime = normalize_agent_runtime(runtime or _get_default_agent_runtime())
+    config = load_models_config()
+    return get_model_override(resolved_runtime) or get_default_model_for_runtime(config, resolved_runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -737,65 +931,131 @@ async def _process_message_locked(message_id: int, msg: dict,
     # 3. Re-read fresh session state (may have been updated by prior message)
     session = await _read_session(session_id) if session_id else None
     analysis_dir: Path | None = None
+    triage_state: dict[str, Any] | None = None
     ones_artifacts: dict[str, Any] | None = None
     if session_id and await _should_prepare_analysis_workspace(msg, session, session_id):
         analysis_dir = await _materialize_analysis_workspace(message_id, msg, session, session_id)
         refreshed = await _read_message(message_id)
         if refreshed:
             msg = refreshed
+    if analysis_dir:
+        triage_state = _load_triage_state(analysis_dir)
     if _ones_link_detected(msg):
         ones_artifacts = await _fetch_ones_task_artifacts(msg)
+    elif analysis_dir:
+        ones_artifacts = _load_ones_artifacts_from_triage_state(analysis_dir)
 
-    # 4. Audit: log before agent call
-    prompt = _build_prompt(msg, session)
-    if ones_artifacts:
-        prompt += _build_ones_artifact_context(ones_artifacts)
-    if analysis_dir:
-        prompt += (
-            f"\n\n[分析工作目录] {analysis_dir}"
-            f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
-        )
-    await _audit("pipeline_agent_call", "message", str(message_id), {
-        "message_id": message_id,
-        "session": session,
-        "prompt": prompt[:2000],
-    })
-
-    # 5. Run agent (project resume, direct ONES route, or orchestrator)
     agent_sid = session["agent_session_id"] if session else None
     project = session["project"] if session else ""
     agent_runtime = normalize_agent_runtime(
         (session or {}).get("agent_runtime") or _get_default_agent_runtime()
     )
-    agent_input = _build_agent_input(msg, session, agent_runtime, prompt)
     direct_project = None
     active_project = project
+    project_runtime_context = None
     route_mode = "orchestrator"
 
-    if agent_sid and project:
-        route_mode = "project_resume"
-        result = await _run_project_agent(project, agent_input, agent_sid, runtime=agent_runtime)
-        # Fallback: context overflow → compact session then retry
-        if (
-            agent_runtime == "claude"
-            and result.get("is_error")
-            and result.get("text") == "Prompt is too long"
-        ):
-            from core.projects import get_project as _get_proj
-            proj = _get_proj(project)
-            cwd = str(proj.path) if proj else None
-            if cwd:
-                logger.warning("Pipeline: session {} context overflow, compacting...", agent_sid)
-                compacted = await _compact_agent_session(agent_sid, cwd)
-                if compacted:
-                    await _audit("context_compacted", "session", str(session_id),
-                                  {"agent_session_id": agent_sid, "trigger": "overflow"})
-                    result = await _run_project_agent(project, agent_input, agent_sid)
-                else:
-                    logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
-    else:
+    if not (agent_sid and project):
         direct_project = await _try_direct_project_route(msg, session)
         if direct_project:
+            active_project = direct_project["project_name"]
+
+    ones_check: dict[str, Any] | None = None
+    is_ones_case = bool(ones_artifacts or _ones_link_detected(msg) or ((triage_state or {}).get("ones_context")))
+    if is_ones_case:
+        ones_check = _evaluate_ones_artifact_completeness(msg, ones_artifacts, analysis_dir)
+        if analysis_dir:
+            _persist_ones_context_to_triage_state(
+                analysis_dir,
+                ones_result=ones_artifacts,
+                check=ones_check,
+                project_name=active_project or project,
+            )
+
+    # 4. Audit: log before agent call
+    prompt = _build_prompt(msg, session)
+    if ones_artifacts:
+        prompt += _build_ones_artifact_context(ones_artifacts)
+    if ones_check and ones_check.get("status") == "complete":
+        prompt += _build_ones_evidence_guard_context(ones_check)
+    if analysis_dir:
+        prompt += (
+            f"\n\n[分析工作目录] {analysis_dir}"
+            f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
+        )
+    skip_agent = bool(ones_check and ones_check.get("status") != "complete")
+    if skip_agent:
+        route_mode = "ones_intake_gate"
+        parsed = {
+            "action": "replied",
+            "classified_type": "work_question",
+            "topic": "补充排障材料",
+            "project_name": active_project or project,
+            "reply_content": _build_ones_missing_info_reply(ones_check or {}, active_project or project),
+            "reason": "ones_evidence_incomplete",
+        }
+        result = {
+            "text": _safe_json_dumps(parsed),
+            "session_id": agent_sid,
+            "usage": {},
+            "model": _get_effective_model_for_runtime(agent_runtime),
+            "is_error": False,
+        }
+        await _audit("pipeline_ones_evidence_gate", "message", str(message_id), {
+            "project_name": active_project or project,
+            "missing_items": (ones_check or {}).get("missing_items", []),
+            "evidence_sources": (ones_check or {}).get("evidence_sources", []),
+        })
+    else:
+        await _audit("pipeline_agent_call", "message", str(message_id), {
+            "message_id": message_id,
+            "session": session,
+            "prompt": prompt[:2000],
+        })
+
+        # 5. Run agent (project resume, direct ONES route, or orchestrator)
+        agent_input = _build_agent_input(msg, session, agent_runtime, prompt)
+
+        if agent_sid and project:
+            route_mode = "project_resume"
+            try:
+                from core.projects import prepare_project_runtime_context
+
+                project_runtime_context = prepare_project_runtime_context(project, ones_result=ones_artifacts)
+            except Exception as e:
+                logger.warning("Pipeline: failed to resolve runtime context for {}: {}", project, e)
+                project_runtime_context = None
+            result = await _run_project_agent(
+                project,
+                agent_input,
+                agent_sid,
+                runtime=agent_runtime,
+                runtime_context=project_runtime_context,
+            )
+            # Fallback: context overflow → compact session then retry
+            if (
+                agent_runtime == "claude"
+                and result.get("is_error")
+                and result.get("text") == "Prompt is too long"
+            ):
+                from core.projects import get_project as _get_proj
+                proj = _get_proj(project)
+                cwd = str(proj.path) if proj else None
+                if cwd:
+                    logger.warning("Pipeline: session {} context overflow, compacting...", agent_sid)
+                    compacted = await _compact_agent_session(agent_sid, cwd)
+                    if compacted:
+                        await _audit("context_compacted", "session", str(session_id),
+                                      {"agent_session_id": agent_sid, "trigger": "overflow"})
+                        result = await _run_project_agent(
+                            project,
+                            agent_input,
+                            agent_sid,
+                            runtime_context=project_runtime_context,
+                        )
+                    else:
+                        logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
+        elif direct_project:
             active_project = direct_project["project_name"]
             route_mode = "direct_project"
             await _audit("pipeline_direct_route", "message", str(message_id), {
@@ -809,18 +1069,28 @@ async def _process_message_locked(message_id: int, msg: dict,
             project_prompt = direct_project["prompt"]
             if ones_artifacts:
                 project_prompt += _build_ones_artifact_context(ones_artifacts)
+            if ones_check:
+                project_prompt += _build_ones_evidence_guard_context(ones_check)
+            try:
+                from core.projects import prepare_project_runtime_context
+
+                project_runtime_context = prepare_project_runtime_context(active_project, ones_result=ones_artifacts)
+            except Exception as e:
+                logger.warning("Pipeline: failed to resolve runtime context for {}: {}", active_project, e)
+                project_runtime_context = None
             result = await _run_project_agent(
                 active_project,
                 project_prompt,
                 None,
                 runtime=agent_runtime,
+                runtime_context=project_runtime_context,
             )
         else:
             result = await _run_orchestrator(agent_input, session_id=agent_sid, runtime=agent_runtime)
 
     result_text = result.get("text", "")
     new_agent_sid = result.get("session_id")
-    if active_project:
+    if not skip_agent and active_project:
         parsed = _normalize_project_result(result_text, session=session, project=active_project)
         if _should_retry_project_response(parsed):
             logger.info("Pipeline: project reply for message {} looks like premature clarification, retrying once", message_id)
@@ -830,7 +1100,13 @@ async def _process_message_locked(message_id: int, msg: dict,
                 "最后才允许附带一个最小追问。\n\n"
                 f"用户本轮消息：{direct_project['prompt'] if direct_project else prompt}"
             )
-            retry_result = await _run_project_agent(active_project, retry_prompt, new_agent_sid or agent_sid, runtime=agent_runtime)
+            retry_result = await _run_project_agent(
+                active_project,
+                retry_prompt,
+                new_agent_sid or agent_sid,
+                runtime=agent_runtime,
+                runtime_context=project_runtime_context,
+            )
             result = retry_result
             result_text = retry_result.get("text", "")
             new_agent_sid = retry_result.get("session_id") or new_agent_sid
@@ -848,12 +1124,13 @@ async def _process_message_locked(message_id: int, msg: dict,
         if fresh and fresh.get("agent_session_id"):
             effective_agent_sid = fresh["agent_session_id"]
 
-    await _audit("pipeline_agent_result", "message", str(message_id), {
-        "agent_session_id": effective_agent_sid,
-        "action": parsed.get("action"),
-        "classified_type": parsed.get("classified_type"),
-        "result_text": result_text[:1500],
-    })
+    if not skip_agent:
+        await _audit("pipeline_agent_result", "message", str(message_id), {
+            "agent_session_id": effective_agent_sid,
+            "action": parsed.get("action"),
+            "classified_type": parsed.get("classified_type"),
+            "result_text": result_text[:1500],
+        })
 
     # 7. Deliver reply via feishu (pipeline handles this, not agent)
     reply_content = parsed.get("reply_content", "")
@@ -882,12 +1159,28 @@ async def _process_message_locked(message_id: int, msg: dict,
                                   processed_at=datetime.now().isoformat())
             logger.warning("Pipeline: message {} marked failed — no platform_message_id", message_id)
             return
+        project_context = None
+        project_name_for_reply = str(parsed.get("project_name") or active_project or project or "").strip()
+        if project_name_for_reply:
+            try:
+                from core.projects import prepare_project_runtime_context
+
+                project_context = prepare_project_runtime_context(
+                    project_name_for_reply,
+                    ones_result=ones_artifacts,
+                )
+            except Exception as e:
+                logger.warning("Pipeline: failed to build project runtime context for {}: {}", project_name_for_reply, e)
+
         thread_id, delivered = await _deliver_reply(
             msg,
             reply_content,
             session_id,
             classified_type=parsed.get("classified_type"),
             topic=parsed.get("topic"),
+            reply_model=result.get("model"),
+            reply_usage=result.get("usage"),
+            project_context=project_context,
         )
         await _audit("pipeline_feishu_reply", "message", str(message_id), {
             "delivered": delivered,
@@ -1087,10 +1380,16 @@ async def _run_project_agent(
     prompt: str | AsyncIterable[dict[str, Any]],
     session_id: str | None,
     runtime: str | None = None,
+    runtime_context: Any = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
     from core.orchestrator.agent_client import PROJECT_AGENT_RESPONSE_RULES
-    from core.projects import get_project, merge_skills
+    from core.projects import (
+        build_project_runtime_prompt_block,
+        get_project,
+        merge_skills,
+        prepare_project_runtime_context,
+    )
     from skills import SKILL_REGISTRY
 
     project = get_project(project_name)
@@ -1098,9 +1397,12 @@ async def _run_project_agent(
         logger.warning("Project {} not found, falling back to orchestrator", project_name)
         return await _run_orchestrator(prompt, runtime=runtime)
 
+    runtime_context = runtime_context or prepare_project_runtime_context(project_name)
+    runtime_block = build_project_runtime_prompt_block(runtime_context)
     merged = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
     system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
+        f"{runtime_block}"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
 
@@ -1111,7 +1413,7 @@ async def _run_project_agent(
     return await agent_client.run_for_project(
         prompt=prompt,
         system_prompt=system,
-        project_cwd=str(project.path),
+        project_cwd=str(getattr(runtime_context, "execution_path", project.path)),
         project_agents=merged,
         max_turns=20,
         session_id=session_id,
@@ -1334,8 +1636,19 @@ async def _bind_session_analysis_workspace(session_id: int, triage_dir: Path) ->
 
 def _triage_state_payload(session_id: int, session: dict | None, msg: dict, triage_dir: Path) -> dict[str, Any]:
     now = datetime.now().isoformat()
+    project_runtime: dict[str, Any] = {}
+    project_name = str((session or {}).get("project") or "").strip()
+    if project_name:
+        try:
+            from core.projects import resolve_project_runtime_context
+
+            runtime_context = resolve_project_runtime_context(project_name)
+            project_runtime = runtime_context.to_payload() if runtime_context else {}
+        except Exception:
+            project_runtime = {}
     return {
         "project": (session or {}).get("project", ""),
+        "project_runtime": project_runtime,
         "mode": "structured",
         "phase": "initialized",
         "problem_summary": ((session or {}).get("title") or msg.get("content") or "")[:200],
@@ -1357,6 +1670,31 @@ def _triage_state_payload(session_id: int, session: dict | None, msg: dict, tria
         "created_at": now,
         "updated_at": now,
     }
+
+
+def _triage_state_path(triage_dir: Path) -> Path:
+    return triage_dir / "00-state.json"
+
+
+def _load_triage_state(triage_dir: Path | None) -> dict[str, Any] | None:
+    if not triage_dir:
+        return None
+    state_path = _triage_state_path(triage_dir)
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _save_triage_state(triage_dir: Path, state: dict[str, Any]) -> None:
+    state["updated_at"] = datetime.now().isoformat()
+    _triage_state_path(triage_dir).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_json_artifact(path: Path, payload: dict[str, Any]) -> None:
@@ -1552,6 +1890,370 @@ def _build_ones_artifact_context(ones_result: dict[str, Any] | None) -> str:
         "downloaded_files": downloaded[:12],
     }
     return "\n\n[ONES 下载产物]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+_LOG_ARTIFACT_SUFFIXES = (
+    ".log",
+    ".txt",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".7z",
+)
+_CONFIG_EVIDENCE_KEYWORDS = (
+    "配置",
+    "config",
+    "server.ssl",
+    "jetty",
+    "nginx",
+    "端口",
+    "证书",
+    "ssl",
+    "开关",
+    "参数",
+    "env",
+    "yaml",
+    "yml",
+    "properties",
+)
+_INCIDENT_TIME_KEYWORDS = (
+    "发生问题时间",
+    "问题时间",
+    "故障时间",
+    "发生时间",
+    "时间点",
+)
+_IDENTIFIER_KEYWORDS = (
+    "订单",
+    "任务号",
+    "任务id",
+    "车辆",
+    "车号",
+    "车体",
+    "设备",
+    "机器人",
+    "request id",
+    "request_id",
+    "trace id",
+    "trace_id",
+    "号车",
+    "序列号",
+    "sn",
+)
+
+
+def _stringify_field_value(value: Any) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item is not None)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _collect_ones_text_fragments(ones_result: dict[str, Any] | None, msg: dict | None = None) -> list[str]:
+    fragments: list[str] = []
+    if msg:
+        content = str(msg.get("content") or "").strip()
+        if content:
+            fragments.append(content)
+
+    if not isinstance(ones_result, dict):
+        return fragments
+
+    task = ones_result.get("task") or {}
+    for key in ("summary", "description", "desc"):
+        value = str(task.get(key) or "").strip()
+        if value:
+            fragments.append(value)
+
+    named_fields = ones_result.get("named_fields") or {}
+    if isinstance(named_fields, dict):
+        for key, value in named_fields.items():
+            rendered = _stringify_field_value(value).strip()
+            if rendered:
+                fragments.append(f"{key}: {rendered}")
+
+    project = ones_result.get("project") or {}
+    for key in ("display_name", "business_project_name", "ones_project_name"):
+        value = str(project.get(key) or "").strip()
+        if value:
+            fragments.append(value)
+
+    return fragments
+
+
+def _iter_analysis_workspace_files(analysis_dir: Path | None) -> list[Path]:
+    if not analysis_dir:
+        return []
+    attachments_root = analysis_dir / "01-intake" / "attachments"
+    if not attachments_root.exists():
+        return []
+    return [path for path in attachments_root.rglob("*") if path.is_file()]
+
+
+def _looks_like_log_artifact(label: str, path: str) -> bool:
+    merged = " ".join(part for part in (label, Path(path).name) if part).lower()
+    if any(merged.endswith(suffix) for suffix in _LOG_ARTIFACT_SUFFIXES):
+        return True
+    return any(token in merged for token in ("log", "trace", "stack", "dump", "stderr", "stdout"))
+
+
+def _looks_like_config_artifact(label: str, path: str) -> bool:
+    merged = " ".join(part for part in (label, Path(path).name) if part).lower()
+    return any(token in merged for token in ("config", "配置", "yaml", "yml", "properties", "toml", "ini", "env"))
+
+
+def _contains_problem_time(text: str) -> bool:
+    lowered = text.lower()
+    if any(keyword in text for keyword in _INCIDENT_TIME_KEYWORDS):
+        return True
+    patterns = (
+        r"20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:[日号\sT]+)?\d{1,2}:\d{2}(?::\d{2})?",
+        r"\d{1,2}[-/.月]\d{1,2}(?:[日号\sT]+)?\d{1,2}:\d{2}(?::\d{2})?",
+    )
+    return any(re.search(pattern, text) for pattern in patterns) or "timezone" in lowered or "时区" in text
+
+
+def _contains_business_identifier(text: str) -> bool:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in _IDENTIFIER_KEYWORDS):
+        return True
+    patterns = (
+        r"\b(order|task|vehicle|device|request|trace)[-_ ]?[a-z0-9]{2,}\b",
+        r"\d+号车",
+        r"[A-Z]{2,}-\d{2,}",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _needs_config_evidence(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in text or keyword in lowered for keyword in _CONFIG_EVIDENCE_KEYWORDS)
+
+
+def _ones_requirement_row(item: str) -> tuple[str, str]:
+    mapping = {
+        "问题描述": ("避免只靠标题或猜测分析", "ONES 现象描述、复现步骤、现场表现"),
+        "问题发生时间": ("需要校准日志时间窗和时区", "精确到分钟的故障时间，最好带时区"),
+        "相关日志/异常堆栈": ("证据链不能只靠本地历史日志", "原始日志包、故障时间窗日志、异常堆栈"),
+        "订单/车辆/设备等关键信息": ("需要把现象和业务对象绑定", "订单号、任务号、车辆号、设备号、序列号"),
+        "相关配置截图/配置片段": ("配置类问题必须有配置证据", "配置截图、配置文件片段、环境参数"),
+    }
+    return mapping.get(item, ("需要补齐关键证据", "请提供能直接支撑结论的原始材料"))
+
+
+def _evaluate_ones_artifact_completeness(
+    msg: dict,
+    ones_result: dict[str, Any] | None,
+    analysis_dir: Path | None = None,
+) -> dict[str, Any]:
+    fragments = _collect_ones_text_fragments(ones_result, msg=msg)
+    issue_fragments = _collect_ones_text_fragments(ones_result, msg=None)
+    issue_text = "\n".join(fragment for fragment in (issue_fragments or fragments) if fragment).strip()
+    merged_text = "\n".join(fragment for fragment in fragments if fragment).strip()
+
+    downloaded_files = _collect_ones_downloaded_files(ones_result or {})
+    workspace_files = _iter_analysis_workspace_files(analysis_dir)
+    file_records = downloaded_files + [
+        {
+            "label": path.name,
+            "path": str(path),
+            "uuid": "",
+        }
+        for path in workspace_files
+    ]
+
+    has_description = len(issue_text) >= 40
+    has_problem_time = _contains_problem_time(issue_text)
+    has_log_artifact = any(
+        _looks_like_log_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
+        for item in file_records
+    ) or any(token in issue_text.lower() for token in ("exception", "stack trace", "stacktrace", "报错", "错误码"))
+    has_identifier = _contains_business_identifier(issue_text)
+    needs_config = _needs_config_evidence(issue_text)
+    has_config_evidence = any(
+        _looks_like_config_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
+        for item in file_records
+    ) or any(token in issue_text.lower() for token in ("server.ssl", "jetty", "nginx", "配置", "参数"))
+
+    requirements = [
+        {"key": "description", "label": "问题描述", "present": has_description},
+        {"key": "problem_time", "label": "问题发生时间", "present": has_problem_time},
+        {"key": "related_logs", "label": "相关日志/异常堆栈", "present": has_log_artifact},
+        {"key": "business_identifier", "label": "订单/车辆/设备等关键信息", "present": has_identifier},
+    ]
+    if needs_config:
+        requirements.append({"key": "config_evidence", "label": "相关配置截图/配置片段", "present": has_config_evidence})
+
+    missing_items = [item["label"] for item in requirements if not item["present"]]
+    status = "complete" if not missing_items else "partial"
+
+    evidence_sources: list[str] = []
+    if ones_result:
+        evidence_sources.append("ONES 工单描述")
+    if downloaded_files:
+        evidence_sources.append(f"ONES 附件 {len(downloaded_files)} 个")
+    if workspace_files:
+        evidence_sources.append(f"会话附件 {len(workspace_files)} 个")
+
+    notes = []
+    if missing_items:
+        notes.append("当前证据还不能稳定闭合 ONES 问题的证据链。")
+    notes.append("现场证据只认当前 ONES 工单和当前会话内提供的材料，本地历史日志只能作为实现参考。")
+
+    return {
+        "status": status,
+        "requirements": requirements,
+        "missing_items": missing_items,
+        "needs_config_evidence": needs_config,
+        "problem_time_detected": has_problem_time,
+        "has_related_logs": has_log_artifact,
+        "has_business_identifier": has_identifier,
+        "evidence_sources": evidence_sources,
+        "file_records": file_records[:20],
+        "notes": notes,
+    }
+
+
+def _build_ones_missing_info_reply(check: dict[str, Any], project_name: str = "") -> dict[str, Any]:
+    received_lines = check.get("evidence_sources") or ["仅收到 ONES 链接或简要描述"]
+    missing_items = [str(item).strip() for item in (check.get("missing_items") or []) if str(item).strip()]
+
+    rows = []
+    request_lines: list[str] = []
+    for index, item in enumerate(missing_items, start=1):
+        why, accepted = _ones_requirement_row(item)
+        rows.append({"item": item, "why": why, "accepted": accepted})
+        request_lines.append(f"{index}. {item}：{accepted}")
+
+    summary = "这类 ONES 问题要先补齐最小证据链，再开始分析，避免把本地历史日志误当成现场证据。"
+    if project_name:
+        summary = f"已识别项目为 {project_name}。{summary}"
+
+    fallback_lines = [
+        "当前信息还不完整，先补齐证据再分析。",
+        "已收到：" + "；".join(received_lines),
+    ]
+    if request_lines:
+        fallback_lines.append("请优先补充：")
+        fallback_lines.extend(request_lines)
+
+    return {
+        "format": "rich",
+        "reply_style": "supplement",
+        "title": "证据暂不完整，先补齐材料",
+        "summary": summary,
+        "sections": [
+            {"title": "当前已收到", "content": "\n".join(f"- {line}" for line in received_lines)},
+            {"title": "当前缺口", "content": "\n".join(f"- {item}" for item in missing_items) or "- 暂无"},
+            {"title": "请优先补充", "content": "\n".join(request_lines) or "补充能直接支撑结论的原始材料。"},
+        ],
+        "table": {
+            "columns": [
+                {"key": "item", "label": "补充项", "type": "text"},
+                {"key": "why", "label": "为什么需要", "type": "markdown"},
+                {"key": "accepted", "label": "可接受证据", "type": "markdown"},
+            ],
+            "rows": rows,
+        },
+        "fallback_text": "\n".join(fallback_lines),
+    }
+
+
+def _build_ones_evidence_guard_context(check: dict[str, Any] | None) -> str:
+    if not check:
+        return ""
+    payload = {
+        "gate_status": "ready" if check.get("status") == "complete" else "awaiting_input",
+        "missing_items": check.get("missing_items") or [],
+        "evidence_sources": check.get("evidence_sources") or [],
+        "rules": [
+            "先检查证据完整性，再开始分析。",
+            "现场证据只能来自当前 ONES 工单、当前会话补料和仓库内能确认的代码/配置事实。",
+            "不要把本机或仓库里其他无关历史日志当成现场证据；若引用这类日志，只能标注为实现参考。",
+        ],
+    }
+    return "\n\n[ONES 证据约束]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _persist_ones_context_to_triage_state(
+    triage_dir: Path,
+    *,
+    ones_result: dict[str, Any] | None,
+    check: dict[str, Any],
+    project_name: str = "",
+) -> None:
+    state = _load_triage_state(triage_dir)
+    if not state:
+        return
+
+    paths = (ones_result or {}).get("paths") or {}
+    task = (ones_result or {}).get("task") or {}
+    state["project"] = project_name or state.get("project", "")
+    state["phase"] = "completeness_checked" if check.get("status") == "complete" else "awaiting_input"
+    state["artifact_completeness"] = {
+        "status": check.get("status") or "unknown",
+        "notes": check.get("notes") or [],
+    }
+    state["evidence_chain_status"] = "partial" if check.get("status") == "complete" else "weak"
+    state["confidence"] = "medium" if check.get("status") == "complete" else "low"
+    state["missing_items"] = check.get("missing_items") or []
+    state["target_log_files"] = [
+        str(Path(item.get("path") or "").name)
+        for item in (check.get("file_records") or [])
+        if _looks_like_log_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
+    ][:8]
+    state["ones_context"] = {
+        "task_ref": str(task.get("uuid") or ""),
+        "task_url": str(task.get("url") or ""),
+        "task_json": str(paths.get("task_json") or ""),
+        "report_md": str(paths.get("report_md") or ""),
+        "messages_json": str(paths.get("messages_json") or ""),
+        "evidence_sources": check.get("evidence_sources") or [],
+    }
+    if project_name:
+        try:
+            from core.projects import resolve_project_runtime_context
+
+            runtime_context = resolve_project_runtime_context(project_name, ones_result=ones_result)
+            if runtime_context:
+                state["project_runtime"] = runtime_context.to_payload()
+                if runtime_context.version_source_value or runtime_context.current_version:
+                    state["version_info"] = {
+                        "value": runtime_context.version_source_value or runtime_context.current_version,
+                        "normalized": runtime_context.normalized_version,
+                        "branch": runtime_context.target_branch or runtime_context.current_branch,
+                        "tag": runtime_context.target_tag,
+                        "status": "resolved" if runtime_context.version_source_value else "inferred",
+                    }
+            else:
+                state["project_runtime"] = {}
+        except Exception as e:
+            logger.warning("Pipeline: failed to persist project runtime context for {}: {}", project_name, e)
+    _save_triage_state(triage_dir, state)
+
+
+def _load_ones_artifacts_from_triage_state(triage_dir: Path | None) -> dict[str, Any] | None:
+    state = _load_triage_state(triage_dir)
+    if not state:
+        return None
+    ones_context = state.get("ones_context") or {}
+    task_json = Path(str(ones_context.get("task_json") or "").strip()) if ones_context.get("task_json") else None
+    if task_json and task_json.exists():
+        try:
+            payload = json.loads(task_json.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    task_ref = str(ones_context.get("task_ref") or "").strip()
+    if task_ref:
+        return _find_existing_ones_task_artifacts(task_ref)
+    return None
 
 
 def _should_capture_process_trace(msg: dict, session: dict | None, parsed: dict) -> bool:
@@ -2115,6 +2817,9 @@ async def _deliver_reply(
     *,
     classified_type: str | None = None,
     topic: str | None = None,
+    reply_model: str | None = None,
+    reply_usage: dict[str, Any] | None = None,
+    project_context: Any = None,
 ) -> tuple[str | None, bool]:
     """Send reply to feishu and save to DB. Returns (thread_id, delivered)."""
     delivered = False
@@ -2125,16 +2830,20 @@ async def _deliver_reply(
     try:
         from core.connectors.feishu import FeishuClient
         client = FeishuClient()
-        msg_type, body_content, db_content = _prepare_feishu_reply(
+        msg_type, body_content, db_content, presentation = _prepare_feishu_reply(
             content,
             client,
             classified_type=classified_type,
             topic=topic,
+            model_id=reply_model,
+            usage=reply_usage,
+            project_context=project_context,
         )
         raw_payload = _safe_json_dumps({
             "msg_type": msg_type,
             "content": body_content,
             "db_content": db_content,
+            "presentation": presentation,
         })
         result = client.reply_message(
             message_id=msg["platform_message_id"],

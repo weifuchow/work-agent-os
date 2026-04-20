@@ -16,6 +16,8 @@ Agent SDK calls are mocked at the pipeline boundary (_run_orchestrator / _run_pr
 
 import json
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aiosqlite
@@ -703,6 +705,20 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
         "task_url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
         "task_summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
     }
+    complete_ones = {
+        "task": {
+            "uuid": "1FmsdpJjHT3JPyWL",
+            "summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
+            "description": "发生问题时间：2026-04-07 11:00，11号车无法生成自动充电任务，现场报错日志显示 ReservationConflictException。",
+            "url": direct_route["task_url"],
+        },
+        "named_fields": {
+            "车辆序列号": "2410084",
+        },
+        "paths": {
+            "messages_json": "",
+        },
+    }
 
     project_calls: list[dict] = []
 
@@ -719,6 +735,9 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
         }
 
     with patch("core.pipeline._try_direct_project_route", AsyncMock(return_value=direct_route)), \
+         patch("core.pipeline._fetch_ones_task_artifacts", AsyncMock(return_value=complete_ones)), \
+         patch("core.pipeline._should_prepare_analysis_workspace", AsyncMock(return_value=False)), \
+         patch("core.pipeline._should_capture_process_trace", return_value=False), \
          patch("core.pipeline._run_project_agent", AsyncMock(side_effect=mock_project)) as mock_proj, \
          patch("core.pipeline._run_orchestrator", AsyncMock()) as mock_orch:
         msg_id = await _insert_message(
@@ -737,10 +756,177 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
     assert mock_proj.await_count == 1
     assert project_calls[0]["project_name"] == "allspark"
     assert project_calls[0]["session_id"] is None
-    assert project_calls[0]["prompt"] == direct_route["prompt"]
+    assert direct_route["prompt"] in project_calls[0]["prompt"]
+    assert "[ONES 下载产物]" in project_calls[0]["prompt"]
     assert len(_feishu_replies) == 1
 
     print("\n[PASS] A4: Direct ONES route skips orchestrator and enters project agent")
+
+
+@pytest.mark.asyncio
+async def test_direct_ones_route_prepares_worktree_context_for_kioxia_charge_issue():
+    """The KIOXIA charge-task ONES case should carry a prepared worktree context into the project agent."""
+    from core.pipeline import process_message
+
+    simulated_content = (
+        "#149268 【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务\n"
+        "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL"
+    )
+    direct_route = {
+        "project_name": "fms-java",
+        "prompt": "用户直接发送了 ONES 工单链接，系统已预路由到项目 `fms-java`。",
+        "confidence": "high",
+        "score": 9,
+        "reasons": ["FMS/RIoT版本 命中 4.9.2-186-g96fb6f2f9_20250723 -> fms-java"],
+        "task_ref": "1FmsdpJjHT3JPyWL",
+        "task_url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+        "task_summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
+    }
+    ones_result = {
+        "task": {
+            "uuid": "1FmsdpJjHT3JPyWL",
+            "number": 149268,
+            "summary": direct_route["task_summary"],
+            "description": "发生问题时间：2026-04-07 11:00，11号车在停靠点无法生成自动充电任务。",
+            "url": direct_route["task_url"],
+        },
+        "project": {
+            "display_name": "KIOXIA岩手工厂日本自动搬运复购项目",
+        },
+        "named_fields": {
+            "FMS/RIoT版本": "4.9.2-186-g96fb6f2f9_20250723",
+            "车辆序列号": "2410084",
+        },
+        "paths": {
+            "messages_json": "",
+        },
+    }
+    runtime_context = SimpleNamespace(
+        running_project="fms-java",
+        business_project_name="KIOXIA岩手工厂日本自动搬运复购项目",
+        project_path=Path("D:/standard/riot/fms-java"),
+        execution_path=Path("D:/standard/work-agent-os/.worktrees/fms-java/149268-1FmsdpJjHT3JPyWL-4.9.2"),
+        current_branch="dev",
+        current_version="dev@3cf57f15",
+        target_branch="master",
+        target_tag="v4.9.2",
+        checkout_ref="v4.9.2",
+        version_source_field="FMS/RIoT版本",
+        version_source_value="4.9.2-186-g96fb6f2f9_20250723",
+        recommended_worktree=Path("D:/standard/work-agent-os/.worktrees/fms-java/149268-1FmsdpJjHT3JPyWL-4.9.2"),
+        notes=["已创建 worktree 并检出 v4.9.2"],
+    )
+
+    project_calls: list[dict] = []
+
+    async def mock_project(project_name, prompt, session_id, **kwargs):
+        project_calls.append({
+            "project_name": project_name,
+            "prompt": prompt,
+            "session_id": session_id,
+            "runtime_context": kwargs.get("runtime_context"),
+        })
+        return {
+            "text": "先给出结论：当前更像位置状态丢失导致充电序列生成失败。",
+            "session_id": PROJECT_SESSION_ID,
+            "cost_usd": 0.02,
+        }
+
+    with patch("core.pipeline._try_direct_project_route", AsyncMock(return_value=direct_route)), \
+         patch("core.pipeline._fetch_ones_task_artifacts", AsyncMock(return_value=ones_result)), \
+         patch("core.pipeline._evaluate_ones_artifact_completeness", return_value={
+             "status": "complete",
+             "missing_items": [],
+             "evidence_sources": ["ONES 工单描述", "日志附件 1 个"],
+             "notes": [],
+         }), \
+         patch("core.pipeline._should_prepare_analysis_workspace", AsyncMock(return_value=False)), \
+         patch("core.pipeline._should_capture_process_trace", return_value=False), \
+         patch("core.projects.prepare_project_runtime_context", return_value=runtime_context), \
+         patch("core.pipeline._run_project_agent", AsyncMock(side_effect=mock_project)) as mock_proj, \
+         patch("core.pipeline._run_orchestrator", AsyncMock()) as mock_orch:
+        msg_id = await _insert_message(simulated_content, "m_direct_ones_worktree_001")
+        await process_message(msg_id)
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+
+    assert msg["pipeline_status"] == "completed"
+    assert session["project"] == "fms-java"
+    assert mock_orch.await_count == 0
+    assert mock_proj.await_count == 1
+    assert project_calls[0]["project_name"] == "fms-java"
+    assert project_calls[0]["runtime_context"].execution_path == runtime_context.execution_path
+    assert project_calls[0]["runtime_context"].checkout_ref == "v4.9.2"
+    assert len(_feishu_replies) == 1
+    card = json.loads(_feishu_replies[0]["content"])
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "运行的项目" in card_text
+    assert "目录" in card_text
+    assert "149268-1FmsdpJjHT3JPyWL-4.9.2" in card_text
+    assert "v4.9.2" in card_text
+
+    print("\n[PASS] A4.0: KIOXIA ONES route passes prepared worktree context")
+
+
+@pytest.mark.asyncio
+async def test_incomplete_ones_evidence_blocks_project_analysis():
+    """ONES issues with incomplete evidence should request supplement before analysis."""
+    from core.pipeline import process_message
+
+    direct_route = {
+        "project_name": "allspark",
+        "prompt": "用户直接发送了 ONES 工单链接，系统已预路由到项目 `allspark`。",
+        "confidence": "high",
+        "score": 7,
+        "reasons": ["命中领域关键词: 调度, 自动充电, 充电桩"],
+        "task_ref": "1FmsdpJjHT3JPyWL",
+        "task_url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+        "task_summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
+    }
+    ones_result = {
+        "task": {
+            "uuid": "1FmsdpJjHT3JPyWL",
+            "summary": "【KIOXIA岩手工厂日本自动搬运复购项目】无法生成自动充电任务",
+            "description": "发生问题时间：2026-04-07 11:00，11号车无法生成自动充电任务。",
+            "url": direct_route["task_url"],
+        },
+        "project": {
+            "display_name": "KIOXIA岩手工厂日本自动搬运复购项目",
+        },
+        "named_fields": {
+            "车辆序列号": "2410084",
+        },
+    }
+
+    with patch("core.pipeline._try_direct_project_route", AsyncMock(return_value=direct_route)), \
+         patch("core.pipeline._fetch_ones_task_artifacts", AsyncMock(return_value=ones_result)), \
+         patch("core.pipeline._should_prepare_analysis_workspace", AsyncMock(return_value=False)), \
+         patch("core.pipeline._should_capture_process_trace", return_value=False), \
+         patch("core.pipeline._run_project_agent", AsyncMock()) as mock_proj, \
+         patch("core.pipeline._run_orchestrator", AsyncMock()) as mock_orch:
+        msg_id = await _insert_message(
+            "帮我分析这个 ONES：#149268 https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+            "m_direct_ones_gate_001",
+        )
+        await process_message(msg_id)
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+
+    assert msg["pipeline_status"] == "completed"
+    assert session["project"] == "allspark"
+    assert mock_proj.await_count == 0
+    assert mock_orch.await_count == 0
+    assert len(_feishu_replies) == 1
+    assert _feishu_replies[0]["msg_type"] == "interactive"
+    card = json.loads(_feishu_replies[0]["content"])
+    assert card["header"]["template"] == "orange"
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "请优先补充" in card_text
+    assert "相关日志/异常堆栈" in card_text
+
+    print("\n[PASS] A4.1: Incomplete ONES evidence blocks analysis and requests supplement")
 
 
 @pytest.mark.asyncio
@@ -761,18 +947,36 @@ async def test_direct_ones_route_only_applies_on_first_turn():
         )
         await db.commit()
 
-    with patch("core.pipeline._run_orchestrator", AsyncMock(return_value={
-        "text": json.dumps({
-            "action": "replied",
-            "classified_type": "chat",
-            "topic": "",
-            "project_name": None,
-            "reply_content": "继续按原流程处理。",
-            "reason": "orchestrator fallback",
-        }, ensure_ascii=False),
-        "session_id": ORCH_SESSION_ID,
-        "cost_usd": 0.001,
-    })) as mock_orch, \
+    complete_ones = {
+        "task": {
+            "uuid": "1FmsdpJjHT3JPyWL",
+            "summary": "一个完整的 ONES 工单",
+            "description": "发生问题时间：2026-04-07 11:00，订单 order-123 无法流转，11号车受影响，报错日志包含 ReservationConflictException。",
+            "url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
+        },
+        "named_fields": {
+            "车辆序列号": "2410084",
+        },
+        "paths": {
+            "messages_json": "",
+        },
+    }
+
+    with patch("core.pipeline._fetch_ones_task_artifacts", AsyncMock(return_value=complete_ones)), \
+         patch("core.pipeline._should_prepare_analysis_workspace", AsyncMock(return_value=False)), \
+         patch("core.pipeline._should_capture_process_trace", return_value=False), \
+         patch("core.pipeline._run_orchestrator", AsyncMock(return_value={
+            "text": json.dumps({
+                "action": "replied",
+                "classified_type": "chat",
+                "topic": "",
+                "project_name": None,
+                "reply_content": "继续按原流程处理。",
+                "reason": "orchestrator fallback",
+            }, ensure_ascii=False),
+            "session_id": ORCH_SESSION_ID,
+            "cost_usd": 0.001,
+        })) as mock_orch, \
          patch("core.pipeline._run_project_agent", AsyncMock()) as mock_proj:
         msg_id = await _insert_message(
             "顺便看这个 https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/1FmsdpJjHT3JPyWL",
@@ -1061,6 +1265,88 @@ async def test_work_question_plain_text_is_cardified_for_feishu():
     assert "补充说明" in card_text
 
     print("\n[PASS] C6: Work-question plain text is auto-cardified")
+
+
+@pytest.mark.asyncio
+async def test_structured_card_includes_project_runtime_context():
+    """Project issue cards should expose running project, directory, and ref info."""
+    from core.pipeline import _deliver_reply
+
+    project_context = SimpleNamespace(
+        running_project="fms-java",
+        business_project_name="KIOXIA岩手工厂日本自动搬运复购项目",
+        project_path=Path("D:/standard/riot/fms-java"),
+        current_branch="dev",
+        current_version="dev@3cf57f15",
+        target_branch="master",
+        target_tag="v4.9.2",
+        version_source_field="FMS/RIoT版本",
+        version_source_value="4.9.2-186-g96fb6f2f9_20250723",
+        recommended_worktree=Path("D:/standard/work-agent-os/.worktrees/fms-java/149268-1FmsdpJjHT3JPyWL-4.9.2"),
+    )
+    payload = {
+        "format": "rich",
+        "title": "排查结论",
+        "summary": "当前更像自动充电任务触发链路异常。",
+        "sections": [
+            {"title": "当前结论", "content": "先检查低电量触发与停靠点状态同步链路。"},
+        ],
+        "fallback_text": "当前更像自动充电任务触发链路异常。",
+    }
+
+    thread_id, delivered = await _deliver_reply(
+        {
+            "id": 1,
+            "platform": "feishu",
+            "platform_message_id": "om_runtime_ctx_001",
+            "chat_id": CHAT_ID,
+        },
+        payload,
+        session_id=None,
+        classified_type="work_question",
+        topic="排查结论",
+        project_context=project_context,
+    )
+
+    assert delivered is True
+    assert thread_id == "thread_om_runtime_ctx_001"
+    card = json.loads(_feishu_replies[0]["content"])
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "运行的项目" in card_text
+    assert "fms-java" in card_text
+    assert "目录" in card_text
+    assert "对应 Tag" in card_text
+    assert "建议 worktree" in card_text
+
+    print("\n[PASS] C6.1: Structured project card includes runtime context")
+
+
+@pytest.mark.asyncio
+async def test_low_reasoning_model_keeps_plain_text_reply():
+    """Lightweight models should be allowed to use plain text instead of fixed cards."""
+    from core.pipeline import _deliver_reply
+
+    thread_id, delivered = await _deliver_reply(
+        {
+            "id": 1,
+            "platform": "feishu",
+            "platform_message_id": "om_plain_low_001",
+            "chat_id": CHAT_ID,
+        },
+        "当前更像配置项未生效，先补充对应日志和配置截图。",
+        session_id=None,
+        classified_type="work_question",
+        topic="补料建议",
+        reply_model="claude-haiku-4-5",
+        reply_usage={"reasoning_output_tokens": 0},
+    )
+
+    assert delivered is True
+    assert thread_id == "thread_om_plain_low_001"
+    assert len(_feishu_replies) == 1
+    assert _feishu_replies[0]["msg_type"] == "text"
+
+    print("\n[PASS] C7: Low-reasoning model may keep plain text reply")
 
 
 # ---------------------------------------------------------------------------

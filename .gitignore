@@ -39,6 +39,7 @@ data/sessions/
 # Local temp and logs
 .tmp/
 .triage/
+.worktrees/
 *.log
 
 # Claude Code

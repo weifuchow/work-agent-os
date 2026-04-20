@@ -196,6 +196,70 @@ def test_build_ones_artifact_context_includes_downloaded_files(tmp_path):
     assert "messages.json" in context
 
 
+def test_evaluate_ones_artifact_completeness_flags_missing_logs():
+    import core.pipeline as pipeline_mod
+
+    ones_result = {
+        "task": {
+            "uuid": "task-demo-1",
+            "summary": "订单冻结",
+            "description": "发生问题时间：2026-04-07 11:00，订单 order-123 一直卡住，11号车无法继续执行。",
+        },
+        "named_fields": {
+            "项目名称": "allspark",
+            "车辆序列号": "2410084",
+        },
+    }
+
+    check = pipeline_mod._evaluate_ones_artifact_completeness(
+        {"content": "帮我分析这个 ONES"},
+        ones_result,
+        analysis_dir=None,
+    )
+
+    assert check["status"] == "partial"
+    assert "相关日志/异常堆栈" in check["missing_items"]
+
+
+def test_evaluate_ones_artifact_completeness_accepts_complete_minimum_evidence(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    messages_json = tmp_path / "messages.json"
+    messages_json.write_text(json.dumps({
+        "attachment_downloads": [
+            {
+                "label": "all_log.zip",
+                "path": "D:/tmp/all_log.zip",
+                "uuid": "att-1",
+            }
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    ones_result = {
+        "task": {
+            "uuid": "task-demo-2",
+            "summary": "自动充电任务未生成",
+            "description": "发生问题时间：2026-04-07 11:00，11号车在停靠点无法生成自动充电任务。",
+        },
+        "named_fields": {
+            "车辆序列号": "2410084",
+            "项目名称": "allspark",
+        },
+        "paths": {
+            "messages_json": str(messages_json),
+        },
+    }
+
+    check = pipeline_mod._evaluate_ones_artifact_completeness(
+        {"content": "继续分析这个 ONES"},
+        ones_result,
+        analysis_dir=None,
+    )
+
+    assert check["status"] == "complete"
+    assert check["missing_items"] == []
+
+
 @pytest.mark.asyncio
 async def test_materialize_analysis_workspace_downloads_related_session_media(tmp_path, monkeypatch):
     import core.pipeline as pipeline_mod
