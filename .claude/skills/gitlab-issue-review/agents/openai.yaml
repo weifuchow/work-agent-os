@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitLab Issue Review"
+  short_description: "分析 GitLab issue、MR、ONES 与分支差异工作流"
+  default_prompt: "请用这个技能执行多轮 GitLab issue review：优先通过 glab 读取 issue 和 MR，上来先确认这是问题修复还是新功能，再确认问题调用逻辑；确认前只给阶段性结论，最终优先按 reply_contract 输出 format=rich 卡片；只有在我明确确认后，才生成 review line comments 和 merge 结论：有风险就 blocked，无阻塞风险就 merge_ready。"

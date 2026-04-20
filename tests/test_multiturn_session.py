@@ -14,6 +14,7 @@ All tests run against an isolated in-memory DB.
 Agent SDK calls are mocked at the pipeline boundary (_run_orchestrator / _run_project_agent).
 """
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -1158,6 +1159,75 @@ async def test_project_resume_clarifying_reply_retries_once():
     assert "我先确认一下" not in retry_card_text
 
     print("\n[PASS] C3: Premature clarification triggers one retry before reply")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_project_messages_do_not_leak_internal_tool_errors():
+    """Concurrent messages on the same thread should serialize and sanitize internal tool errors."""
+    THREAD_ID = "thread_project_concurrent"
+
+    async with aiosqlite.connect(TEST_DB_PATH) as db:
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO sessions (session_key, source_platform, source_chat_id, owner_user_id, "
+            "title, project, status, thread_id, agent_session_id, last_active_at, "
+            "message_count, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("key_project_concurrent_001", "feishu", CHAT_ID, SENDER_ID,
+             "allspark 并发测试", "allspark", "open",
+             THREAD_ID, PROJECT_SESSION_ID, now, 2, now, now),
+        )
+        await db.commit()
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def mock_proj(project_name, prompt, session_id, **kwargs):
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            if "并发消息 1" in prompt:
+                await asyncio.sleep(0.05)
+                return {
+                    "text": "user cancelled MCP tool call",
+                    "session_id": PROJECT_SESSION_ID,
+                    "cost_usd": 0.01,
+                }
+            return {
+                "text": "第二条消息正常处理完成。",
+                "session_id": PROJECT_SESSION_ID,
+                "cost_usd": 0.01,
+            }
+        finally:
+            in_flight -= 1
+
+    from core.pipeline import process_message
+
+    with patch("core.pipeline._run_project_agent", AsyncMock(side_effect=mock_proj)), \
+         patch("core.pipeline._run_orchestrator", AsyncMock()):
+
+        msg1_id = await _insert_message("并发消息 1", "m_proj_concurrent_001", thread_id=THREAD_ID)
+        msg2_id = await _insert_message("并发消息 2", "m_proj_concurrent_002", thread_id=THREAD_ID)
+
+        await asyncio.gather(
+            process_message(msg1_id),
+            process_message(msg2_id),
+        )
+
+    assert max_in_flight == 1, f"Expected session lock serialization, got max_in_flight={max_in_flight}"
+    assert len(_feishu_replies) == 2
+    assert "user cancelled MCP tool call" not in _feishu_replies[0]["content"]
+    assert "user cancelled MCP tool call" not in _feishu_replies[1]["content"]
+    assert any("内部调用刚才被中断" in reply["content"] for reply in _feishu_replies)
+    assert any("第二条消息正常处理完成" in reply["content"] for reply in _feishu_replies)
+
+    bot_reply_1 = await _get_message_by_platform_id("reply_m_proj_concurrent_001")
+    bot_reply_2 = await _get_message_by_platform_id("reply_m_proj_concurrent_002")
+    assert "user cancelled MCP tool call" not in bot_reply_1["content"]
+    assert "user cancelled MCP tool call" not in bot_reply_2["content"]
+
+    print("\n[PASS] C3.1: Concurrent project messages serialize and sanitize internal tool errors")
 
 
 @pytest.mark.asyncio

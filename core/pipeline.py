@@ -252,6 +252,38 @@ def _reply_content_to_text(content: Any) -> str:
     return str(content)
 
 
+_INTERNAL_TOOL_ERROR_MARKERS = (
+    "user cancelled mcp tool call",
+    "cancelled mcp tool call",
+    "mcp tool call cancelled",
+    "tool call cancelled",
+    "tool call failed",
+    "mcp error",
+)
+
+
+def _contains_internal_tool_error(content: Any) -> bool:
+    text = _reply_content_to_text(content).strip()
+    if not text:
+        return False
+    lowered = re.sub(r"\s+", " ", text.lower())
+    return any(marker in lowered for marker in _INTERNAL_TOOL_ERROR_MARKERS)
+
+
+def _build_internal_tool_error_reply(
+    *,
+    classified_type: str | None,
+    project_name: str = "",
+) -> str:
+    project_hint = f"`{project_name}` 项目" if project_name else "项目"
+    if classified_type in {"work_question", "urgent_issue", "task_request"}:
+        return (
+            f"{project_hint} 的内部调用刚才被中断了，我这边没有拿到有效结论。"
+            "请先等上一条消息处理完成后再继续发送；如果还需要，我可以重新处理一次。"
+        )
+    return "刚才的内部调用被中断了，请稍后重试。"
+
+
 def _should_cardify_text_reply(text: str, classified_type: str | None) -> bool:
     if classified_type not in {"work_question", "urgent_issue", "task_request"}:
         return False
@@ -1159,8 +1191,22 @@ async def _process_message_locked(message_id: int, msg: dict,
                                   processed_at=datetime.now().isoformat())
             logger.warning("Pipeline: message {} marked failed — no platform_message_id", message_id)
             return
-        project_context = None
         project_name_for_reply = str(parsed.get("project_name") or active_project or project or "").strip()
+        if _contains_internal_tool_error(reply_content):
+            original_reply = _reply_content_to_text(reply_content)
+            reply_content = _build_internal_tool_error_reply(
+                classified_type=parsed.get("classified_type"),
+                project_name=project_name_for_reply,
+            )
+            parsed["reply_content"] = reply_content
+            await _audit("pipeline_internal_tool_error_sanitized", "message", str(message_id), {
+                "project_name": project_name_for_reply,
+                "original_reply": original_reply[:500],
+                "replacement_reply": reply_content,
+                "route_mode": route_mode,
+            })
+
+        project_context = None
         if project_name_for_reply:
             try:
                 from core.projects import prepare_project_runtime_context
@@ -1564,6 +1610,23 @@ _ANALYSIS_KEYWORDS = (
     "5 why",
 )
 
+_REVIEW_KEYWORDS = (
+    "review",
+    "code review",
+    "merge request",
+    "mr 评论",
+    "mr评论",
+    "行评论",
+    "可合并",
+    "能合并",
+    "cherry-pick",
+    "cherrypick",
+    "审查",
+)
+
+_GITLAB_ISSUE_URL_RE = re.compile(r"https?://[^\s]+/-/issues/\d+", flags=re.IGNORECASE)
+_GITLAB_MR_URL_RE = re.compile(r"https?://[^\s]+/-/merge_requests/\d+", flags=re.IGNORECASE)
+
 
 def _analysis_requested(msg: dict) -> bool:
     content = str(msg.get("content") or "").strip().lower()
@@ -1580,6 +1643,14 @@ def _analysis_requested(msg: dict) -> bool:
     return False
 
 
+def _review_requested(msg: dict) -> bool:
+    content = str(msg.get("content") or "").strip()
+    lowered = content.lower()
+    if _GITLAB_ISSUE_URL_RE.search(content) or _GITLAB_MR_URL_RE.search(content):
+        return True
+    return any(keyword in lowered for keyword in _REVIEW_KEYWORDS)
+
+
 def _slugify_text(value: str, max_length: int = 48) -> str:
     normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in (value or "").strip())
     normalized = "-".join(part for part in normalized.split("-") if part)
@@ -1590,13 +1661,18 @@ def _triage_base_dir() -> Path:
     return settings.project_root / ".triage"
 
 
-def _triage_dir_for_session(session_id: int, session: dict | None, msg: dict) -> Path:
+def _review_base_dir() -> Path:
+    return settings.project_root / ".review"
+
+
+def _analysis_dir_for_session(session_id: int, session: dict | None, msg: dict) -> Path:
     existing = str((session or {}).get("analysis_workspace") or "").strip()
     if existing:
         return Path(existing)
     seed = (session or {}).get("title") or (session or {}).get("topic") or str(msg.get("content") or "")
     slug = _slugify_text(seed)
-    return _triage_base_dir() / f"session-{session_id}-{slug}"
+    base_dir = _review_base_dir() if _review_requested(msg) else _triage_base_dir()
+    return base_dir / f"session-{session_id}-{slug}"
 
 
 def _has_media(msg: dict) -> bool:
@@ -1604,12 +1680,14 @@ def _has_media(msg: dict) -> bool:
     return bool(media_info.get("type"))
 
 
-async def _session_has_triage_workspace(session_id: int) -> bool:
-    base = _triage_base_dir()
-    if not base.exists():
-        return False
+async def _session_has_analysis_workspace(session_id: int) -> bool:
     prefix = f"session-{session_id}-"
-    return any(child.is_dir() and child.name.startswith(prefix) for child in base.iterdir())
+    for base in (_triage_base_dir(), _review_base_dir()):
+        if not base.exists():
+            continue
+        if any(child.is_dir() and child.name.startswith(prefix) for child in base.iterdir()):
+            return True
+    return False
 
 
 async def _should_prepare_analysis_workspace(msg: dict, session: dict | None, session_id: int | None) -> bool:
@@ -1617,7 +1695,9 @@ async def _should_prepare_analysis_workspace(msg: dict, session: dict | None, se
         return False
     if session and bool(session.get("analysis_mode")):
         return True
-    if await _session_has_triage_workspace(session_id):
+    if await _session_has_analysis_workspace(session_id):
+        return True
+    if _review_requested(msg):
         return True
     return _analysis_requested(msg)
 
@@ -2264,6 +2344,8 @@ def _should_capture_process_trace(msg: dict, session: dict | None, parsed: dict)
         return True
     if _analysis_requested(msg):
         return True
+    if _review_requested(msg):
+        return True
     if _ones_link_detected(msg):
         return True
     return (parsed.get("classified_type") or "") in {"urgent_issue", "task_request"}
@@ -2687,7 +2769,7 @@ async def _persist_message_media_state(message_id: int, media_info: dict[str, An
 
 
 async def _materialize_analysis_workspace(message_id: int, msg: dict, session: dict | None, session_id: int) -> Path:
-    triage_dir = _triage_dir_for_session(session_id, session, msg)
+    triage_dir = _analysis_dir_for_session(session_id, session, msg)
     intake_dir = triage_dir / "01-intake"
     attachments_dir = intake_dir / "attachments"
     messages_dir = intake_dir / "messages"

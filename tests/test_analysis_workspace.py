@@ -66,6 +66,36 @@ async def test_should_prepare_analysis_workspace_respects_session_level_analysis
     assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=session, session_id=2) is True
 
 
+@pytest.mark.asyncio
+async def test_should_prepare_review_workspace_for_gitlab_issue_link(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
+    monkeypatch.setattr(pipeline_mod, "_review_base_dir", lambda: tmp_path / ".review")
+
+    msg = {
+        "content": "http://git.standard-robots.com/cybertron/allspark/-/issues/1072",
+        "media_info_json": json.dumps({}, ensure_ascii=False),
+    }
+    assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=None, session_id=3) is True
+
+
+def test_analysis_dir_for_review_message_uses_review_base(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
+    monkeypatch.setattr(pipeline_mod, "_review_base_dir", lambda: tmp_path / ".review")
+
+    review_dir = pipeline_mod._analysis_dir_for_session(
+        9,
+        session=None,
+        msg={"content": "http://git.standard-robots.com/cybertron/allspark/-/issues/1072"},
+    )
+
+    assert review_dir.parent == tmp_path / ".review"
+    assert review_dir.name.startswith("session-9-")
+
+
 def test_analysis_requested_for_image_question():
     import core.pipeline as pipeline_mod
 
@@ -325,6 +355,44 @@ async def test_materialize_analysis_workspace_downloads_related_session_media(tm
     media_info = json.loads(refreshed["media_info_json"])
     assert media_info["download_status"] == "downloaded"
     assert refreshed["attachment_path"] == str(files[0].resolve())
+
+
+@pytest.mark.asyncio
+async def test_materialize_review_workspace_uses_review_directory(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    db_file = tmp_path / "app.sqlite"
+    async with aiosqlite.connect(db_file) as db:
+        await db.executescript(_SCHEMA)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO messages (id, platform, platform_message_id, chat_id, sender_id, sender_name, "
+            "message_type, content, received_at, raw_payload, media_info_json, attachment_path, thread_id, root_id, parent_id, "
+            "classified_type, session_id, pipeline_status, pipeline_error, processed_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                1, "feishu", "om_review_001", "oc_x", "ou_x", "tester",
+                "text", "http://git.standard-robots.com/cybertron/allspark/-/issues/1072", now, "",
+                json.dumps({}, ensure_ascii=False),
+                "", "", "", "", None, 1, "pending", "", None, now,
+            ),
+        )
+        await db.commit()
+
+    monkeypatch.setattr(pipeline_mod, "DB_PATH", str(db_file))
+    monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
+    monkeypatch.setattr(pipeline_mod, "_review_base_dir", lambda: tmp_path / ".review")
+
+    review_dir = await pipeline_mod._materialize_analysis_workspace(
+        1,
+        {"id": 1, "content": "http://git.standard-robots.com/cybertron/allspark/-/issues/1072", "platform_message_id": "om_review_001"},
+        {"id": 1, "title": "Issue 1072 review", "topic": "", "project": "allspark"},
+        1,
+    )
+
+    assert review_dir.exists()
+    assert review_dir.parent == tmp_path / ".review"
+    assert (review_dir / "00-state.json").exists()
 
 
 @pytest.mark.asyncio
