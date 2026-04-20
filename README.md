@@ -1,6 +1,6 @@
 # Personal Work Agent OS
 
-Local-first 个人工作助理系统。接入飞书，由 Orchestrator Agent 自主决策处理每条消息 — 分类、路由、分析、回复。依托 Claude Code Agent SDK，模型驱动的 Agentic 架构。
+Local-first 个人工作助理系统。接入飞书，由 Pipeline + Agent runtime 自主处理每条消息：分类、路由、分析、回复。当前同时支持 `claude` 与 `codex` 两种运行时，并通过本地 MCP 工具访问数据库、飞书、项目派发和 GitLab review 工作流。
 
 ## 系统流程
 
@@ -27,8 +27,9 @@ flowchart TB
             direction TB
             Route["route_to_session<br/>查找/创建会话"]
             Link["link_task_context<br/>关联任务上下文"]
-            Dispatch["dispatch_to_project<br/>派发到项目 Agent"]
-            Route --> Link --> Dispatch
+            FastProject["explicit project switch<br/>首轮项目名快速直达"]
+            Dispatch["dispatch_to_project<br/>项目派发 / resume"]
+            Route --> Link --> FastProject --> Dispatch
         end
 
         subgraph Skills["按需调用 Skills (子 Agent)"]
@@ -80,6 +81,8 @@ flowchart TB
 
 ## 已实现功能
 
+> 当前主线阶段能力已基本完成。下面的 Phase 1-9 主要用于回顾已落地里程碑，不再表示项目仍卡在某个阶段；文末只保留少量“后续增强项”作为非阻塞优化方向。
+
 ### Phase 1-5: 基础架构（已完成）
 
 | 能力 | 实现方式 | 状态 |
@@ -121,6 +124,37 @@ flowchart TB
 | 消息表情回应 | 收到消息立即 GLANCE 回应，表示已收到 | ✅ |
 | 多模态消息解析 | image/file/video/audio/post/interactive/sticker 全类型 | ✅ |
 | 处理进度通知 | 话题内持续推送累计思考时间，不盲目重试 | ✅ |
+| 内部工具错误脱敏 | `user cancelled MCP tool call` 等内部文本不再直接发给用户 | ✅ |
+| 首轮项目切换快速路径 | `allspark 项目` / `切到 allspark` 这类短消息直接进入项目 Agent | ✅ |
+| Review 工作区分流 | GitLab issue/MR review 过程与失败记录默认写入 `.review/` | ✅ |
+| GitLab Review Workflow | 支持 issue/MR 上下文抓取、review 状态流、正式评论发布脚本 | ✅ |
+
+### Phase 8: 飞书话题会话跟踪（已完成）
+
+**目标**: 用飞书话题（Thread）替代时间窗口，实现精确的多轮会话关联。
+
+- [x] 解析飞书消息中的 `thread_id` / `root_id` / `parent_id` 字段，入库存储
+- [x] Bot 回复使用 `reply_in_thread=true` 自动创建话题，`thread_id` 回写到 Session
+- [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建
+- [x] `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
+- [x] Session 路由完全由 pipeline 代码层处理（移除 `route_to_session` tool）
+- [x] SDK session resume：有 `agent_session_id` 时传入 `session_id` 恢复上下文
+- [x] 精简 prompt：resume 时只传新消息 + 必要 ID
+
+### Phase 9: 飞书消息体验增强（核心链路已完成）
+
+**已完成**:
+
+- [x] 收到消息立即 GLANCE（👀）表情回应，表示已收到
+- [x] 多模态消息解析：image / file / video / audio / post / interactive / sticker
+- [x] Pipeline prompt 携带 `[多模态内容]` 描述，Agent 可感知媒体类型
+- [x] 图片与文件附件下载：收到 image / file / post 图片时自动下载到本地工作目录
+- [x] 处理进度通知：模型思考中每 5 分钟在话题内推送累计时间（5min/10min/15min...）
+- [x] 智能重试：仅在 agent_run 明确失败时重试，超时不重试
+- [x] 项目注册：allsparkbox（RIOT3 部署构建包）
+- [x] 内部工具错误脱敏，避免把 MCP/tool 取消信息直接回给用户
+- [x] 首轮短消息显式项目切换快速直达
+- [x] GitLab review 首轮流程落盘到 `.review/`
 
 ## 架构
 
@@ -156,10 +190,53 @@ core/
 data/
 ├── models.yaml          多模型配置
 ├── projects.yaml        项目注册
+.review/                 GitLab issue/MR review 工作目录（运行时生成）
+.triage/                 日志/现场问题分析工作目录（运行时生成）
 tests/
 ├── test_multiturn_session.py  单元测试 — pipeline 逻辑（10项，mock agent，秒级）
-└── test_e2e_routing.py        核心能力集成测试 — 真实 API，路由一致性验证（约5分钟）
+├── test_e2e_routing.py        核心能力集成测试 — 真实 API，路由一致性验证（约5分钟）
+├── test_gitlab_issue_review_scripts.py
+└── test_gitlab_review_publish_script.py
 ```
+
+## GitLab Review Workflow
+
+仓库内置了 `.claude/skills/gitlab-issue-review/`，用于处理 GitLab issue / MR review 场景。
+
+当前能力包括：
+
+- 首轮 GitLab review 过程记录默认写入 `.review/`
+- `glab` 优先抓取 issue / MR / notes
+- 多分支 cherry-pick 等价归并
+- `bugfix / feature / mixed` 变更意图识别
+- 固定 `format=rich` 输出契约
+- 只有在用户明确确认后，才允许正式发布 MR 行评论
+
+关键脚本：
+
+```bash
+python .claude/skills/gitlab-issue-review/scripts/init_review.py --project allspark --issue-url <issue-url>
+python .claude/skills/gitlab-issue-review/scripts/collect_issue_context.py --issue-url <issue-url> --state .review/<case>/00-state.json
+python .claude/skills/gitlab-issue-review/scripts/publish_review_comments.py --state .review/<case>/00-state.json --mr-iid <iid> --confirmed
+```
+
+## 当前重点 Workflow Skills
+
+当前项目已经形成两个重点工作流型 skill：
+
+- `ones` 问题分析
+  - 用于 ONES 工单下载、评论/附件补齐、现场证据收集、版本线索识别与问题分析
+  - 适合日志类、现场类、工单类问题
+- `gitlab-issue-review`
+  - 用于 GitLab issue / MR 上下文抓取、代码 review、风险判断、正式 MR 评论发布
+  - 适合问题修复 review、新功能 review、多分支 cherry-pick 归并
+
+这两个 workflow skill 已经是当前项目的主要工作面，后续会继续扩展更多工作流能力，例如：
+
+- 记忆系统深度集成
+- review / triage 结果自动沉淀到结构化记忆
+- 更多项目专用 workflow skill
+- 更强的飞书卡片化输出和审批流
 
 ## 快速开始
 
@@ -180,8 +257,9 @@ python -m uvicorn apps.api.main:app --port 8000  # API 服务
 cd apps/admin-ui && npm install && npm run dev  # 管理后台
 
 # 5. 运行测试
-pytest tests/test_multiturn_session.py -v          # 单元测试（秒级）
-pytest tests/test_e2e_routing.py -v -s -m e2e      # 核心能力测试（真实API，约5分钟）
+pytest tests/test_multiturn_session.py -v
+pytest tests/test_analysis_workspace.py tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py -q
+pytest tests/test_e2e_routing.py -v -s -m e2e
 ```
 
 ## API 端点
@@ -201,6 +279,7 @@ pytest tests/test_e2e_routing.py -v -s -m e2e      # 核心能力测试（真实
 | `POST /api/model/switch` | 运行时模型切换 |
 | `GET /api/agent-runs` | Agent 执行历史 |
 | `GET /api/agent-runs/inflight` | 当前运行中的 Agent |
+| `GET /api/triage/runs` | 分析 / review 工作目录列表 |
 | `GET /api/stats` | 统计概览 |
 | `POST /api/messages/{id}/reprocess` | 重新处理消息 |
 | `POST /api/playground/chat` | 模型测试对话 |
@@ -234,45 +313,18 @@ pytest tests/test_multiturn_session.py -v
 
 ---
 
-## 下阶段计划
+## 后续增强项
 
-### Phase 8: 飞书话题会话跟踪（已完成）
+下面这些不是主线未完成项，而是后续可继续优化的增强能力。
 
-**目标**: 用飞书话题（Thread）替代时间窗口，实现精确的多轮会话关联。
+### 飞书体验增强（可选增强）
 
-- [x] 解析飞书消息中的 `thread_id` / `root_id` / `parent_id` 字段，入库存储
-- [x] Bot 回复使用 `reply_in_thread=true` 自动创建话题，`thread_id` 回写到 Session
-- [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建
-- [x] `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
-- [x] Session 路由完全由 pipeline 代码层处理（移除 `route_to_session` tool）
-- [x] SDK session resume：有 `agent_session_id` 时传入 `session_id` 恢复上下文
-- [x] 精简 prompt：resume 时只传新消息 + 必要 ID
-
-### Phase 9: 飞书消息体验增强（进行中）
-
-**目标**: 提升飞书交互体验感，支持多模态内容处理。
-
-**已完成**:
-
-- [x] 收到消息立即 GLANCE（👀）表情回应，表示已收到
-- [x] 多模态消息解析：image / file / video / audio / post / interactive / sticker
-- [x] Pipeline prompt 携带 `[多模态内容]` 描述，Agent 可感知媒体类型
-- [x] 处理进度通知：模型思考中每 5 分钟在话题内推送累计时间（5min/10min/15min...）
-- [x] 智能重试：仅在 agent_run 明确失败时重试，超时不重试
-- [x] 项目注册：allsparkbox（RIOT3 部署构建包）
-
-**待完成**:
-
-- [ ] 图片下载：收到 image 消息时通过飞书 API 下载图片，传入多模态模型处理
-- [ ] 文件下载：收到 file 消息时下载到本地，读取内容传给 Agent
 - [ ] 图片消息回复：Agent 生成的图片/截图通过飞书发送
 - [ ] 飞书卡片消息回复：正文、分析过程、风险提示分块展示
 - [ ] 草稿消息飞书卡片确认按钮（一键确认/修改）
 - [ ] 管理后台按话题维度展示会话
 
-### Phase 10: 管理后台增强
-
-**目标**: 日常可用的监控和运营界面。
+### 管理后台增强（可选增强）
 
 - [ ] 消息/会话搜索（关键词、发送者、时间范围）
 - [ ] Dashboard Token 消耗折线图 + 消息分类饼图
@@ -280,9 +332,7 @@ pytest tests/test_multiturn_session.py -v
 - [ ] 草稿消息审批界面
 - [ ] 日报预览和编辑
 
-### Phase 11: 稳定性与部署
-
-**目标**: 生产可用。
+### 工程化与部署（可选增强）
 
 - [ ] Docker Compose 一键部署
 - [ ] Token 消耗日预算告警
