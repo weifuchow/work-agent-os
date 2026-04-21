@@ -28,8 +28,9 @@ async def monitor_job():
     from core.monitor import check_running_tasks
     try:
         counts = await check_running_tasks()
-        if counts["stuck"]:
-            logger.warning("Monitor: {} stuck tasks found", counts["stuck"])
+        stuck = int(counts.get("stuck") or 0)
+        if stuck:
+            logger.warning("Monitor: {} stuck tasks found", stuck)
     except Exception as e:
         logger.exception("Monitor job failed: {}", e)
 

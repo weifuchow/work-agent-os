@@ -997,6 +997,51 @@ async def test_direct_ones_route_only_applies_on_first_turn():
 
 
 # ---------------------------------------------------------------------------
+# Test A5.1: Explicit project-switch phrase routes directly to project agent
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_explicit_project_switch_routes_directly_to_project_agent():
+    """A short first-turn project-switch message should bypass orchestrator and enter the project agent."""
+    from core.pipeline import process_message
+
+    project_calls: list[dict] = []
+
+    async def mock_project(project_name, prompt, session_id, **kwargs):
+        project_calls.append({
+            "project_name": project_name,
+            "prompt": prompt,
+            "session_id": session_id,
+        })
+        return {
+            "text": "后续按 allspark（RIOT3/riot3 调度系统）项目处理。你直接发具体问题、需求、日志、报错或工单链接即可。",
+            "session_id": PROJECT_SESSION_ID,
+            "cost_usd": 0.01,
+        }
+
+    with patch("core.pipeline._run_project_agent", AsyncMock(side_effect=mock_project)) as mock_proj, \
+         patch("core.pipeline._run_orchestrator", AsyncMock()) as mock_orch:
+        msg_id = await _insert_message("allspark 项目", "m_direct_project_switch_001")
+        await process_message(msg_id)
+
+    msg = await _get_message(msg_id)
+    session = await _get_session(msg["session_id"])
+
+    assert msg["pipeline_status"] == "completed"
+    assert session["project"] == "allspark"
+    assert session["agent_session_id"] == PROJECT_SESSION_ID
+    assert mock_orch.await_count == 0, "Explicit project switch should bypass orchestrator"
+    assert mock_proj.await_count == 1
+    assert project_calls[0]["project_name"] == "allspark"
+    assert project_calls[0]["session_id"] is None
+    assert "指定后续对话按项目" in project_calls[0]["prompt"]
+    assert len(_feishu_replies) == 1
+    assert "后续按 allspark" in _feishu_replies[0]["content"]
+
+    print("\n[PASS] A5.1: Explicit project switch routes directly to project agent")
+
+
+# ---------------------------------------------------------------------------
 # Test C: agent_session_id stability — not overwritten on resume
 # ---------------------------------------------------------------------------
 

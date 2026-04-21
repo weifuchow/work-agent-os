@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from typing import Callable, Optional
 
 import lark_oapi as lark
@@ -27,22 +28,44 @@ class FeishuClient:
 
     def start_ws(self) -> None:
         """Start WebSocket long-connection to receive events."""
-        from lark_oapi.ws import Client as WsClient
+        reconnect_delay = max(1, int(os.getenv("FEISHU_WS_RECONNECT_DELAY_SECONDS", "3")))
+        logger.info("Starting Feishu WebSocket connection...")
 
-        event_handler = lark.EventDispatcherHandler.builder(
+        while True:
+            try:
+                event_handler = self._build_ws_event_handler()
+                ws_client = self._build_ws_client(event_handler)
+                ws_client.start()
+                logger.warning(
+                    "Feishu WebSocket connection exited, reconnecting in {}s",
+                    reconnect_delay,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Feishu WebSocket connection failed, reconnecting in {}s: {}",
+                    reconnect_delay,
+                    e,
+                )
+            self._sleep_for_ws_reconnect(reconnect_delay)
+
+    def _build_ws_event_handler(self):
+        return lark.EventDispatcherHandler.builder(
             settings.feishu_verification_token,
             settings.feishu_encrypt_key,
         ).register_p2_im_message_receive_v1(self._handle_message_event).build()
 
-        ws_client = WsClient(
+    def _build_ws_client(self, event_handler):
+        from lark_oapi.ws import Client as WsClient
+
+        return WsClient(
             settings.feishu_app_id,
             settings.feishu_app_secret,
             event_handler=event_handler,
             log_level=lark.LogLevel.DEBUG if settings.debug else lark.LogLevel.INFO,
         )
 
-        logger.info("Starting Feishu WebSocket connection...")
-        ws_client.start()
+    def _sleep_for_ws_reconnect(self, delay_seconds: int) -> None:
+        time.sleep(delay_seconds)
 
     def react_to_message(self, message_id: str, emoji: str = "GLANCE") -> bool:
         """Add an emoji reaction to a message.

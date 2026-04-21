@@ -284,6 +284,54 @@ def _build_internal_tool_error_reply(
     return "刚才的内部调用被中断了，请稍后重试。"
 
 
+def _extract_project_aliases(description: str) -> list[str]:
+    text = str(description or "").strip()
+    if not text:
+        return []
+    match = re.search(r"别名[:：]\s*(.+?)(?:。|\n|版本线索|关键词线索)", text)
+    if not match:
+        return []
+    raw = match.group(1)
+    aliases: list[str] = []
+    for item in re.split(r"[、,，/]+", raw):
+        candidate = item.strip()
+        if candidate:
+            aliases.append(candidate)
+    return aliases
+
+
+def _match_explicit_project_switch(content: str) -> tuple[str, str] | None:
+    from core.projects import get_projects
+
+    raw = str(content or "").strip()
+    if not raw:
+        return None
+    normalized = re.sub(r"\s+", "", raw).lower()
+    if len(normalized) > 40:
+        return None
+
+    suffixes = ("项目",)
+    prefixes = ("切到", "切换到", "进入", "用", "按", "后续按", "转到")
+
+    for project in get_projects():
+        candidates = [project.name, *_extract_project_aliases(project.description)]
+        seen: set[str] = set()
+        for token in candidates:
+            normalized_token = re.sub(r"\s+", "", str(token or "")).lower()
+            if not normalized_token or normalized_token in seen:
+                continue
+            seen.add(normalized_token)
+            allowed = {
+                normalized_token,
+                *(prefix + normalized_token for prefix in prefixes),
+                *(normalized_token + suffix for suffix in suffixes),
+                *(prefix + normalized_token + suffix for prefix in prefixes for suffix in suffixes),
+            }
+            if normalized in allowed:
+                return project.name, token
+    return None
+
+
 def _should_cardify_text_reply(text: str, classified_type: str | None) -> bool:
     if classified_type not in {"work_question", "urgent_issue", "task_request"}:
         return False
@@ -982,12 +1030,26 @@ async def _process_message_locked(message_id: int, msg: dict,
     agent_runtime = normalize_agent_runtime(
         (session or {}).get("agent_runtime") or _get_default_agent_runtime()
     )
+    if ones_artifacts:
+        try:
+            await _ensure_ones_summary_snapshot(
+                msg=msg,
+                ones_result=ones_artifacts,
+                runtime=agent_runtime,
+            )
+        except Exception as e:
+            logger.warning("Pipeline: failed to build ONES summary snapshot: {}", e)
     direct_project = None
     active_project = project
     project_runtime_context = None
     route_mode = "orchestrator"
+    known_project_route = _should_route_to_known_project(
+        session,
+        agent_session_id=agent_sid,
+        project_name=project,
+    )
 
-    if not (agent_sid and project):
+    if not (agent_sid and project) and not known_project_route:
         direct_project = await _try_direct_project_route(msg, session)
         if direct_project:
             active_project = direct_project["project_name"]
@@ -1046,7 +1108,14 @@ async def _process_message_locked(message_id: int, msg: dict,
         })
 
         # 5. Run agent (project resume, direct ONES route, or orchestrator)
-        agent_input = _build_agent_input(msg, session, agent_runtime, prompt)
+        agent_images = _collect_agent_image_paths(msg, ones_artifacts)
+        agent_input = _build_agent_input(
+            msg,
+            session,
+            agent_runtime,
+            prompt,
+            ones_result=ones_artifacts,
+        )
 
         if agent_sid and project:
             route_mode = "project_resume"
@@ -1063,6 +1132,7 @@ async def _process_message_locked(message_id: int, msg: dict,
                 agent_sid,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
+                image_paths=agent_images,
             )
             # Fallback: context overflow → compact session then retry
             if (
@@ -1084,9 +1154,32 @@ async def _process_message_locked(message_id: int, msg: dict,
                             agent_input,
                             agent_sid,
                             runtime_context=project_runtime_context,
+                            image_paths=agent_images,
                         )
                     else:
                         logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
+        elif known_project_route:
+            route_mode = "known_project"
+            await _audit("pipeline_known_project_route", "message", str(message_id), {
+                "project_name": project,
+                "session_id": session_id,
+                "agent_session_id": str(agent_sid or ""),
+            })
+            try:
+                from core.projects import prepare_project_runtime_context
+
+                project_runtime_context = prepare_project_runtime_context(project, ones_result=ones_artifacts)
+            except Exception as e:
+                logger.warning("Pipeline: failed to resolve runtime context for {}: {}", project, e)
+                project_runtime_context = None
+            result = await _run_project_agent(
+                project,
+                agent_input,
+                None,
+                runtime=agent_runtime,
+                runtime_context=project_runtime_context,
+                image_paths=agent_images,
+            )
         elif direct_project:
             active_project = direct_project["project_name"]
             route_mode = "direct_project"
@@ -1116,9 +1209,15 @@ async def _process_message_locked(message_id: int, msg: dict,
                 None,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
+                image_paths=agent_images,
             )
         else:
-            result = await _run_orchestrator(agent_input, session_id=agent_sid, runtime=agent_runtime)
+            result = await _run_orchestrator(
+                agent_input,
+                session_id=agent_sid,
+                runtime=agent_runtime,
+                image_paths=agent_images,
+            )
 
     result_text = result.get("text", "")
     new_agent_sid = result.get("session_id")
@@ -1410,6 +1509,7 @@ async def _run_orchestrator(
     prompt: str | AsyncIterable[dict[str, Any]],
     session_id: str | None = None,
     runtime: str | None = None,
+    image_paths: list[str] | None = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
     return await agent_client.run(
@@ -1418,6 +1518,7 @@ async def _run_orchestrator(
         max_turns=30,
         session_id=session_id,
         runtime=runtime,
+        image_paths=image_paths,
     )
 
 
@@ -1427,6 +1528,7 @@ async def _run_project_agent(
     session_id: str | None,
     runtime: str | None = None,
     runtime_context: Any = None,
+    image_paths: list[str] | None = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
     from core.orchestrator.agent_client import PROJECT_AGENT_RESPONSE_RULES
@@ -1464,7 +1566,21 @@ async def _run_project_agent(
         max_turns=20,
         session_id=session_id,
         runtime=runtime,
+        image_paths=image_paths,
     )
+
+
+def _should_route_to_known_project(
+    session: dict | None,
+    *,
+    agent_session_id: str | None,
+    project_name: str | None,
+) -> bool:
+    if not isinstance(session, dict):
+        return False
+    if str(agent_session_id or "").strip():
+        return False
+    return bool(str(project_name or "").strip())
 
 
 async def _try_direct_project_route(msg: dict, session: dict | None) -> dict[str, Any] | None:
@@ -1474,7 +1590,31 @@ async def _try_direct_project_route(msg: dict, session: dict | None) -> dict[str
         return None
 
     content = str(msg.get("content") or "").strip()
-    if not content or "ones." not in content.lower():
+    if not content:
+        return None
+
+    explicit_project = _match_explicit_project_switch(content)
+    if explicit_project:
+        project_name, matched_token = explicit_project
+        project_label = matched_token or project_name
+        prompt = (
+            f"用户首轮消息直接写了 `{content}`，这明确是在指定后续对话按项目 `{project_name}` 处理。"
+            "请不要再做项目识别或反问，直接给一条简短中文回复："
+            f"确认后续已切换到 {project_label} 项目上下文，并提示用户继续发送具体问题、日志、报错、需求或工单链接。"
+            "回复控制在两句话内，不要输出额外分析。"
+        )
+        return {
+            "project_name": project_name,
+            "prompt": prompt,
+            "confidence": "high",
+            "score": 10,
+            "reasons": [f"首轮消息直接命中项目名/别名: {project_label}"],
+            "task_ref": "",
+            "task_url": "",
+            "task_summary": content,
+        }
+
+    if "ones." not in content.lower():
         return None
 
     from core.ones_routing import extract_ones_task_link, try_direct_project_route
@@ -1534,40 +1674,188 @@ def _parse_media_info(msg: dict) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _image_block_from_path(path: Path, mime_type: str = "") -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    resolved_mime = mime_type.strip() or (mimetypes.guess_type(path.name)[0] or "image/png")
+    if not resolved_mime.startswith("image/"):
+        return None
+    try:
+        image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as e:
+        logger.warning("Pipeline: failed to read image attachment {}: {}", path, e)
+        return None
+    return {"type": "image", "data": image_b64, "mimeType": resolved_mime}
+
+
+def _collect_message_multimodal_image_blocks(msg: dict) -> list[dict[str, Any]]:
+    media_info = _parse_media_info(msg)
+    media_type = str(media_info.get("type") or "")
+    paths: list[tuple[str, str]] = []
+    if media_type == "image":
+        local_path = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
+        if local_path:
+            paths.append((local_path, str(media_info.get("mime_type") or "").strip()))
+    elif media_type == "post" and media_info.get("has_image"):
+        local_paths = media_info.get("local_paths") or []
+        if local_paths:
+            paths.extend((str(path), "image/png") for path in local_paths[:3] if str(path).strip())
+        else:
+            local_path = str(media_info.get("local_path") or "").strip()
+            if local_path:
+                paths.append((local_path, str(media_info.get("mime_type") or "").strip()))
+
+    blocks: list[dict[str, Any]] = []
+    for raw_path, mime_type in paths:
+        block = _image_block_from_path(Path(raw_path), mime_type)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _collect_message_multimodal_image_paths(msg: dict) -> list[str]:
+    media_info = _parse_media_info(msg)
+    media_type = str(media_info.get("type") or "")
+    paths: list[str] = []
+    if media_type == "image":
+        local_path = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
+        if local_path:
+            paths.append(local_path)
+    elif media_type == "post" and media_info.get("has_image"):
+        local_paths = media_info.get("local_paths") or []
+        if local_paths:
+            paths.extend(str(path).strip() for path in local_paths[:3] if str(path).strip())
+        else:
+            local_path = str(media_info.get("local_path") or "").strip()
+            if local_path:
+                paths.append(local_path)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(resolved)
+    return result
+
+
+def _collect_ones_multimodal_image_blocks(ones_result: dict[str, Any] | None, limit: int = 4) -> list[dict[str, Any]]:
+    if not isinstance(ones_result, dict):
+        return []
+    snapshot = _load_ones_summary_snapshot(ones_result)
+    if isinstance(snapshot, dict) and snapshot.get("status") == "ready":
+        return []
+    paths = (ones_result.get("paths") or {}) if isinstance(ones_result, dict) else {}
+    messages_json_path = str(paths.get("messages_json") or "").strip()
+    if not messages_json_path:
+        return []
+    try:
+        payload = json.loads(Path(messages_json_path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+
+    image_candidates: list[tuple[str, str]] = []
+    for item in payload.get("description_images", []) or []:
+        path = str(item.get("path") or "").strip()
+        if path:
+            image_candidates.append((path, str(item.get("mime") or "").strip()))
+    for item in payload.get("attachment_downloads", []) or []:
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        mime_type = str(item.get("mime") or "").strip() or (mimetypes.guess_type(path)[0] or "")
+        if mime_type.startswith("image/"):
+            image_candidates.append((path, mime_type))
+
+    blocks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path, mime_type in image_candidates:
+        if raw_path in seen:
+            continue
+        seen.add(raw_path)
+        block = _image_block_from_path(Path(raw_path), mime_type)
+        if block:
+            blocks.append(block)
+        if len(blocks) >= limit:
+            break
+    return blocks
+
+
+def _collect_ones_multimodal_image_paths(ones_result: dict[str, Any] | None, limit: int = 4) -> list[str]:
+    if not isinstance(ones_result, dict):
+        return []
+    snapshot = _load_ones_summary_snapshot(ones_result)
+    if isinstance(snapshot, dict) and snapshot.get("status") == "ready":
+        return []
+    paths = (ones_result.get("paths") or {}) if isinstance(ones_result, dict) else {}
+    messages_json_path = str(paths.get("messages_json") or "").strip()
+    if not messages_json_path:
+        return []
+    try:
+        payload = json.loads(Path(messages_json_path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+
+    image_candidates: list[tuple[str, str]] = []
+    for item in payload.get("description_images", []) or []:
+        path = str(item.get("path") or "").strip()
+        if path:
+            image_candidates.append((path, str(item.get("mime") or "").strip()))
+    for item in payload.get("attachment_downloads", []) or []:
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        mime_type = str(item.get("mime") or "").strip() or (mimetypes.guess_type(path)[0] or "")
+        if mime_type.startswith("image/"):
+            image_candidates.append((path, mime_type))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_path, _mime in image_candidates:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(resolved)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _collect_agent_image_paths(msg: dict, ones_result: dict[str, Any] | None = None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_path in [*_collect_message_multimodal_image_paths(msg), *(_collect_ones_multimodal_image_paths(ones_result) if ones_result else [])]:
+        if raw_path in seen:
+            continue
+        seen.add(raw_path)
+        result.append(raw_path)
+    return result
+
+
 def _build_agent_input(
     msg: dict,
     session: dict | None,
     runtime: str,
     prompt_text: str,
+    *,
+    ones_result: dict[str, Any] | None = None,
 ) -> str | AsyncIterable[dict[str, Any]]:
     if runtime != "claude":
         return prompt_text
 
-    media_info = _parse_media_info(msg)
-    media_type = str(media_info.get("type") or "")
-    if media_type == "image":
-        local_path = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
-    elif media_type == "post" and media_info.get("has_image"):
-        local_paths = media_info.get("local_paths") or []
-        local_path = str(local_paths[0] if local_paths else media_info.get("local_path") or "").strip()
-    else:
-        return prompt_text
-
-    if not local_path:
-        return prompt_text
-
-    image_path = Path(local_path)
-    if not image_path.exists():
-        return prompt_text
-
-    mime_type = str(media_info.get("mime_type") or "").strip() or (
-        mimetypes.guess_type(image_path.name)[0] or "image/png"
-    )
-
-    try:
-        image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    except OSError as e:
-        logger.warning("Pipeline: failed to read image attachment {}: {}", image_path, e)
+    blocks = _collect_message_multimodal_image_blocks(msg)
+    if ones_result:
+        blocks.extend(_collect_ones_multimodal_image_blocks(ones_result))
+    if not blocks:
         return prompt_text
 
     payload = {
@@ -1575,10 +1863,7 @@ def _build_agent_input(
         "session_id": "",
         "message": {
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_text},
-                {"type": "image", "data": image_b64, "mimeType": mime_type},
-            ],
+            "content": [{"type": "text", "text": prompt_text}, *blocks],
         },
         "parent_tool_use_id": None,
     }
@@ -1797,332 +2082,87 @@ def _truncate_text(value: Any, limit: int = 800) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def _ones_link_detected(msg: dict) -> bool:
-    content = str(msg.get("content") or "").strip()
-    if not content or "ones." not in content.lower():
-        return False
-    try:
-        from core.ones_routing import extract_ones_task_link
-    except Exception:
-        return False
-    return bool(extract_ones_task_link(content))
-
-
-def _extract_ones_link(msg: dict) -> str:
-    content = str(msg.get("content") or "").strip()
-    if not content:
-        return ""
-    try:
-        from core.ones_routing import extract_ones_task_link
-    except Exception:
-        return ""
-    extracted = extract_ones_task_link(content)
-    return extracted[2] if extracted else ""
-
-
-def _find_existing_ones_task_artifacts(task_ref: str) -> dict[str, Any] | None:
-    ones_root = settings.project_root / ".ones"
-    if not task_ref or not ones_root.exists():
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    text = str(text or "").strip()
+    if not text:
         return None
-    for task_dir in sorted(ones_root.glob(f"*_{task_ref}")):
-        task_json_path = task_dir / "task.json"
-        if not task_json_path.exists():
-            continue
+
+    candidates = [text]
+    if "```" in text:
+        for block in text.split("```"):
+            block = block.strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            if block:
+                candidates.append(block)
+
+    for candidate in candidates:
         try:
-            payload = json.loads(task_json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, ValueError):
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError, TypeError):
             continue
-        return payload if isinstance(payload, dict) else None
+        if isinstance(parsed, dict):
+            return parsed
+
     return None
 
 
-def _collect_ones_downloaded_files(ones_result: dict[str, Any]) -> list[dict[str, str]]:
-    paths = (ones_result.get("paths") or {}) if isinstance(ones_result, dict) else {}
-    messages_json_path = str(paths.get("messages_json") or "").strip()
-    if not messages_json_path:
-        return []
-    try:
-        payload = json.loads(Path(messages_json_path).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, ValueError):
-        return []
+def _ones_link_detected(msg: dict) -> bool:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.ones_link_detected(msg)
 
-    files: list[dict[str, str]] = []
-    for item in payload.get("description_images", []) or []:
-        path = str(item.get("path") or "").strip()
-        if path:
-            files.append({
-                "label": str(item.get("label") or "").strip() or Path(path).name,
-                "path": path,
-                "uuid": str(item.get("uuid") or "").strip(),
-            })
-    for item in payload.get("attachment_downloads", []) or []:
-        path = str(item.get("path") or "").strip()
-        if path:
-            files.append({
-                "label": str(item.get("label") or "").strip() or Path(path).name,
-                "path": path,
-                "uuid": str(item.get("uuid") or "").strip(),
-            })
-    return files
+
+def _extract_ones_link(msg: dict) -> str:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.extract_ones_link(msg)
+
+
+def _sync_ones_intake_config(ones_intake_mod: Any) -> None:
+    # Keep extracted ONES intake logic aligned with the pipeline's live settings,
+    # including tests that monkeypatch pipeline-local config.
+    ones_intake_mod.settings = settings
+
+
+def _find_existing_ones_task_artifacts(task_ref: str) -> dict[str, Any] | None:
+    from core import ones_intake as ones_intake_mod
+    _sync_ones_intake_config(ones_intake_mod)
+    return ones_intake_mod.find_existing_ones_task_artifacts(task_ref)
+
+
+def _ones_summary_snapshot_path(ones_result: dict[str, Any] | None) -> Path | None:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.ones_summary_snapshot_path(ones_result)
+
+
+def _load_ones_summary_snapshot(ones_result: dict[str, Any] | None) -> dict[str, Any] | None:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.load_ones_summary_snapshot(ones_result)
+
+
+def _collect_ones_downloaded_files(ones_result: dict[str, Any]) -> list[dict[str, str]]:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.collect_ones_downloaded_files(ones_result)
 
 
 def _ones_cli_script_path() -> Path:
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    return codex_home / "skills" / "ones" / "scripts" / "ones_cli.py"
+    from core import ones_intake as ones_intake_mod
+    _sync_ones_intake_config(ones_intake_mod)
+    return ones_intake_mod.ones_cli_script_path()
 
 
 async def _fetch_ones_task_artifacts(msg: dict) -> dict[str, Any] | None:
-    task_url = _extract_ones_link(msg)
-    if not task_url:
-        return None
-
-    try:
-        from core.ones_routing import extract_ones_task_link
-    except Exception:
-        return None
-
-    extracted = extract_ones_task_link(task_url)
-    if not extracted:
-        return None
-    _, task_ref, _ = extracted
-
-    existing = _find_existing_ones_task_artifacts(task_ref)
-    if existing:
-        return existing
-
-    script_path = _ones_cli_script_path()
-    if not script_path.exists():
-        logger.warning("Pipeline: ONES CLI not found at {}", script_path)
-        return None
-
-    def _run_fetch() -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(script_path), "fetch-task", task_url],
-            cwd=str(settings.project_root),
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-
-    try:
-        completed = await asyncio.to_thread(_run_fetch)
-    except Exception as e:
-        logger.warning("Pipeline: ONES fetch-task failed for {}: {}", task_ref, e)
-        return None
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        logger.warning(
-            "Pipeline: ONES fetch-task non-zero for {}: rc={} stdout={} stderr={}",
-            task_ref,
-            completed.returncode,
-            _truncate_text(stdout, limit=400),
-            _truncate_text(stderr, limit=400),
-        )
-        return None
-
-    try:
-        payload = json.loads(completed.stdout or "{}")
-    except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Pipeline: ONES fetch-task output not valid JSON for {}", task_ref)
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("success") is False:
-        logger.warning("Pipeline: ONES fetch-task reported failure for {}: {}", task_ref, payload.get("error"))
-        return None
-    data = payload.get("data")
-    return data if isinstance(data, dict) else payload
+    from core import ones_intake as ones_intake_mod
+    _sync_ones_intake_config(ones_intake_mod)
+    return await ones_intake_mod.fetch_ones_task_artifacts(msg)
 
 
 def _build_ones_artifact_context(ones_result: dict[str, Any] | None) -> str:
-    if not ones_result:
-        return ""
-
-    task = ones_result.get("task") or {}
-    project = ones_result.get("project") or {}
-    counts = ones_result.get("counts") or {}
-    paths = ones_result.get("paths") or {}
-    downloaded = _collect_ones_downloaded_files(ones_result)
-    payload = {
-        "task": {
-            "number": task.get("number"),
-            "uuid": task.get("uuid"),
-            "summary": task.get("summary"),
-            "status_name": task.get("status_name"),
-            "issue_type_name": task.get("issue_type_name"),
-            "url": task.get("url"),
-        },
-        "project": {
-            "display_name": project.get("display_name"),
-            "business_project_name": project.get("business_project_name"),
-            "confidence": project.get("confidence"),
-        },
-        "counts": counts,
-        "paths": {
-            "task_dir": paths.get("task_dir", ""),
-            "task_json": paths.get("task_json", ""),
-            "messages_json": paths.get("messages_json", ""),
-            "report_md": paths.get("report_md", ""),
-        },
-        "downloaded_files": downloaded[:12],
-    }
-    return "\n\n[ONES 下载产物]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-_LOG_ARTIFACT_SUFFIXES = (
-    ".log",
-    ".txt",
-    ".zip",
-    ".gz",
-    ".tar",
-    ".tgz",
-    ".bz2",
-    ".xz",
-    ".7z",
-)
-_CONFIG_EVIDENCE_KEYWORDS = (
-    "配置",
-    "config",
-    "server.ssl",
-    "jetty",
-    "nginx",
-    "端口",
-    "证书",
-    "ssl",
-    "开关",
-    "参数",
-    "env",
-    "yaml",
-    "yml",
-    "properties",
-)
-_INCIDENT_TIME_KEYWORDS = (
-    "发生问题时间",
-    "问题时间",
-    "故障时间",
-    "发生时间",
-    "时间点",
-)
-_IDENTIFIER_KEYWORDS = (
-    "订单",
-    "任务号",
-    "任务id",
-    "车辆",
-    "车号",
-    "车体",
-    "设备",
-    "机器人",
-    "request id",
-    "request_id",
-    "trace id",
-    "trace_id",
-    "号车",
-    "序列号",
-    "sn",
-)
-
-
-def _stringify_field_value(value: Any) -> str:
-    if isinstance(value, list):
-        return " ".join(str(item) for item in value if item is not None)
-    if value is None:
-        return ""
-    return str(value)
-
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.build_ones_artifact_context(ones_result)
 
 def _collect_ones_text_fragments(ones_result: dict[str, Any] | None, msg: dict | None = None) -> list[str]:
-    fragments: list[str] = []
-    if msg:
-        content = str(msg.get("content") or "").strip()
-        if content:
-            fragments.append(content)
-
-    if not isinstance(ones_result, dict):
-        return fragments
-
-    task = ones_result.get("task") or {}
-    for key in ("summary", "description", "desc"):
-        value = str(task.get(key) or "").strip()
-        if value:
-            fragments.append(value)
-
-    named_fields = ones_result.get("named_fields") or {}
-    if isinstance(named_fields, dict):
-        for key, value in named_fields.items():
-            rendered = _stringify_field_value(value).strip()
-            if rendered:
-                fragments.append(f"{key}: {rendered}")
-
-    project = ones_result.get("project") or {}
-    for key in ("display_name", "business_project_name", "ones_project_name"):
-        value = str(project.get(key) or "").strip()
-        if value:
-            fragments.append(value)
-
-    return fragments
-
-
-def _iter_analysis_workspace_files(analysis_dir: Path | None) -> list[Path]:
-    if not analysis_dir:
-        return []
-    attachments_root = analysis_dir / "01-intake" / "attachments"
-    if not attachments_root.exists():
-        return []
-    return [path for path in attachments_root.rglob("*") if path.is_file()]
-
-
-def _looks_like_log_artifact(label: str, path: str) -> bool:
-    merged = " ".join(part for part in (label, Path(path).name) if part).lower()
-    if any(merged.endswith(suffix) for suffix in _LOG_ARTIFACT_SUFFIXES):
-        return True
-    return any(token in merged for token in ("log", "trace", "stack", "dump", "stderr", "stdout"))
-
-
-def _looks_like_config_artifact(label: str, path: str) -> bool:
-    merged = " ".join(part for part in (label, Path(path).name) if part).lower()
-    return any(token in merged for token in ("config", "配置", "yaml", "yml", "properties", "toml", "ini", "env"))
-
-
-def _contains_problem_time(text: str) -> bool:
-    lowered = text.lower()
-    if any(keyword in text for keyword in _INCIDENT_TIME_KEYWORDS):
-        return True
-    patterns = (
-        r"20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:[日号\sT]+)?\d{1,2}:\d{2}(?::\d{2})?",
-        r"\d{1,2}[-/.月]\d{1,2}(?:[日号\sT]+)?\d{1,2}:\d{2}(?::\d{2})?",
-    )
-    return any(re.search(pattern, text) for pattern in patterns) or "timezone" in lowered or "时区" in text
-
-
-def _contains_business_identifier(text: str) -> bool:
-    lowered = text.lower()
-    if any(keyword in lowered for keyword in _IDENTIFIER_KEYWORDS):
-        return True
-    patterns = (
-        r"\b(order|task|vehicle|device|request|trace)[-_ ]?[a-z0-9]{2,}\b",
-        r"\d+号车",
-        r"[A-Z]{2,}-\d{2,}",
-    )
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
-
-
-def _needs_config_evidence(text: str) -> bool:
-    lowered = text.lower()
-    return any(keyword in text or keyword in lowered for keyword in _CONFIG_EVIDENCE_KEYWORDS)
-
-
-def _ones_requirement_row(item: str) -> tuple[str, str]:
-    mapping = {
-        "问题描述": ("避免只靠标题或猜测分析", "ONES 现象描述、复现步骤、现场表现"),
-        "问题发生时间": ("需要校准日志时间窗和时区", "精确到分钟的故障时间，最好带时区"),
-        "相关日志/异常堆栈": ("证据链不能只靠本地历史日志", "原始日志包、故障时间窗日志、异常堆栈"),
-        "订单/车辆/设备等关键信息": ("需要把现象和业务对象绑定", "订单号、任务号、车辆号、设备号、序列号"),
-        "相关配置截图/配置片段": ("配置类问题必须有配置证据", "配置截图、配置文件片段、环境参数"),
-    }
-    return mapping.get(item, ("需要补齐关键证据", "请提供能直接支撑结论的原始材料"))
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.collect_ones_text_fragments(ones_result, msg=msg)
 
 
 def _evaluate_ones_artifact_completeness(
@@ -2130,133 +2170,87 @@ def _evaluate_ones_artifact_completeness(
     ones_result: dict[str, Any] | None,
     analysis_dir: Path | None = None,
 ) -> dict[str, Any]:
-    fragments = _collect_ones_text_fragments(ones_result, msg=msg)
-    issue_fragments = _collect_ones_text_fragments(ones_result, msg=None)
-    issue_text = "\n".join(fragment for fragment in (issue_fragments or fragments) if fragment).strip()
-    merged_text = "\n".join(fragment for fragment in fragments if fragment).strip()
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.evaluate_ones_artifact_completeness(msg, ones_result, analysis_dir)
 
-    downloaded_files = _collect_ones_downloaded_files(ones_result or {})
-    workspace_files = _iter_analysis_workspace_files(analysis_dir)
-    file_records = downloaded_files + [
-        {
-            "label": path.name,
-            "path": str(path),
-            "uuid": "",
-        }
-        for path in workspace_files
-    ]
 
-    has_description = len(issue_text) >= 40
-    has_problem_time = _contains_problem_time(issue_text)
-    has_log_artifact = any(
-        _looks_like_log_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
-        for item in file_records
-    ) or any(token in issue_text.lower() for token in ("exception", "stack trace", "stacktrace", "报错", "错误码"))
-    has_identifier = _contains_business_identifier(issue_text)
-    needs_config = _needs_config_evidence(issue_text)
-    has_config_evidence = any(
-        _looks_like_config_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
-        for item in file_records
-    ) or any(token in issue_text.lower() for token in ("server.ssl", "jetty", "nginx", "配置", "参数"))
+def _build_ones_summary_prompt(ones_result: dict[str, Any], msg: dict | None = None) -> str:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod._build_ones_summary_prompt(ones_result, msg=msg)
 
-    requirements = [
-        {"key": "description", "label": "问题描述", "present": has_description},
-        {"key": "problem_time", "label": "问题发生时间", "present": has_problem_time},
-        {"key": "related_logs", "label": "相关日志/异常堆栈", "present": has_log_artifact},
-        {"key": "business_identifier", "label": "订单/车辆/设备等关键信息", "present": has_identifier},
-    ]
-    if needs_config:
-        requirements.append({"key": "config_evidence", "label": "相关配置截图/配置片段", "present": has_config_evidence})
 
-    missing_items = [item["label"] for item in requirements if not item["present"]]
-    status = "complete" if not missing_items else "partial"
+def _merge_ones_summary_snapshot(
+    *,
+    llm_summary: dict[str, Any] | None,
+    ones_result: dict[str, Any],
+    msg: dict | None = None,
+) -> dict[str, Any]:
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.merge_ones_summary_snapshot(
+        llm_summary=llm_summary,
+        ones_result=ones_result,
+        msg=msg,
+    )
 
-    evidence_sources: list[str] = []
-    if ones_result:
-        evidence_sources.append("ONES 工单描述")
-    if downloaded_files:
-        evidence_sources.append(f"ONES 附件 {len(downloaded_files)} 个")
-    if workspace_files:
-        evidence_sources.append(f"会话附件 {len(workspace_files)} 个")
 
-    notes = []
-    if missing_items:
-        notes.append("当前证据还不能稳定闭合 ONES 问题的证据链。")
-    notes.append("现场证据只认当前 ONES 工单和当前会话内提供的材料，本地历史日志只能作为实现参考。")
+async def _extract_ones_summary_snapshot(
+    *,
+    msg: dict,
+    ones_result: dict[str, Any],
+    runtime: str,
+) -> dict[str, Any] | None:
+    from core import ones_intake as ones_intake_mod
+    from core.orchestrator.agent_client import agent_client
 
-    return {
-        "status": status,
-        "requirements": requirements,
-        "missing_items": missing_items,
-        "needs_config_evidence": needs_config,
-        "problem_time_detected": has_problem_time,
-        "has_related_logs": has_log_artifact,
-        "has_business_identifier": has_identifier,
-        "evidence_sources": evidence_sources,
-        "file_records": file_records[:20],
-        "notes": notes,
-    }
+    async def _run_ones_intake_agent(**kwargs):
+        return await agent_client.run(skill="ones", **kwargs)
+
+    return await ones_intake_mod.extract_ones_summary_snapshot(
+        msg=msg,
+        ones_result=ones_result,
+        runtime=runtime,
+        run_agent=_run_ones_intake_agent,
+        build_agent_input=_build_agent_input,
+        collect_ones_multimodal_image_paths=_collect_ones_multimodal_image_paths,
+    )
+
+
+def _persist_ones_summary_snapshot(ones_result: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    from core import ones_intake as ones_intake_mod
+    ones_intake_mod.persist_ones_summary_snapshot(ones_result, snapshot)
+
+
+async def _ensure_ones_summary_snapshot(
+    *,
+    msg: dict,
+    ones_result: dict[str, Any] | None,
+    runtime: str,
+) -> dict[str, Any] | None:
+    if not isinstance(ones_result, dict):
+        return None
+
+    existing = _load_ones_summary_snapshot(ones_result)
+    if isinstance(existing, dict) and existing.get("status") == "ready":
+        return existing
+
+    snapshot = await _extract_ones_summary_snapshot(
+        msg=msg,
+        ones_result=ones_result,
+        runtime=runtime,
+    )
+    if snapshot:
+        _persist_ones_summary_snapshot(ones_result, snapshot)
+    return snapshot
 
 
 def _build_ones_missing_info_reply(check: dict[str, Any], project_name: str = "") -> dict[str, Any]:
-    received_lines = check.get("evidence_sources") or ["仅收到 ONES 链接或简要描述"]
-    missing_items = [str(item).strip() for item in (check.get("missing_items") or []) if str(item).strip()]
-
-    rows = []
-    request_lines: list[str] = []
-    for index, item in enumerate(missing_items, start=1):
-        why, accepted = _ones_requirement_row(item)
-        rows.append({"item": item, "why": why, "accepted": accepted})
-        request_lines.append(f"{index}. {item}：{accepted}")
-
-    summary = "这类 ONES 问题要先补齐最小证据链，再开始分析，避免把本地历史日志误当成现场证据。"
-    if project_name:
-        summary = f"已识别项目为 {project_name}。{summary}"
-
-    fallback_lines = [
-        "当前信息还不完整，先补齐证据再分析。",
-        "已收到：" + "；".join(received_lines),
-    ]
-    if request_lines:
-        fallback_lines.append("请优先补充：")
-        fallback_lines.extend(request_lines)
-
-    return {
-        "format": "rich",
-        "reply_style": "supplement",
-        "title": "证据暂不完整，先补齐材料",
-        "summary": summary,
-        "sections": [
-            {"title": "当前已收到", "content": "\n".join(f"- {line}" for line in received_lines)},
-            {"title": "当前缺口", "content": "\n".join(f"- {item}" for item in missing_items) or "- 暂无"},
-            {"title": "请优先补充", "content": "\n".join(request_lines) or "补充能直接支撑结论的原始材料。"},
-        ],
-        "table": {
-            "columns": [
-                {"key": "item", "label": "补充项", "type": "text"},
-                {"key": "why", "label": "为什么需要", "type": "markdown"},
-                {"key": "accepted", "label": "可接受证据", "type": "markdown"},
-            ],
-            "rows": rows,
-        },
-        "fallback_text": "\n".join(fallback_lines),
-    }
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.build_ones_missing_info_reply(check, project_name=project_name)
 
 
 def _build_ones_evidence_guard_context(check: dict[str, Any] | None) -> str:
-    if not check:
-        return ""
-    payload = {
-        "gate_status": "ready" if check.get("status") == "complete" else "awaiting_input",
-        "missing_items": check.get("missing_items") or [],
-        "evidence_sources": check.get("evidence_sources") or [],
-        "rules": [
-            "先检查证据完整性，再开始分析。",
-            "现场证据只能来自当前 ONES 工单、当前会话补料和仓库内能确认的代码/配置事实。",
-            "不要把本机或仓库里其他无关历史日志当成现场证据；若引用这类日志，只能标注为实现参考。",
-        ],
-    }
-    return "\n\n[ONES 证据约束]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.build_ones_evidence_guard_context(check)
 
 
 def _persist_ones_context_to_triage_state(
@@ -2266,74 +2260,18 @@ def _persist_ones_context_to_triage_state(
     check: dict[str, Any],
     project_name: str = "",
 ) -> None:
-    state = _load_triage_state(triage_dir)
-    if not state:
-        return
-
-    paths = (ones_result or {}).get("paths") or {}
-    task = (ones_result or {}).get("task") or {}
-    state["project"] = project_name or state.get("project", "")
-    state["phase"] = "completeness_checked" if check.get("status") == "complete" else "awaiting_input"
-    state["artifact_completeness"] = {
-        "status": check.get("status") or "unknown",
-        "notes": check.get("notes") or [],
-    }
-    state["evidence_chain_status"] = "partial" if check.get("status") == "complete" else "weak"
-    state["confidence"] = "medium" if check.get("status") == "complete" else "low"
-    state["missing_items"] = check.get("missing_items") or []
-    state["target_log_files"] = [
-        str(Path(item.get("path") or "").name)
-        for item in (check.get("file_records") or [])
-        if _looks_like_log_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
-    ][:8]
-    state["ones_context"] = {
-        "task_ref": str(task.get("uuid") or ""),
-        "task_url": str(task.get("url") or ""),
-        "task_json": str(paths.get("task_json") or ""),
-        "report_md": str(paths.get("report_md") or ""),
-        "messages_json": str(paths.get("messages_json") or ""),
-        "evidence_sources": check.get("evidence_sources") or [],
-    }
-    if project_name:
-        try:
-            from core.projects import resolve_project_runtime_context
-
-            runtime_context = resolve_project_runtime_context(project_name, ones_result=ones_result)
-            if runtime_context:
-                state["project_runtime"] = runtime_context.to_payload()
-                if runtime_context.version_source_value or runtime_context.current_version:
-                    state["version_info"] = {
-                        "value": runtime_context.version_source_value or runtime_context.current_version,
-                        "normalized": runtime_context.normalized_version,
-                        "branch": runtime_context.target_branch or runtime_context.current_branch,
-                        "tag": runtime_context.target_tag,
-                        "status": "resolved" if runtime_context.version_source_value else "inferred",
-                    }
-            else:
-                state["project_runtime"] = {}
-        except Exception as e:
-            logger.warning("Pipeline: failed to persist project runtime context for {}: {}", project_name, e)
-    _save_triage_state(triage_dir, state)
+    from core import ones_intake as ones_intake_mod
+    ones_intake_mod.persist_ones_context_to_state(
+        triage_dir,
+        ones_result=ones_result,
+        check=check,
+        project_name=project_name,
+    )
 
 
 def _load_ones_artifacts_from_triage_state(triage_dir: Path | None) -> dict[str, Any] | None:
-    state = _load_triage_state(triage_dir)
-    if not state:
-        return None
-    ones_context = state.get("ones_context") or {}
-    task_json = Path(str(ones_context.get("task_json") or "").strip()) if ones_context.get("task_json") else None
-    if task_json and task_json.exists():
-        try:
-            payload = json.loads(task_json.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, ValueError):
-            payload = None
-        if isinstance(payload, dict):
-            return payload
-
-    task_ref = str(ones_context.get("task_ref") or "").strip()
-    if task_ref:
-        return _find_existing_ones_task_artifacts(task_ref)
-    return None
+    from core import ones_intake as ones_intake_mod
+    return ones_intake_mod.load_ones_artifacts_from_state(triage_dir)
 
 
 def _should_capture_process_trace(msg: dict, session: dict | None, parsed: dict) -> bool:

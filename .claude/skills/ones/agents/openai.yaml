@@ -1,0 +1,4 @@
+interface:
+  display_name: "ONES Intake"
+  short_description: "下载 ONES 工单并生成结构化摘要快照"
+  default_prompt: "请用这个技能处理 ONES 工单：先抓工单、评论、附件和描述图，优先读取正文，再结合图片生成 summary_snapshot.json，后续分析优先只消费这份结构化摘要。"

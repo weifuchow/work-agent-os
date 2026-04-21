@@ -198,6 +198,18 @@ async def test_fetch_ones_task_artifacts_uses_existing_task_dir(tmp_path, monkey
     assert payload["paths"]["task_dir"] == str(ones_root)
 
 
+def test_ones_cli_script_path_prefers_repo_skill(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    local_script = tmp_path / ".claude" / "skills" / "ones" / "scripts" / "ones_cli.py"
+    local_script.parent.mkdir(parents=True, exist_ok=True)
+    local_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline_mod, "settings", SimpleNamespace(project_root=tmp_path))
+
+    assert pipeline_mod._ones_cli_script_path() == local_script
+
+
 def test_build_ones_artifact_context_includes_downloaded_files(tmp_path):
     import core.pipeline as pipeline_mod
 
@@ -288,6 +300,177 @@ def test_evaluate_ones_artifact_completeness_accepts_complete_minimum_evidence(t
 
     assert check["status"] == "complete"
     assert check["missing_items"] == []
+
+
+def test_collect_ones_text_fragments_prefers_summary_snapshot():
+    import core.pipeline as pipeline_mod
+
+    ones_result = {
+        "task": {
+            "summary": "原始标题",
+            "description": "原始描述",
+        },
+        "summary_snapshot": {
+            "status": "ready",
+            "summary_text": "结构化摘要：问题发生在站点3，偶发触发失败。",
+            "problem_time": "2026年4月10号上午11:30左右",
+            "version_hint": "RIOT2.0",
+            "version_fields": ["RIOT2.0-field"],
+            "version_from_images": ["RIOT2.0-image"],
+            "version_normalized": "RIOT2.0",
+            "version_evidence": ["fields", "images"],
+            "business_identifiers": ["站点3"],
+            "observations": ["修改站点1/2编号后可触发"],
+            "image_findings": ["版本截图显示 RIOT2.0"],
+        },
+    }
+
+    fragments = pipeline_mod._collect_ones_text_fragments(ones_result, msg={"content": "帮我分析这个 ONES"})
+
+    merged = "\n".join(fragments)
+    assert "结构化摘要：问题发生在站点3" in merged
+    assert "问题发生时间: 2026年4月10号上午11:30左右" in merged
+    assert "版本线索: RIOT2.0" in merged
+    assert "字段版本: RIOT2.0-field" in merged
+    assert "图片版本: RIOT2.0-image" in merged
+    assert "修改站点1/2编号后可触发" in merged
+    assert "版本截图显示 RIOT2.0" in merged
+
+
+def test_collect_ones_multimodal_image_paths_skips_after_snapshot_ready(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    image_path = tmp_path / "desc.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nsnapshot")
+    messages_json = tmp_path / "messages.json"
+    messages_json.write_text(json.dumps({
+        "description_images": [
+            {"label": "desc-img", "path": str(image_path), "uuid": "img-1", "mime": "image/png"},
+        ],
+        "attachment_downloads": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    ones_result = {
+        "paths": {"messages_json": str(messages_json)},
+        "summary_snapshot": {"status": "ready"},
+    }
+
+    assert pipeline_mod._collect_ones_multimodal_image_paths(ones_result) == []
+
+
+def test_should_route_to_known_project_requires_project_without_agent_session():
+    import core.pipeline as pipeline_mod
+
+    assert pipeline_mod._should_route_to_known_project(
+        {"project": "riot-standalone"},
+        agent_session_id="",
+        project_name="riot-standalone",
+    ) is True
+    assert pipeline_mod._should_route_to_known_project(
+        {"project": "riot-standalone"},
+        agent_session_id="sdk-session-1",
+        project_name="riot-standalone",
+    ) is False
+    assert pipeline_mod._should_route_to_known_project(
+        {"project": ""},
+        agent_session_id="",
+        project_name="",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_ones_summary_snapshot_writes_snapshot_and_updates_task_json(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    task_json = tmp_path / "task.json"
+    task_json.write_text(json.dumps({
+        "task": {"uuid": "task-demo-3", "summary": "demo"},
+        "paths": {"task_json": str(task_json), "task_dir": str(tmp_path)},
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    ones_result = {
+        "task": {"uuid": "task-demo-3", "summary": "demo"},
+        "paths": {"task_json": str(task_json), "task_dir": str(tmp_path)},
+    }
+
+    async def fake_extract(*, msg, ones_result, runtime):
+        return {
+            "status": "ready",
+            "summary_text": "结构化摘要",
+            "problem_time": "2026-04-10 11:30",
+            "problem_time_confidence": "high",
+            "version_text": "RIOT2.0",
+            "version_fields": ["RIOT2.0-field"],
+            "version_from_images": ["RIOT2.0-image"],
+            "version_normalized": "RIOT2.0",
+            "version_evidence": ["text", "images"],
+            "business_identifiers": ["站点3"],
+            "observations": ["偶发，一个月一次"],
+            "image_findings": ["截图中版本为 RIOT2.0"],
+            "missing_items": [],
+            "downloaded_files": [],
+            "source": {"text_first": True, "images_consumed": True, "runtime": runtime},
+        }
+
+    monkeypatch.setattr(pipeline_mod, "_extract_ones_summary_snapshot", fake_extract)
+
+    snapshot = await pipeline_mod._ensure_ones_summary_snapshot(
+        msg={"content": "帮我分析这个 ONES"},
+        ones_result=ones_result,
+        runtime="codex",
+    )
+
+    snapshot_path = tmp_path / "summary_snapshot.json"
+    assert snapshot is not None
+    assert snapshot_path.exists()
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert payload["summary_text"] == "结构化摘要"
+    assert payload["version_normalized"] == "RIOT2.0"
+    assert payload["version_fields"] == ["RIOT2.0-field"]
+    assert payload["version_from_images"] == ["RIOT2.0-image"]
+    assert ones_result["summary_snapshot"]["summary_text"] == "结构化摘要"
+
+    updated_task = json.loads(task_json.read_text(encoding="utf-8"))
+    assert updated_task["summary_snapshot"]["summary_text"] == "结构化摘要"
+    assert updated_task["paths"]["summary_snapshot_json"] == str(snapshot_path)
+
+
+def test_merge_ones_summary_snapshot_collects_version_sources():
+    import core.pipeline as pipeline_mod
+
+    ones_result = {
+        "task": {
+            "description_local": "问题出现时间：2026年4月10号上午11:30左右\nRIOT2.0",
+        },
+        "named_fields": {
+            "FMS/RIoT版本": "4.9.2",
+        },
+    }
+
+    merged = pipeline_mod._merge_ones_summary_snapshot(
+        llm_summary={
+            "summary_text": "结构化摘要",
+            "problem_time": "",
+            "version_text": "",
+            "version_fields": [],
+            "version_from_images": ["截图里显示 4.9.2"],
+            "version_normalized": "",
+            "version_evidence": [],
+            "business_identifiers": [],
+            "observations": [],
+            "image_findings": [],
+            "missing_items": [],
+        },
+        ones_result=ones_result,
+        msg={"content": "帮我分析这个 ONES"},
+    )
+
+    assert merged["version_fields"] == ["4.9.2"]
+    assert merged["version_from_images"] == ["截图里显示 4.9.2"]
+    assert merged["version_normalized"] == "2.0"
+    assert "text" in merged["version_evidence"]
+    assert "fields" in merged["version_evidence"]
+    assert "images" in merged["version_evidence"]
 
 
 @pytest.mark.asyncio

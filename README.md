@@ -28,8 +28,9 @@ flowchart TB
             Route["route_to_session<br/>查找/创建会话"]
             Link["link_task_context<br/>关联任务上下文"]
             FastProject["explicit project switch<br/>首轮项目名快速直达"]
+            KnownProject["known project route<br/>已绑定项目补料直达"]
             Dispatch["dispatch_to_project<br/>项目派发 / resume"]
-            Route --> Link --> FastProject --> Dispatch
+            Route --> Link --> FastProject --> KnownProject --> Dispatch
         end
 
         subgraph Skills["按需调用 Skills (子 Agent)"]
@@ -126,8 +127,11 @@ flowchart TB
 | 处理进度通知 | 话题内持续推送累计思考时间，不盲目重试 | ✅ |
 | 内部工具错误脱敏 | `user cancelled MCP tool call` 等内部文本不再直接发给用户 | ✅ |
 | 首轮项目切换快速路径 | `allspark 项目` / `切到 allspark` 这类短消息直接进入项目 Agent | ✅ |
+| 已知项目补料直达 | session 已绑定 project 但还没有 `agent_session_id` 时，补料消息直接进入项目 Agent | ✅ |
 | Review 工作区分流 | GitLab issue/MR review 过程与失败记录默认写入 `.review/` | ✅ |
 | GitLab Review Workflow | 支持 issue/MR 上下文抓取、review 状态流、正式评论发布脚本 | ✅ |
+| Feishu WS 自动重连 | WebSocket 断开后自动重连，不需要人工重启 worker | ✅ |
+| Scheduler 监控健壮性 | `monitor_job` 不再依赖 `counts["stuck"]` 必存在 | ✅ |
 
 ### Phase 8: 飞书话题会话跟踪（已完成）
 
@@ -175,6 +179,7 @@ apps/
 
 core/
 ├── pipeline.py          Orchestrator Agent 入口
+├── ones_intake.py       ONES intake：工单抓取、图片/正文联合摘要、snapshot 持久化
 ├── projects.py          项目注册与发现
 ├── monitor.py           任务进度监控（纯 DB 查询）
 ├── connectors/
@@ -186,6 +191,10 @@ core/
 ├── sessions/            路由/摘要/生命周期
 ├── reports/             日报生成
 └── memory/              长期记忆归档
+
+.claude/skills/
+├── ones/                ONES intake workflow（含本地 ones_cli.py）
+└── gitlab-issue-review/ GitLab review workflow
 
 data/
 ├── models.yaml          多模型配置
@@ -226,6 +235,9 @@ python .claude/skills/gitlab-issue-review/scripts/publish_review_comments.py --s
 
 - `ones` 问题分析
   - 用于 ONES 工单下载、评论/附件补齐、现场证据收集、版本线索识别与问题分析
+  - 当前已经抽为独立 intake：`.claude/skills/ones/` + `core/ones_intake.py`
+  - 本地脚本已随仓库维护：`.claude/skills/ones/scripts/ones_cli.py`
+  - 标准产物落在 `.ones/<task-number>_<task-uuid>/`，核心包括 `task.json`、`messages.json`、`desc_local.md`、`summary_snapshot.json`
   - 适合日志类、现场类、工单类问题
 - `gitlab-issue-review`
   - 用于 GitLab issue / MR 上下文抓取、代码 review、风险判断、正式 MR 评论发布
@@ -254,11 +266,15 @@ python scripts/init_db.py
 # 4. 启动服务
 python -m apps.worker.feishu_worker  # 飞书消息接收
 python -m uvicorn apps.api.main:app --port 8000  # API 服务
+python -m apps.worker.scheduler  # 定时任务
 cd apps/admin-ui && npm install && npm run dev  # 管理后台
+
+# Windows 一键重启
+cmd /c scripts\\restart_all_windows.bat
 
 # 5. 运行测试
 pytest tests/test_multiturn_session.py -v
-pytest tests/test_analysis_workspace.py tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py -q
+pytest tests/test_analysis_workspace.py tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py tests/test_ones_desc_local.py tests/test_service_runtime.py -q
 pytest tests/test_e2e_routing.py -v -s -m e2e
 ```
 

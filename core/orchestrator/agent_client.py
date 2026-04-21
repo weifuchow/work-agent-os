@@ -1059,6 +1059,7 @@ class AgentClient:
         cwd: str | None = None,
         model: str | None = None,
         scope: str = "orchestrator",
+        image_paths: list[str] | None = None,
     ) -> list[str]:
         cli_path = str(_NPM_CODEX_EXE) if _NPM_CODEX_EXE.exists() else (shutil.which("codex") or "")
         if not cli_path:
@@ -1078,6 +1079,8 @@ class AgentClient:
             cmd.extend(["--add-dir", str(PROJECT_ROOT)])
         if model:
             cmd.extend(["-m", model])
+        for image_path in image_paths or []:
+            cmd.extend(["--image", str(image_path)])
         cmd.extend(self._build_codex_mcp_overrides(scope))
         if session_id:
             cmd.extend(["resume", session_id, "-"])
@@ -1184,6 +1187,7 @@ class AgentClient:
         project_agents: dict[str, AgentDefinition] | None = None,
         scope: str = "orchestrator",
         orchestrator_mode: bool = False,
+        image_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         selected_model = self._select_model(model)
         codex_prompt = self._build_codex_prompt(
@@ -1198,6 +1202,7 @@ class AgentClient:
             cwd=cwd,
             model=selected_model,
             scope=scope,
+            image_paths=image_paths,
         )
         env = {**os.environ, **self._get_codex_env()}
 
@@ -1273,6 +1278,7 @@ class AgentClient:
         project_agents: dict[str, AgentDefinition] | None = None,
         scope: str = "orchestrator",
         orchestrator_mode: bool = False,
+        image_paths: list[str] | None = None,
     ) -> AsyncIterator[dict]:
         selected_model = self._select_model(model)
         codex_prompt = self._build_codex_prompt(
@@ -1287,6 +1293,7 @@ class AgentClient:
             cwd=cwd,
             model=selected_model,
             scope=scope,
+            image_paths=image_paths,
         )
         env = {**os.environ, **self._get_codex_env()}
 
@@ -1475,6 +1482,7 @@ class AgentClient:
         skill: Optional[str] = None,
         model: Optional[str] = None,
         runtime: Optional[str] = None,
+        image_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run agent to completion. Returns {"text": ..., "session_id": ...}."""
         resolved_runtime = self._resolve_runtime(runtime)
@@ -1491,6 +1499,7 @@ class AgentClient:
                     model=model,
                     scope="orchestrator",
                     orchestrator_mode=True,
+                    image_paths=image_paths,
                 )
             finally:
                 _ACTIVE_AGENT_RUNTIME.reset(token)
@@ -1535,6 +1544,7 @@ class AgentClient:
         skill: Optional[str] = None,
         model: Optional[str] = None,
         runtime: Optional[str] = None,
+        image_paths: list[str] | None = None,
     ) -> AsyncIterator[dict]:
         """Run agent with SSE streaming. Yields event dicts."""
         resolved_runtime = self._resolve_runtime(runtime)
@@ -1551,6 +1561,7 @@ class AgentClient:
                     model=model,
                     scope="orchestrator",
                     orchestrator_mode=True,
+                    image_paths=image_paths,
                 ):
                     yield event
                 return
@@ -1601,6 +1612,7 @@ class AgentClient:
         session_id: Optional[str] = None,
         model: Optional[str] = None,
         runtime: Optional[str] = None,
+        image_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run an agent in a specific project directory with project-specific skills.
 
@@ -1623,6 +1635,7 @@ class AgentClient:
                     cwd=project_cwd,
                     project_agents=project_agents,
                     scope="project",
+                    image_paths=image_paths,
                 )
 
             if session_id and isinstance(prompt, str):

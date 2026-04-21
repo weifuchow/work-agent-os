@@ -27,7 +27,7 @@ async def check_running_tasks() -> dict:
     Returns summary of checks performed.
     """
     async with async_session_factory() as db:
-        counts = {"running": 0, "notified": 0, "inflight": []}
+        counts = {"running": 0, "stuck": 0, "notified": 0, "inflight": []}
 
         # 1. Check slow/stuck pipelines — only notify, no auto-retry
         thinking_cutoff = datetime.now() - timedelta(minutes=THINKING_NOTIFY_MINUTES)

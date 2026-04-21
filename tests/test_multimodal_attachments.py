@@ -10,7 +10,8 @@ import pytest
 
 from core.connectors import message_service as message_service_mod
 from core.connectors.feishu import FeishuClient, _parse_message_content
-from core.pipeline import _build_agent_input
+from core.pipeline import _build_agent_input, _collect_agent_image_paths
+from core.orchestrator.agent_client import AgentClient
 from models.db import Message
 
 
@@ -45,6 +46,107 @@ async def test_build_agent_input_emits_image_block(tmp_path):
     assert payload["message"]["content"][1]["type"] == "image"
     assert payload["message"]["content"][1]["mimeType"] == "image/png"
     assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
+
+
+@pytest.mark.asyncio
+async def test_build_agent_input_includes_ones_description_images(tmp_path):
+    image_path = tmp_path / "desc-1.png"
+    image_bytes = b"\x89PNG\r\n\x1a\nones-image"
+    image_path.write_bytes(image_bytes)
+
+    messages_json = tmp_path / "messages.json"
+    messages_json.write_text(json.dumps({
+        "description_images": [
+            {
+                "label": "description_image_01_demo",
+                "path": str(image_path),
+                "uuid": "demo-uuid",
+                "mime": "image/png",
+            }
+        ],
+        "attachment_downloads": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    msg = {
+        "content": "帮我分析这个 ONES",
+        "message_type": "text",
+        "platform_message_id": "om_test_ones_001",
+        "media_info_json": json.dumps({}, ensure_ascii=False),
+    }
+    ones_result = {
+        "paths": {
+            "messages_json": str(messages_json),
+        }
+    }
+
+    prompt = _build_agent_input(
+        msg,
+        session=None,
+        runtime="claude",
+        prompt_text="请先阅读正文，再参考附图补充判断",
+        ones_result=ones_result,
+    )
+    assert not isinstance(prompt, str)
+
+    collected = []
+    async for item in prompt:
+        collected.append(item)
+
+    assert len(collected) == 1
+    payload = collected[0]
+    assert payload["message"]["content"][0]["type"] == "text"
+    assert payload["message"]["content"][1]["type"] == "image"
+    assert payload["message"]["content"][1]["mimeType"] == "image/png"
+    assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
+
+
+def test_collect_agent_image_paths_includes_ones_description_images(tmp_path):
+    image_path = tmp_path / "desc-1.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nones-image")
+    messages_json = tmp_path / "messages.json"
+    messages_json.write_text(json.dumps({
+        "description_images": [
+            {
+                "label": "description_image_01_demo",
+                "path": str(image_path),
+                "uuid": "demo-uuid",
+                "mime": "image/png",
+            }
+        ],
+        "attachment_downloads": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    msg = {
+        "content": "帮我分析这个 ONES",
+        "message_type": "text",
+        "platform_message_id": "om_test_ones_paths_001",
+        "media_info_json": json.dumps({}, ensure_ascii=False),
+    }
+    ones_result = {
+        "paths": {
+            "messages_json": str(messages_json),
+        }
+    }
+
+    image_paths = _collect_agent_image_paths(msg, ones_result)
+
+    assert image_paths == [str(image_path.resolve())]
+
+
+def test_build_codex_command_includes_image_flags(tmp_path):
+    image_path = tmp_path / "desc-1.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nones-image")
+    client = AgentClient()
+
+    cmd = client._build_codex_command(
+        cwd=str(tmp_path),
+        model="gpt-5.4",
+        scope="project",
+        image_paths=[str(image_path.resolve())],
+    )
+
+    assert "--image" in cmd
+    assert str(image_path.resolve()) in cmd
 
 
 def test_build_agent_input_keeps_file_message_as_text_prompt(tmp_path):
