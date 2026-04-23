@@ -276,6 +276,61 @@ def match_terms(text: str, package: dict[str, Any]) -> list[str]:
     return matched
 
 
+def matched_file_targets(path_str: str, package: dict[str, Any]) -> list[str]:
+    targets = package.get("target_files") or []
+    lowered = path_str.lower()
+    return [target for target in targets if target.lower() in lowered]
+
+
+def format_time_window(window: dict[str, Any]) -> str:
+    start = str(window.get("start") or "").strip()
+    end = str(window.get("end") or "").strip()
+    if start and end:
+        return f"{start} ~ {end}"
+    if start:
+        return f">= {start}"
+    if end:
+        return f"<= {end}"
+    return ""
+
+
+def describe_time_match(timestamp_text: str, package: dict[str, Any]) -> str:
+    window = package.get("time_window") or {}
+    window_label = format_time_window(window)
+    if not window_label:
+        if timestamp_text:
+            return f"命中时间: {timestamp_text}；当前未限制时间窗口"
+        return "当前未限制时间窗口"
+    if timestamp_text:
+        return f"命中时间: {timestamp_text}；落在时间窗口 {window_label}"
+    return f"当前行未解析到时间戳；本次命中主要依据关键词/文件筛选，仍需结合时间窗口 {window_label} 人工复核"
+
+
+def build_match_reason(
+    *,
+    path_str: str,
+    timestamp_text: str,
+    matched_terms: list[str],
+    package: dict[str, Any],
+) -> str:
+    reasons = [f"关键词命中: {', '.join(matched_terms)}"]
+    file_targets = matched_file_targets(path_str, package)
+    if file_targets:
+        reasons.append(f"目标文件命中: {', '.join(file_targets)}")
+    reasons.append(describe_time_match(timestamp_text, package))
+    if package.get("require_all_terms"):
+        reasons.append("匹配策略: require_all_terms=true")
+    return "；".join(reason for reason in reasons if reason)
+
+
+def markdown_table_cell(text: str, *, limit: int = 160) -> str:
+    cleaned = " ".join((text or "").split())
+    cleaned = cleaned.replace("|", "\\|")
+    if len(cleaned) > limit:
+        return cleaned[: limit - 3] + "..."
+    return cleaned or "-"
+
+
 def scan_documents(
     *,
     root: Path,
@@ -324,6 +379,14 @@ def scan_documents(
                     "line_number": line_number,
                     "timestamp": last_timestamp,
                     "matched_terms": matched_terms,
+                    "matched_file_targets": matched_file_targets(display_path, package),
+                    "matched_line": line,
+                    "match_reason": build_match_reason(
+                        path_str=display_path,
+                        timestamp_text=last_timestamp,
+                        matched_terms=matched_terms,
+                        package=package,
+                    ),
                     "excerpt_lines": list(recent_lines) + [line],
                     "exclude_terms": package.get("exclude_terms") or [],
                 }
@@ -395,6 +458,18 @@ def write_markdown_summary(output_path: Path, result: dict[str, Any]) -> None:
     else:
         lines.append("- No matching files")
 
+    lines.extend(["", "## Evidence Table", ""])
+    if result["evidence_hits"]:
+        lines.append("| 日志原文 | 日志文件 | 匹配关键词 |")
+        lines.append("| --- | --- | --- |")
+        for hit in result["evidence_hits"]:
+            matched_line = markdown_table_cell(str(hit.get("matched_line") or hit.get("excerpt") or ""))
+            log_file = markdown_table_cell(f"{hit['path']}:{hit['line_number']}", limit=120)
+            keywords = markdown_table_cell(", ".join(hit.get("matched_terms") or []), limit=120)
+            lines.append(f"| {matched_line} | {log_file} | {keywords} |")
+    else:
+        lines.append("- No hits")
+
     lines.extend(["", "## Evidence Hits", ""])
     if result["evidence_hits"]:
         for hit in result["evidence_hits"]:
@@ -402,6 +477,10 @@ def write_markdown_summary(output_path: Path, result: dict[str, Any]) -> None:
             if hit["timestamp"]:
                 lines.append(f"- Timestamp: `{hit['timestamp']}`")
             lines.append(f"- Matched terms: {', '.join(hit['matched_terms'])}")
+            if hit.get("matched_file_targets"):
+                lines.append(f"- Matched target files: {', '.join(hit['matched_file_targets'])}")
+            if hit.get("match_reason"):
+                lines.append(f"- Match reason: {hit['match_reason']}")
             lines.append("```text")
             lines.append(hit["excerpt"])
             lines.append("```")

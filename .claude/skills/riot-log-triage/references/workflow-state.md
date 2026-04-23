@@ -12,7 +12,7 @@
 
 复杂问题不需要照搬 `fix-issue` 的完整工单状态机，但需要维护一个轻量状态对象。可以放在会话记忆里，或在复杂场景写到 `.triage/<topic>/00-state.json`。
 
-建议字段：
+建议字段；如果问题牵涉时间换算或订单执行链路，优先把时区与证据锚点显式写进状态：
 
 ```json
 {
@@ -30,9 +30,18 @@
   },
   "time_alignment": {
     "problem_time": "",
+    "problem_timezone": "",
     "log_time_format": "",
-    "timezone": "",
+    "log_timezone": "",
+    "normalized_problem_time": "",
     "status": "aligned | mismatched | unknown"
+  },
+  "evidence_anchor": {
+    "issue_type": "order_execution | other | unknown",
+    "order_id": "",
+    "vehicle_name": "",
+    "key_time": "",
+    "status": "weak | partial | strong"
   },
   "module_hypothesis": [],
   "target_log_files": [],
@@ -68,6 +77,8 @@
 - `keywords_ready` 之前，不要启动大规模日志搜索。
 - `search_delegated` 阶段只允许把最小搜索输入交给子 agent，不要把大量原始日志塞回主线程。
 - `evidence_reviewed` 阶段必须判断证据链是否完整，以及置信度是否足够高。
+- `订单 / 车辆任务执行问题`在 `evidence_reviewed` 阶段至少要检查 `订单ID + 车辆名称 + 时间` 是否闭合；缺少订单ID时，不要推进到高置信结论。
+- `RIOT3` 要在状态里明确“现场时区”和 `UTC+0` 日志时区；`RIOT2 / FMS` 要明确服务器时间口径。
 - `ready_for_report` 仅表示“可以出正式报告”，不代表应该立刻输出。
 - `report_confirmed` 只有在用户明确同意后才能进入。
 
@@ -77,6 +88,7 @@
 
 - 问题摘要
 - 时间窗口
+- 时间窗口对应的时区口径
 - `keyword package`
 - 目标日志文件或目录
 - 当前假设列表
@@ -85,6 +97,8 @@
 
 - 命中的关键日志条目摘要
 - 文件路径、时间点、命中次数
+- 对`订单 / 车辆任务执行问题`，是否命中同一 `订单ID`
+- 精选的原始日志片段，以及它是如何匹配到的
 - 对应关键代码类/方法
 - 未命中或噪音过大的说明
 
@@ -112,6 +126,7 @@
 - 至少一条核心调用链已经建立
 - 关键词搜索结果已经返回
 - 证据链达到 `partial` 或 `complete`
+- `订单 / 车辆任务执行问题`已经拿到 `订单ID`，或明确说明为什么当前还拿不到
 - 置信度至少为 `medium`
 
 用户未确认前，不输出完整 `5 why`。
