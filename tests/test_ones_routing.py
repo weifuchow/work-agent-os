@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import shutil
 import subprocess
 
 import core.ones_routing as ones_routing_mod
@@ -268,3 +269,87 @@ def test_prepare_project_runtime_context_reuses_legacy_issue_version_worktree(mo
     assert ctx.execution_path == legacy_path
     assert not (tmp_path / ".worktrees" / "fms-java" / "149268-1FmsdpJjHT3JPyWL-4.9.2").exists()
     assert any("复用已有 worktree" in note for note in ctx.notes)
+
+
+def test_prepare_project_runtime_context_recovers_missing_registered_worktree(monkeypatch, tmp_path):
+    repo = tmp_path / "fms-java"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "tag", "v4.9.2")
+
+    stale_path = tmp_path / ".worktrees" / "fms-java" / "149268-1FmsdpJjHT3JPyWL-4.9.2"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "--detach", str(stale_path), "v4.9.2")
+    shutil.rmtree(stale_path)
+
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: projects_mod.ProjectConfig(name=name, path=repo, description=""),
+    )
+    monkeypatch.setattr(projects_mod, "settings", SimpleNamespace(project_root=tmp_path))
+    projects_mod._git_ref_inventory.cache_clear()
+
+    ctx = projects_mod.prepare_project_runtime_context(
+        "fms-java",
+        ones_result={
+            "task": {"number": 149268, "uuid": "1FmsdpJjHT3JPyWL"},
+            "named_fields": {"FMS/RIoT版本": "4.9.2-186-g96fb6f2f9_20250723"},
+            "project": {"display_name": "KIOXIA岩手工厂日本自动搬运复购项目"},
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.execution_path == stale_path
+    assert ctx.execution_path.exists()
+    assert any("清理失效 worktree 注册" in note for note in ctx.notes)
+    assert any("已创建 worktree" in note for note in ctx.notes)
+
+
+def test_prepare_project_runtime_context_uses_backup_path_when_preferred_creation_fails(monkeypatch, tmp_path):
+    repo = tmp_path / "fms-java"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "tag", "v4.9.2")
+
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: projects_mod.ProjectConfig(name=name, path=repo, description=""),
+    )
+    monkeypatch.setattr(projects_mod, "settings", SimpleNamespace(project_root=tmp_path))
+    projects_mod._git_ref_inventory.cache_clear()
+
+    original_create = projects_mod._create_detached_worktree
+
+    def flaky_create(project_path, worktree_path, ref, *, force=False):
+        if worktree_path.name == "149268-1FmsdpJjHT3JPyWL-4.9.2" and not force:
+            return False, "fatal: could not create directory of '.git/worktrees/149268-1FmsdpJjHT3JPyWL-4.9.2': Permission denied"
+        return original_create(project_path, worktree_path, ref, force=force)
+
+    monkeypatch.setattr(projects_mod, "_create_detached_worktree", flaky_create)
+
+    ctx = projects_mod.prepare_project_runtime_context(
+        "fms-java",
+        ones_result={
+            "task": {"number": 149268, "uuid": "1FmsdpJjHT3JPyWL"},
+            "named_fields": {"FMS/RIoT版本": "4.9.2-186-g96fb6f2f9_20250723"},
+            "project": {"display_name": "KIOXIA岩手工厂日本自动搬运复购项目"},
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.execution_path != repo
+    assert ctx.execution_path.name == "149268-4.9.2"
+    assert ctx.execution_path.exists()
+    assert any("首选 worktree 路径不可用" in note for note in ctx.notes)

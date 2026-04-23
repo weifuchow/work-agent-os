@@ -4,8 +4,10 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -480,6 +482,87 @@ def _next_available_worktree_path(base_path: Path) -> Path:
         suffix += 1
 
 
+def _normalize_worktree_path(path: Path) -> str:
+    try:
+        normalized = str(path.resolve())
+    except Exception:
+        normalized = str(path)
+    return normalized.lower() if os.name == "nt" else normalized
+
+
+def _registered_worktree_flags(project_path: Path) -> dict[str, set[str]]:
+    flags_by_path: dict[str, set[str]] = {}
+    current_key: str | None = None
+    for line in _git_capture_lines(project_path, "worktree", "list", "--porcelain"):
+        if line.startswith("worktree "):
+            raw_path = line.removeprefix("worktree ").strip()
+            current_key = _normalize_worktree_path(Path(raw_path))
+            flags_by_path.setdefault(current_key, set())
+            continue
+        if current_key is None:
+            continue
+        if line == "prunable" or line.startswith("prunable "):
+            flags_by_path[current_key].add("prunable")
+        elif line == "locked" or line.startswith("locked "):
+            flags_by_path[current_key].add("locked")
+    return flags_by_path
+
+
+def _prune_worktrees(project_path: Path) -> tuple[bool, str]:
+    result = _git_run(project_path, "worktree", "prune", "--expire", "now")
+    if result.returncode == 0:
+        return True, ""
+    error_text = (result.stderr or result.stdout or "").strip()
+    return False, error_text[:400]
+
+
+def _worktree_metadata_path(project_path: Path, worktree_path: Path) -> Path | None:
+    common_dir = _git_common_dir(project_path)
+    if not common_dir:
+        return None
+    return common_dir / "worktrees" / worktree_path.name
+
+
+def _cleanup_stale_worktree_state(project_path: Path, worktree_path: Path) -> list[str]:
+    notes: list[str] = []
+    worktree_key = _normalize_worktree_path(worktree_path)
+    registered_flags = _registered_worktree_flags(project_path)
+    flags = registered_flags.get(worktree_key, set())
+    if "prunable" in flags:
+        pruned, error_text = _prune_worktrees(project_path)
+        if pruned:
+            notes.append(f"已清理失效 worktree 注册: {worktree_path}")
+        elif error_text:
+            notes.append(f"清理失效 worktree 注册失败，将继续尝试创建。原因: {error_text}")
+        registered_flags = _registered_worktree_flags(project_path)
+
+    if worktree_path.exists() or worktree_key in registered_flags:
+        return notes
+
+    metadata_path = _worktree_metadata_path(project_path, worktree_path)
+    if not metadata_path or not metadata_path.exists():
+        return notes
+
+    try:
+        shutil.rmtree(metadata_path)
+        notes.append(f"已移除残留 worktree 元数据目录: {metadata_path}")
+    except Exception as exc:
+        notes.append(f"移除残留 worktree 元数据目录失败，将继续尝试创建。原因: {exc}")
+    return notes
+
+
+def _is_retryable_worktree_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    retryable_markers = (
+        "missing but already registered worktree",
+        "already registered worktree",
+        "permission denied",
+        "file exists",
+        "already exists",
+    )
+    return any(marker in lowered for marker in retryable_markers)
+
+
 def _checkout_existing_worktree(worktree_path: Path, ref: str) -> tuple[bool, str]:
     result = _git_run(worktree_path, "checkout", "--detach", ref)
     if result.returncode == 0:
@@ -488,13 +571,70 @@ def _checkout_existing_worktree(worktree_path: Path, ref: str) -> tuple[bool, st
     return False, error_text[:400]
 
 
-def _create_detached_worktree(project_path: Path, worktree_path: Path, ref: str) -> tuple[bool, str]:
+def _create_detached_worktree(
+    project_path: Path,
+    worktree_path: Path,
+    ref: str,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    result = _git_run(project_path, "worktree", "add", "--detach", str(worktree_path), ref, timeout=120)
+    args = ["worktree", "add"]
+    if force:
+        args.append("-f")
+    args.extend(["--detach", str(worktree_path), ref])
+    result = _git_run(project_path, *args, timeout=120)
     if result.returncode == 0:
         return True, ""
     error_text = (result.stderr or result.stdout or "").strip()
     return False, error_text[:400]
+
+
+def _try_create_worktree_with_recovery(
+    project_path: Path,
+    worktree_path: Path,
+    ref: str,
+) -> tuple[bool, str, list[str]]:
+    notes = _cleanup_stale_worktree_state(project_path, worktree_path)
+    created, error_text = _create_detached_worktree(project_path, worktree_path, ref)
+    if created or not error_text or not _is_retryable_worktree_error(error_text):
+        return created, error_text, notes
+
+    pruned, prune_error = _prune_worktrees(project_path)
+    if pruned:
+        notes.append("首次创建失败后已执行 git worktree prune。")
+    elif prune_error:
+        notes.append(f"首次创建失败后执行 git worktree prune 失败，将继续重试。原因: {prune_error}")
+    notes.extend(_cleanup_stale_worktree_state(project_path, worktree_path))
+
+    force_retry = "already registered worktree" in error_text.lower()
+    retried, retry_error = _create_detached_worktree(
+        project_path,
+        worktree_path,
+        ref,
+        force=force_retry,
+    )
+    if retried:
+        notes.append(f"首次创建失败后已自动恢复并创建 worktree: {worktree_path}")
+        return True, "", notes
+    return False, retry_error or error_text, notes
+
+
+def _worktree_create_candidates(
+    preferred_path: Path,
+    legacy_paths: list[Path],
+) -> tuple[Path, ...]:
+    bases: list[Path] = []
+    for candidate in [preferred_path, *legacy_paths]:
+        if candidate not in bases:
+            bases.append(candidate)
+
+    candidates = list(bases)
+    for base in bases:
+        retry_candidate = base.parent / f"{base.name}-2"
+        if retry_candidate not in candidates:
+            candidates.append(retry_candidate)
+    return tuple(candidates)
 
 
 def _try_reuse_worktree_path(
@@ -566,16 +706,30 @@ def _ensure_project_worktree(
         if reused_path is not None:
             return reused_path, notes
 
-    candidate_path = preferred_path
-    if candidate_path.exists():
-        candidate_path = _next_available_worktree_path(candidate_path)
+    create_candidates = _worktree_create_candidates(preferred_path, candidate_paths[1:])
+    last_error = ""
+    for index, create_candidate in enumerate(create_candidates):
+        candidate_path = create_candidate
+        if candidate_path.exists():
+            candidate_path = _next_available_worktree_path(candidate_path)
 
-    created, error_text = _create_detached_worktree(context.project_path, candidate_path, checkout_ref)
-    if created:
-        notes.append(f"已创建 worktree 并检出 {checkout_ref}: {candidate_path}")
-        return candidate_path, notes
+        created, error_text, create_notes = _try_create_worktree_with_recovery(
+            context.project_path,
+            candidate_path,
+            checkout_ref,
+        )
+        notes.extend(create_notes)
+        if created:
+            if candidate_path != preferred_path:
+                notes.append(f"首选 worktree 路径不可用，改用备用路径: {candidate_path}")
+            notes.append(f"已创建 worktree 并检出 {checkout_ref}: {candidate_path}")
+            return candidate_path, notes
 
-    notes.append(f"创建 worktree 失败，回退到主仓库目录。原因: {error_text}")
+        last_error = error_text
+        if index < len(create_candidates) - 1:
+            notes.append(f"worktree 创建失败，尝试下一个候选目录。候选: {candidate_path}。原因: {error_text}")
+
+    notes.append(f"创建 worktree 失败，回退到主仓库目录。原因: {last_error}")
     return context.project_path, notes
 
 
