@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -580,14 +581,15 @@ def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
     if display_name:
         lines.append(f"- 项目名称：`{display_name}`")
 
+    analysis_workspace = str(getattr(project_context, "analysis_workspace", "") or "").strip()
     execution_path = str(getattr(project_context, "execution_path", "") or "").strip()
     project_path = str(getattr(project_context, "project_path", "") or "").strip()
-    if execution_path:
+    if analysis_workspace:
+        lines.append(f"- 分析目录：`{analysis_workspace}`")
+    elif execution_path:
         lines.append(f"- 目录：`{execution_path}`")
     elif project_path:
         lines.append(f"- 目录：`{project_path}`")
-    if project_path and execution_path and project_path != execution_path:
-        lines.append(f"- 主仓库：`{project_path}`")
 
     current_branch = str(getattr(project_context, "current_branch", "") or "").strip()
     if current_branch:
@@ -610,10 +612,6 @@ def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
     if version_field and version_value:
         lines.append(f"- 版本线索：`{version_field} = {version_value}`")
 
-    worktree_path = str(getattr(project_context, "recommended_worktree", "") or "").strip()
-    if worktree_path:
-        lines.append(f"- 建议 worktree：`{worktree_path}`")
-
     if not lines:
         return []
 
@@ -621,6 +619,25 @@ def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
         _section_title("运行信息"),
         _lark_md_div("\n".join(lines)),
     ]
+
+
+def _project_context_for_reply(
+    project_context: Any,
+    *,
+    analysis_workspace: str = "",
+) -> Any:
+    analysis_workspace = str(analysis_workspace or "").strip()
+    if not analysis_workspace:
+        return project_context
+
+    payload: dict[str, Any] = {}
+    if project_context is not None:
+        try:
+            payload.update(vars(project_context))
+        except TypeError:
+            payload = {}
+    payload["analysis_workspace"] = analysis_workspace
+    return SimpleNamespace(**payload)
 
 
 def _step_block(index: int, title: str, detail: str = "") -> dict[str, Any]:
@@ -1010,6 +1027,15 @@ async def _process_message_locked(message_id: int, msg: dict,
     """Core processing under per-session lock (steps 3-11)."""
     # 3. Re-read fresh session state (may have been updated by prior message)
     session = await _read_session(session_id) if session_id else None
+    staged_media_reply = ""
+    if session_id:
+        media_info = await _stage_message_media_to_temp_resource(message_id, msg, session)
+        if media_info:
+            refreshed = await _read_message(message_id)
+            if refreshed:
+                msg = refreshed
+            if _is_media_only_message(msg):
+                staged_media_reply = _build_media_staged_reply(msg, media_info)
     analysis_dir: Path | None = None
     triage_state: dict[str, Any] | None = None
     ones_artifacts: dict[str, Any] | None = None
@@ -1020,7 +1046,7 @@ async def _process_message_locked(message_id: int, msg: dict,
             msg = refreshed
     if analysis_dir:
         triage_state = _load_triage_state(analysis_dir)
-    if _ones_link_detected(msg):
+    if not staged_media_reply and _ones_link_detected(msg):
         ones_artifacts = await _fetch_ones_task_artifacts(msg)
     elif analysis_dir:
         ones_artifacts = _load_ones_artifacts_from_triage_state(analysis_dir)
@@ -1055,7 +1081,7 @@ async def _process_message_locked(message_id: int, msg: dict,
             active_project = direct_project["project_name"]
 
     ones_check: dict[str, Any] | None = None
-    is_ones_case = bool(ones_artifacts or _ones_link_detected(msg) or ((triage_state or {}).get("ones_context")))
+    is_ones_case = bool(not staged_media_reply and (ones_artifacts or _ones_link_detected(msg) or ((triage_state or {}).get("ones_context"))))
     if is_ones_case:
         ones_check = _evaluate_ones_artifact_completeness(msg, ones_artifacts, analysis_dir)
         if analysis_dir:
@@ -1076,9 +1102,41 @@ async def _process_message_locked(message_id: int, msg: dict,
         prompt += (
             f"\n\n[分析工作目录] {analysis_dir}"
             f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
+            f"\n[目录展示规则] 如果回复里需要展示目录，只展示分析工作目录：{analysis_dir}；"
+            "不要同时展示主仓库目录、执行目录或 worktree 目录。"
         )
-    skip_agent = bool(ones_check and ones_check.get("status") != "complete")
-    if skip_agent:
+    session_image_paths: list[str] = []
+    if session_id and _message_references_recent_session_image(msg):
+        session_image_paths = await _collect_recent_session_image_paths(
+            session_id,
+            before_message_id=message_id,
+        )
+        if session_image_paths:
+            prompt += f"\n[会话图片上下文] 已附带本会话最近 {len(session_image_paths)} 张图片。"
+    skip_agent = bool(staged_media_reply) or bool(ones_check and ones_check.get("status") != "complete")
+    if staged_media_reply:
+        route_mode = "media_staged"
+        parsed = {
+            "action": "replied",
+            "classified_type": "chat",
+            "topic": "附件已存储",
+            "project_name": active_project or project,
+            "reply_content": staged_media_reply,
+            "reason": "media_staged_waiting_for_text",
+        }
+        result = {
+            "text": _safe_json_dumps(parsed),
+            "session_id": agent_sid,
+            "usage": {},
+            "model": _get_effective_model_for_runtime(agent_runtime),
+            "is_error": False,
+        }
+        await _audit("pipeline_media_staged", "message", str(message_id), {
+            "project_name": active_project or project,
+            "temp_resource_dir": str(_parse_media_info(msg).get("temp_resource_dir") or ""),
+            "attachment_path": str(msg.get("attachment_path") or ""),
+        })
+    elif skip_agent:
         route_mode = "ones_intake_gate"
         parsed = {
             "action": "replied",
@@ -1109,12 +1167,16 @@ async def _process_message_locked(message_id: int, msg: dict,
 
         # 5. Run agent (project resume, direct ONES route, or orchestrator)
         agent_images = _collect_agent_image_paths(msg, ones_artifacts)
+        for raw_path in session_image_paths:
+            if raw_path not in agent_images:
+                agent_images.append(raw_path)
         agent_input = _build_agent_input(
             msg,
             session,
             agent_runtime,
             prompt,
             ones_result=ones_artifacts,
+            extra_image_paths=session_image_paths,
         )
 
         if agent_sid and project:
@@ -1306,6 +1368,9 @@ async def _process_message_locked(message_id: int, msg: dict,
             })
 
         project_context = None
+        analysis_workspace_for_reply = str(
+            analysis_dir or (session or {}).get("analysis_workspace") or ""
+        ).strip()
         if project_name_for_reply:
             try:
                 from core.projects import prepare_project_runtime_context
@@ -1316,6 +1381,10 @@ async def _process_message_locked(message_id: int, msg: dict,
                 )
             except Exception as e:
                 logger.warning("Pipeline: failed to build project runtime context for {}: {}", project_name_for_reply, e)
+        project_context = _project_context_for_reply(
+            project_context,
+            analysis_workspace=analysis_workspace_for_reply,
+        )
 
         thread_id, delivered = await _deliver_reply(
             msg,
@@ -1688,6 +1757,25 @@ def _image_block_from_path(path: Path, mime_type: str = "") -> dict[str, Any] | 
     return {"type": "image", "data": image_b64, "mimeType": resolved_mime}
 
 
+def _image_blocks_from_paths(raw_paths: list[str], *, limit: int = 4) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        path = Path(str(raw_path).strip())
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        block = _image_block_from_path(path)
+        if block:
+            blocks.append(block)
+        if len(blocks) >= limit:
+            break
+    return blocks
+
+
 def _collect_message_multimodal_image_blocks(msg: dict) -> list[dict[str, Any]]:
     media_info = _parse_media_info(msg)
     media_type = str(media_info.get("type") or "")
@@ -1841,6 +1929,42 @@ def _collect_agent_image_paths(msg: dict, ones_result: dict[str, Any] | None = N
     return result
 
 
+async def _collect_recent_session_image_paths(
+    session_id: int | None,
+    *,
+    before_message_id: int | None = None,
+    limit: int = 3,
+) -> list[str]:
+    if not session_id:
+        return []
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        sql = (
+            "SELECT * FROM messages WHERE session_id = ? AND sender_id != 'bot' "
+            "AND message_type IN ('image', 'post')"
+        )
+        params: list[Any] = [session_id]
+        if before_message_id:
+            sql += " AND id < ?"
+            params.append(before_message_id)
+        sql += " ORDER BY id DESC LIMIT 12"
+        cursor = await db.execute(sql, tuple(params))
+        rows = [dict(row) for row in await cursor.fetchall()]
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for raw_path in _collect_message_multimodal_image_paths(row):
+            if raw_path in seen:
+                continue
+            seen.add(raw_path)
+            result.append(raw_path)
+            if len(result) >= limit:
+                return result
+    return result
+
+
 def _build_agent_input(
     msg: dict,
     session: dict | None,
@@ -1848,11 +1972,14 @@ def _build_agent_input(
     prompt_text: str,
     *,
     ones_result: dict[str, Any] | None = None,
+    extra_image_paths: list[str] | None = None,
 ) -> str | AsyncIterable[dict[str, Any]]:
     if runtime != "claude":
         return prompt_text
 
     blocks = _collect_message_multimodal_image_blocks(msg)
+    if extra_image_paths:
+        blocks.extend(_image_blocks_from_paths(extra_image_paths))
     if ones_result:
         blocks.extend(_collect_ones_multimodal_image_blocks(ones_result))
     if not blocks:
@@ -1895,6 +2022,23 @@ _ANALYSIS_KEYWORDS = (
     "5 why",
 )
 
+_SESSION_IMAGE_REFERENCE_KEYWORDS = (
+    "图片",
+    "截图",
+    "照片",
+    "附件",
+    "看图",
+    "图里",
+    "图上",
+    "刚才的图",
+    "刚才那张图",
+    "刚才的图片",
+)
+
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^\[(?:图片|文件(?:\s*:\s*[^\]]*)?|视频(?:\s*:\s*[^\]]*)?|语音(?:\s*:\s*[^\]]*)?|表情)\]$"
+)
+
 _REVIEW_KEYWORDS = (
     "review",
     "code review",
@@ -1926,6 +2070,33 @@ def _analysis_requested(msg: dict) -> bool:
     ):
         return True
     return False
+
+
+def _message_references_recent_session_image(msg: dict) -> bool:
+    if _has_media(msg):
+        return False
+    content = str(msg.get("content") or "").strip().lower()
+    if not content:
+        return False
+    if any(keyword in content for keyword in _SESSION_IMAGE_REFERENCE_KEYWORDS):
+        return True
+    if len(content) <= 20 and any(token in content for token in ("是什么", "是啥", "什么意思", "啥")):
+        return True
+    return False
+
+
+def _is_media_placeholder_content(content: str) -> bool:
+    stripped = str(content or "").strip()
+    if not stripped:
+        return True
+    return bool(_MEDIA_PLACEHOLDER_RE.fullmatch(stripped))
+
+
+def _is_media_only_message(msg: dict) -> bool:
+    media_info = _parse_media_info(msg)
+    if not str(media_info.get("type") or "").strip():
+        return False
+    return _is_media_placeholder_content(str(msg.get("content") or ""))
 
 
 def _review_requested(msg: dict) -> bool:
@@ -1977,6 +2148,8 @@ async def _session_has_analysis_workspace(session_id: int) -> bool:
 
 async def _should_prepare_analysis_workspace(msg: dict, session: dict | None, session_id: int | None) -> bool:
     if not session_id:
+        return False
+    if _is_media_only_message(msg):
         return False
     if session and bool(session.get("analysis_mode")):
         return True
@@ -2562,78 +2735,175 @@ def _guess_attachment_suffix(file_name: str, media_type: str) -> str:
     return ".bin"
 
 
-async def _download_message_media_to_workspace(msg: dict, triage_dir: Path) -> dict[str, Any]:
+def _resolve_temp_resource_root(session: dict | None) -> Path:
+    project_name = str((session or {}).get("project") or "").strip()
+    if project_name:
+        try:
+            from core.projects import get_project
+
+            project = get_project(project_name)
+            if project and project.path.exists():
+                return project.path / ".temp_resource"
+        except Exception as e:
+            logger.warning("Pipeline: failed to resolve temp_resource root for {}: {}", project_name, e)
+    return settings.project_root / ".temp_resource"
+
+
+def _collect_existing_media_source_paths(msg: dict, media_info: dict[str, Any], *, multiple: bool) -> list[Path]:
+    candidates: list[str] = []
+    if multiple:
+        for key in ("staged_local_paths", "local_paths"):
+            raw_value = media_info.get(key) or []
+            if isinstance(raw_value, list):
+                candidates.extend(str(item).strip() for item in raw_value if str(item).strip())
+        for key in ("staged_local_path", "local_path", "analysis_local_path"):
+            raw_value = str(media_info.get(key) or "").strip()
+            if raw_value:
+                candidates.append(raw_value)
+    else:
+        for key in ("staged_local_path", "local_path", "analysis_local_path"):
+            raw_value = str(media_info.get(key) or "").strip()
+            if raw_value:
+                candidates.append(raw_value)
+        attachment_path = str(msg.get("attachment_path") or "").strip()
+        if attachment_path:
+            candidates.append(attachment_path)
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(Path(resolved))
+    return result
+
+
+def _copy_or_reuse_media_source(source_path: Path, target_file: Path) -> Path:
+    source_resolved = source_path.resolve()
+    try:
+        target_resolved = target_file.resolve()
+    except FileNotFoundError:
+        target_resolved = target_file.parent.resolve() / target_file.name
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    if source_resolved == target_resolved:
+        return source_resolved
+    shutil.copy2(source_resolved, target_file)
+    return target_resolved
+
+
+def _write_media_manifest(target_dir: Path, msg: dict, media_info: dict[str, Any]) -> None:
+    manifest_path = target_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({
+            "message_id": msg["id"],
+            "platform_message_id": msg["platform_message_id"],
+            "message_type": msg.get("message_type", ""),
+            "media_info": media_info,
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+async def _materialize_message_media(
+    msg: dict,
+    target_dir: Path,
+    *,
+    scope: str,
+) -> dict[str, Any]:
     media_info = _parse_media_info(msg)
     media_type = str(media_info.get("type") or "").strip()
     if media_type not in {"image", "file", "audio", "video", "post"}:
         return media_info
 
-    if media_type == "post":
-        image_keys = [str(item).strip() for item in (media_info.get("image_keys") or []) if str(item).strip()]
-        if not image_keys:
-            return media_info
-
-        attachments_root = triage_dir / "01-intake" / "attachments"
-        target_dir = attachments_root / str(msg["platform_message_id"])
-        target_dir.mkdir(parents=True, exist_ok=True)
-        original_dir = target_dir / "original"
-        original_dir.mkdir(parents=True, exist_ok=True)
-
-        from core.connectors.feishu import FeishuClient
-
-        client = FeishuClient()
-        local_paths: list[str] = []
-        for index, image_key in enumerate(image_keys, start=1):
-            payload = client.get_image_bytes(
-                image_key,
-                message_id=str(msg.get("platform_message_id") or ""),
-                resource_type="image",
-            )
-            if not payload:
-                continue
-            data, downloaded_name = payload
-            base_name = _sanitize_filename(downloaded_name or f"post-image-{index}", fallback=f"post-image-{index}.png")
-            suffix = _guess_attachment_suffix(base_name, "image")
-            if not Path(base_name).suffix:
-                base_name = f"{base_name}{suffix}"
-            target_file = original_dir / base_name
-            target_file.write_bytes(data)
-            local_paths.append(str(target_file.resolve()))
-
-        if local_paths:
-            media_info.update({
-                "download_status": "downloaded",
-                "local_paths": local_paths,
-                "local_path": local_paths[0],
-                "mime_type": "image/png",
-                "proxy_url": f"/api/messages/{msg['id']}/attachment",
-            })
-        else:
-            media_info["download_status"] = "failed"
-
-        manifest_path = target_dir / "manifest.json"
-        manifest_path.write_text(
-            json.dumps({
-                "message_id": msg["id"],
-                "platform_message_id": msg["platform_message_id"],
-                "message_type": msg["message_type"],
-                "media_info": media_info,
-            }, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return media_info
-
-    attachments_root = triage_dir / "01-intake" / "attachments"
-    target_dir = attachments_root / str(msg["platform_message_id"])
     target_dir.mkdir(parents=True, exist_ok=True)
     original_dir = target_dir / "original"
     original_dir.mkdir(parents=True, exist_ok=True)
 
-    local_path_value = str(media_info.get("local_path") or msg.get("attachment_path") or "").strip()
-    local_path = Path(local_path_value) if local_path_value else None
-    if local_path and local_path.exists():
-        data = local_path.read_bytes()
-        downloaded_name = local_path.name
+    if media_type == "post":
+        local_paths: list[str] = []
+        existing_sources = _collect_existing_media_source_paths(msg, media_info, multiple=True)
+        if existing_sources:
+            for index, source_path in enumerate(existing_sources, start=1):
+                base_name = _sanitize_filename(source_path.name, fallback=f"post-image-{index}.png")
+                suffix = _guess_attachment_suffix(base_name, "image")
+                if not Path(base_name).suffix:
+                    base_name = f"{base_name}{suffix}"
+                target_file = original_dir / base_name
+                stored_path = _copy_or_reuse_media_source(source_path, target_file)
+                local_paths.append(str(stored_path))
+        else:
+            image_keys = [str(item).strip() for item in (media_info.get("image_keys") or []) if str(item).strip()]
+            if not image_keys:
+                return media_info
+
+            from core.connectors.feishu import FeishuClient
+
+            client = FeishuClient()
+            for index, image_key in enumerate(image_keys, start=1):
+                payload = client.get_image_bytes(
+                    image_key,
+                    message_id=str(msg.get("platform_message_id") or ""),
+                    resource_type="image",
+                )
+                if not payload:
+                    continue
+                data, downloaded_name = payload
+                base_name = _sanitize_filename(
+                    downloaded_name or f"post-image-{index}",
+                    fallback=f"post-image-{index}.png",
+                )
+                suffix = _guess_attachment_suffix(base_name, "image")
+                if not Path(base_name).suffix:
+                    base_name = f"{base_name}{suffix}"
+                target_file = original_dir / base_name
+                target_file.write_bytes(data)
+                local_paths.append(str(target_file.resolve()))
+
+        if not local_paths:
+            media_info["download_status"] = "failed"
+            return media_info
+
+        media_info.update({
+            "download_status": "downloaded",
+            "local_paths": local_paths,
+            "local_path": local_paths[0],
+            "mime_type": "image/png",
+            "proxy_url": f"/api/messages/{msg['id']}/attachment",
+        })
+        if scope == "temp_resource":
+            media_info.update({
+                "temp_resource_dir": str(target_dir.resolve()),
+                "staged_local_paths": list(local_paths),
+                "staged_local_path": local_paths[0],
+            })
+        else:
+            media_info.update({
+                "analysis_attachment_dir": str(target_dir.resolve()),
+                "analysis_local_paths": list(local_paths),
+                "analysis_local_path": local_paths[0],
+            })
+        _write_media_manifest(target_dir, msg, media_info)
+        return media_info
+
+    existing_sources = _collect_existing_media_source_paths(msg, media_info, multiple=False)
+    target_file: Path
+    if existing_sources:
+        source_path = existing_sources[0]
+        base_name = _sanitize_filename(
+            source_path.name,
+            fallback=f"{media_type}_{msg['platform_message_id']}",
+        )
+        suffix = _guess_attachment_suffix(base_name, media_type)
+        if not Path(base_name).suffix:
+            base_name = f"{base_name}{suffix}"
+        target_file = original_dir / base_name
+        stored_path = _copy_or_reuse_media_source(source_path, target_file)
+        size_bytes = stored_path.stat().st_size
     else:
         remote_key = (
             media_info.get("image_key")
@@ -2649,7 +2919,11 @@ async def _download_message_media_to_workspace(msg: dict, triage_dir: Path) -> d
         client = FeishuClient()
         payload: tuple[bytes, str | None] | None = None
         if media_type == "image":
-            payload = client.get_image_bytes(str(remote_key))
+            payload = client.get_image_bytes(
+                str(remote_key),
+                message_id=str(msg.get("platform_message_id") or ""),
+                resource_type="image",
+            )
         else:
             payload = client.get_file_bytes(
                 str(remote_key),
@@ -2662,39 +2936,41 @@ async def _download_message_media_to_workspace(msg: dict, triage_dir: Path) -> d
             return media_info
 
         data, downloaded_name = payload
+        base_name = _sanitize_filename(
+            downloaded_name or str(media_info.get("file_name") or ""),
+            fallback=f"{media_type}_{msg['platform_message_id']}",
+        )
+        suffix = _guess_attachment_suffix(base_name, media_type)
+        if not Path(base_name).suffix:
+            base_name = f"{base_name}{suffix}"
 
-    base_name = _sanitize_filename(
-        downloaded_name or str(media_info.get("file_name") or ""),
-        fallback=f"{media_type}_{msg['platform_message_id']}",
-    )
-    suffix = _guess_attachment_suffix(base_name, media_type)
-    if not Path(base_name).suffix:
-        base_name = f"{base_name}{suffix}"
+        target_file = original_dir / base_name
+        target_file.write_bytes(data)
+        stored_path = target_file.resolve()
+        size_bytes = len(data)
 
-    target_file = original_dir / base_name
-    target_file.write_bytes(data)
-    mime_type = mimetypes.guess_type(target_file.name)[0] or (
+    mime_type = mimetypes.guess_type(stored_path.name)[0] or str(media_info.get("mime_type") or "").strip() or (
         "image/png" if media_type == "image" else "application/octet-stream"
     )
-
+    resolved_path = str(stored_path)
     media_info.update({
         "download_status": "downloaded",
-        "local_path": str(target_file.resolve()),
-        "size_bytes": len(data),
+        "local_path": resolved_path,
+        "size_bytes": size_bytes,
         "mime_type": mime_type,
         "proxy_url": f"/api/messages/{msg['id']}/attachment",
     })
-
-    manifest_path = target_dir / "manifest.json"
-    manifest_path.write_text(
-        json.dumps({
-            "message_id": msg["id"],
-            "platform_message_id": msg["platform_message_id"],
-            "message_type": msg["message_type"],
-            "media_info": media_info,
-        }, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    if scope == "temp_resource":
+        media_info.update({
+            "temp_resource_dir": str(target_dir.resolve()),
+            "staged_local_path": resolved_path,
+        })
+    else:
+        media_info.update({
+            "analysis_attachment_dir": str(target_dir.resolve()),
+            "analysis_local_path": resolved_path,
+        })
+    _write_media_manifest(target_dir, msg, media_info)
     return media_info
 
 
@@ -2702,8 +2978,53 @@ async def _persist_message_media_state(message_id: int, media_info: dict[str, An
     await _update_message(
         message_id,
         media_info_json=json.dumps(media_info, ensure_ascii=False),
-        attachment_path=str(media_info.get("local_path") or ""),
+        attachment_path=str(media_info.get("staged_local_path") or media_info.get("local_path") or ""),
     )
+
+
+async def _stage_message_media_to_temp_resource(
+    message_id: int,
+    msg: dict,
+    session: dict | None,
+) -> dict[str, Any]:
+    media_info = _parse_media_info(msg)
+    media_type = str(media_info.get("type") or "").strip()
+    if media_type not in {"image", "file", "audio", "video", "post"}:
+        return media_info
+
+    day = datetime.now().strftime("%Y%m%d")
+    temp_root = _resolve_temp_resource_root(session)
+    target_dir = temp_root / "feishu" / day / str(msg["platform_message_id"])
+    media_info = await _materialize_message_media(msg, target_dir, scope="temp_resource")
+    await _persist_message_media_state(message_id, media_info)
+    return media_info
+
+
+def _build_media_staged_reply(msg: dict, media_info: dict[str, Any]) -> str:
+    media_type = str(media_info.get("type") or "").strip()
+    label = "附件"
+    if media_type in {"image", "post"}:
+        label = "图片"
+
+    if media_info.get("download_status") != "downloaded":
+        return f"收到{label}，但本地存储失败。请重发一次，或补一条文字说明后我再继续处理。"
+
+    target = (
+        str(media_info.get("staged_local_path") or "").strip()
+        or str(media_info.get("local_path") or "").strip()
+        or str(media_info.get("temp_resource_dir") or "").strip()
+        or str(msg.get("attachment_path") or "").strip()
+    )
+    return (
+        f"收到{label}，已存储到 {target}，数据已存储。"
+        "你再发文字说明后，我会把这些材料复制到分析目录继续处理。"
+    )
+
+
+async def _download_message_media_to_workspace(msg: dict, triage_dir: Path) -> dict[str, Any]:
+    attachments_root = triage_dir / "01-intake" / "attachments"
+    target_dir = attachments_root / str(msg["platform_message_id"])
+    return await _materialize_message_media(msg, target_dir, scope="analysis_workspace")
 
 
 async def _materialize_analysis_workspace(message_id: int, msg: dict, session: dict | None, session_id: int) -> Path:

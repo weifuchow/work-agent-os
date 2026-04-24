@@ -100,6 +100,39 @@ async def test_build_agent_input_includes_ones_description_images(tmp_path):
     assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
 
 
+@pytest.mark.asyncio
+async def test_build_agent_input_includes_extra_session_image_paths(tmp_path):
+    image_path = tmp_path / "session-image.png"
+    image_bytes = b"\x89PNG\r\n\x1a\nsession-image"
+    image_path.write_bytes(image_bytes)
+
+    msg = {
+        "content": "图片内容是什么",
+        "message_type": "text",
+        "platform_message_id": "om_test_session_img_001",
+        "media_info_json": json.dumps({}, ensure_ascii=False),
+    }
+
+    prompt = _build_agent_input(
+        msg,
+        session=None,
+        runtime="claude",
+        prompt_text="请结合上下文图片回答",
+        extra_image_paths=[str(image_path.resolve())],
+    )
+    assert not isinstance(prompt, str)
+
+    collected = []
+    async for item in prompt:
+        collected.append(item)
+
+    assert len(collected) == 1
+    payload = collected[0]
+    assert payload["message"]["content"][0]["type"] == "text"
+    assert payload["message"]["content"][1]["type"] == "image"
+    assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
+
+
 def test_collect_agent_image_paths_includes_ones_description_images(tmp_path):
     image_path = tmp_path / "desc-1.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nones-image")
@@ -266,3 +299,26 @@ def test_get_file_bytes_falls_back_to_message_resource():
 
     data = client.get_file_bytes("file_key_x", message_id="om_xxx", resource_type="file")
     assert data == (b"fallback-data", "evidence.log")
+
+
+def test_get_image_bytes_falls_back_to_message_resource():
+    client = FeishuClient.__new__(FeishuClient)
+
+    primary_response = SimpleNamespace(code=234001, msg="Invalid request param.", file=None)
+    file_obj = SimpleNamespace(
+        seek=lambda offset: None,
+        read=lambda: b"fallback-image",
+    )
+    fallback_response = SimpleNamespace(code=0, file=file_obj, file_name="capture.png")
+
+    client._client = SimpleNamespace(
+        im=SimpleNamespace(
+            v1=SimpleNamespace(
+                image=SimpleNamespace(get=lambda request: primary_response),
+                message_resource=SimpleNamespace(get=lambda request: fallback_response),
+            )
+        )
+    )
+
+    data = client.get_image_bytes("img_v3_x", message_id="om_img_xxx", resource_type="image")
+    assert data == (b"fallback-image", "capture.png")

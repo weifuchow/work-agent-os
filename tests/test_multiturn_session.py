@@ -1384,7 +1384,7 @@ async def test_work_question_plain_text_is_cardified_for_feishu():
 
 @pytest.mark.asyncio
 async def test_structured_card_includes_project_runtime_context():
-    """Project issue cards should expose running project, directory, and ref info."""
+    """Project issue cards should expose runtime info without redundant directory fields."""
     from core.pipeline import _deliver_reply
 
     project_context = SimpleNamespace(
@@ -1431,9 +1431,59 @@ async def test_structured_card_includes_project_runtime_context():
     assert "fms-java" in card_text
     assert "目录" in card_text
     assert "对应 Tag" in card_text
-    assert "建议 worktree" in card_text
+    assert "建议 worktree" not in card_text
 
     print("\n[PASS] C6.1: Structured project card includes runtime context")
+
+
+@pytest.mark.asyncio
+async def test_structured_card_prefers_analysis_workspace_as_only_directory():
+    """When analysis workspace exists, runtime card should only show that directory."""
+    from core.pipeline import _deliver_reply
+
+    project_context = SimpleNamespace(
+        running_project="riot-standalone",
+        business_project_name="唐山松下项目1",
+        project_path=Path("D:/standard/riot/riot-standalone"),
+        execution_path=Path("D:/standard/work-agent-os/.worktrees/riot-standalone/149531-branch"),
+        analysis_workspace="D:/standard/work-agent-os/.triage/session-68-demo",
+        current_branch="2.0.7-avary-standard",
+        current_version="2.0.7",
+        target_branch="master",
+        recommended_worktree=Path("D:/standard/work-agent-os/.worktrees/riot-standalone/149531-branch"),
+    )
+    payload = {
+        "format": "rich",
+        "title": "关键日志证据",
+        "summary": "最关键的日志证据有 3 组。",
+        "fallback_text": "最关键的日志证据有 3 组。",
+    }
+
+    thread_id, delivered = await _deliver_reply(
+        {
+            "id": 1,
+            "platform": "feishu",
+            "platform_message_id": "om_runtime_ctx_analysis_001",
+            "chat_id": CHAT_ID,
+        },
+        payload,
+        session_id=None,
+        classified_type="work_question",
+        topic="关键日志证据",
+        project_context=project_context,
+    )
+
+    assert delivered is True
+    assert thread_id == "thread_om_runtime_ctx_analysis_001"
+    card = json.loads(_feishu_replies[0]["content"])
+    card_text = json.dumps(card, ensure_ascii=False)
+    assert "分析目录" in card_text
+    assert "D:/standard/work-agent-os/.triage/session-68-demo" in card_text
+    assert "D:/standard/riot/riot-standalone" not in card_text
+    assert "149531-branch" not in card_text
+    assert "建议 worktree" not in card_text
+
+    print("\n[PASS] C6.2: Structured project card prefers analysis workspace as only directory")
 
 
 @pytest.mark.asyncio

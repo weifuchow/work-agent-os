@@ -79,6 +79,36 @@ def test_score_project_routes_can_identify_deployment_package():
     assert scored["allsparkbox"]["score"] > scored["allspark"]["score"]
 
 
+def test_choose_project_route_prefers_riot3_frontend_over_allspark_backend():
+    project_name, confidence, score, reasons = choose_project_route(
+        user_message="帮我看 riot3 前端白屏问题",
+        task_summary="RIOT3 前端页面异常",
+        task_description="riot3 frontend 登录页白屏，vite build 后页面加载失败。",
+        ones_project_name="",
+        business_project_name="",
+        key_fields={"FMS/RIoT版本": "3.51.0"},
+    )
+    assert project_name == "riot-frontend-v3"
+    assert confidence in {"medium", "high"}
+    assert score > 8
+    assert any("前端" in reason or "frontend" in reason for reason in reasons)
+
+
+def test_choose_project_route_defaults_bare_riot3_to_allspark():
+    project_name, confidence, score, reasons = choose_project_route(
+        user_message="帮我看 riot3 的问题",
+        task_summary="RIOT3 调度异常",
+        task_description="现场反馈 riot3 出现调度卡顿。",
+        ones_project_name="",
+        business_project_name="",
+        key_fields={"FMS/RIoT版本": "3.51.0"},
+    )
+    assert project_name == "allspark"
+    assert confidence in {"medium", "high"}
+    assert score >= 8
+    assert all("frontend" not in reason.lower() for reason in reasons)
+
+
 def test_read_env_fallback_supports_dot_ones_env(monkeypatch, tmp_path):
     env_path = tmp_path / ".ones.env"
     env_path.write_text(

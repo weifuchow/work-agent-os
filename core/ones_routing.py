@@ -41,6 +41,14 @@ KEY_FIELDS = (
 )
 PROJECT_ALIASES = {
     "allspark": ("allspark", "riot3", "riot 3", "riot3.0", "riot 3.0", "riot3调度系统"),
+    "riot-frontend-v3": (
+        "riot-frontend-v3",
+        "riot3前端",
+        "riot3 前端",
+        "riot3 frontend",
+        "riot3-frontend",
+        "allspark frontend",
+    ),
     "riot-standalone": ("riot-standalone", "riot2", "riot 2", "riot2.0", "riot 2.0", "单体版"),
     "fms-java": ("fms-java", "riot1", "riot 1", "riot1.0", "riot 1.0", "fms", "车队管理系统"),
     "allsparkbox": ("allsparkbox", "部署包", "安装包"),
@@ -52,6 +60,14 @@ PROJECT_DOMAIN_KEYWORDS = {
         "mrs",
         "电梯",
         "风淋门",
+    ),
+    "riot-frontend-v3": (
+        "前端",
+        "frontend",
+        "vite",
+        "pinia",
+        "vue router",
+        "unocss",
     ),
     "riot-standalone": (
         "brokerx",

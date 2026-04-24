@@ -43,7 +43,7 @@ async def test_should_prepare_analysis_workspace_requires_explicit_analysis(tmp_
 
     monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
 
-    msg = {"content": "收到附件了", "media_info_json": json.dumps({"type": "image"})}
+    msg = {"content": "[图片]", "media_info_json": json.dumps({"type": "image"})}
     assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=None, session_id=1) is False
 
     analysis_msg = {"content": "帮我分析这个问题", "media_info_json": json.dumps({"type": "image"})}
@@ -51,7 +51,10 @@ async def test_should_prepare_analysis_workspace_requires_explicit_analysis(tmp_
 
     existing_dir = (tmp_path / ".triage" / "session-1-demo")
     existing_dir.mkdir(parents=True, exist_ok=True)
-    assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=None, session_id=1) is True
+    assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=None, session_id=1) is False
+
+    text_msg = {"content": "继续分析刚才的附件", "media_info_json": json.dumps({}, ensure_ascii=False)}
+    assert await pipeline_mod._should_prepare_analysis_workspace(text_msg, session=None, session_id=1) is True
 
 
 @pytest.mark.asyncio
@@ -64,6 +67,9 @@ async def test_should_prepare_analysis_workspace_respects_session_level_analysis
     session = {"analysis_mode": 1, "analysis_workspace": str(tmp_path / ".triage" / "session-2-case")}
 
     assert await pipeline_mod._should_prepare_analysis_workspace(msg, session=session, session_id=2) is True
+
+    media_only_msg = {"content": "[图片]", "media_info_json": json.dumps({"type": "image"}, ensure_ascii=False)}
+    assert await pipeline_mod._should_prepare_analysis_workspace(media_only_msg, session=session, session_id=2) is False
 
 
 @pytest.mark.asyncio
@@ -606,3 +612,131 @@ async def test_download_message_media_to_workspace_for_post_images(tmp_path):
     stored_path = Path(media_info["local_paths"][0])
     assert stored_path.exists()
     assert stored_path.read_bytes() == b"\x89PNGpost-image"
+
+
+@pytest.mark.asyncio
+async def test_stage_message_media_to_temp_resource_uses_project_temp_dir(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    db_file = tmp_path / "app.sqlite"
+    async with aiosqlite.connect(db_file) as db:
+        await db.executescript(_SCHEMA)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO messages (id, platform, platform_message_id, chat_id, sender_id, sender_name, "
+            "message_type, content, received_at, raw_payload, media_info_json, attachment_path, thread_id, root_id, parent_id, "
+            "classified_type, session_id, pipeline_status, pipeline_error, processed_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                1, "feishu", "om_stage_001", "oc_x", "ou_x", "tester",
+                "image", "[图片]", now, "",
+                json.dumps({"type": "image", "image_key": "img_stage_001"}, ensure_ascii=False),
+                "", "", "", "", None, 1, "pending", "", None, now,
+            ),
+        )
+        await db.commit()
+
+    monkeypatch.setattr(pipeline_mod, "DB_PATH", str(db_file))
+    monkeypatch.setattr(pipeline_mod, "_resolve_temp_resource_root", lambda session: tmp_path / "allspark" / ".temp_resource")
+
+    fake_client = SimpleNamespace(
+        get_image_bytes=lambda image_key, *args, **kwargs: (b"\x89PNGstage-image", "stage.png"),
+        get_file_bytes=lambda *args, **kwargs: None,
+    )
+
+    with patch("core.connectors.feishu.FeishuClient", return_value=fake_client):
+        media_info = await pipeline_mod._stage_message_media_to_temp_resource(
+            1,
+            {
+                "id": 1,
+                "platform_message_id": "om_stage_001",
+                "message_type": "image",
+                "content": "[图片]",
+                "media_info_json": json.dumps({"type": "image", "image_key": "img_stage_001"}, ensure_ascii=False),
+                "attachment_path": "",
+            },
+            {"project": "allspark"},
+        )
+
+    assert media_info["download_status"] == "downloaded"
+    assert "temp_resource_dir" in media_info
+    staged_path = Path(media_info["staged_local_path"])
+    assert staged_path.exists()
+    assert staged_path.read_bytes() == b"\x89PNGstage-image"
+    assert ".temp_resource" in str(staged_path)
+    assert f"feishu\\{datetime.now().strftime('%Y%m%d')}\\om_stage_001\\original\\stage.png" in str(staged_path)
+
+    refreshed = await pipeline_mod._read_message(1)
+    assert refreshed is not None
+    assert refreshed["attachment_path"] == str(staged_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_materialize_analysis_workspace_copies_from_temp_resource_cache(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+
+    db_file = tmp_path / "app.sqlite"
+    staged_path = tmp_path / "allspark" / ".temp_resource" / "feishu" / "20260423" / "om_img_cache_001" / "original" / "capture.png"
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path.write_bytes(b"\x89PNGcached-image")
+
+    async with aiosqlite.connect(db_file) as db:
+        await db.executescript(_SCHEMA)
+        now = datetime.now().isoformat()
+        await db.execute(
+            "INSERT INTO messages (id, platform, platform_message_id, chat_id, sender_id, sender_name, "
+            "message_type, content, received_at, raw_payload, media_info_json, attachment_path, thread_id, root_id, parent_id, "
+            "classified_type, session_id, pipeline_status, pipeline_error, processed_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                1, "feishu", "om_img_cache_001", "oc_x", "ou_x", "tester",
+                "image", "[图片]", now, "",
+                json.dumps({
+                    "type": "image",
+                    "image_key": "img_key_001",
+                    "download_status": "downloaded",
+                    "temp_resource_dir": str(staged_path.parent.parent.resolve()),
+                    "staged_local_path": str(staged_path.resolve()),
+                    "local_path": str(staged_path.resolve()),
+                    "mime_type": "image/png",
+                }, ensure_ascii=False),
+                str(staged_path.resolve()), "", "", "", None, 1, "pending", "", None, now,
+            ),
+        )
+        await db.execute(
+            "INSERT INTO messages (id, platform, platform_message_id, chat_id, sender_id, sender_name, "
+            "message_type, content, received_at, raw_payload, media_info_json, attachment_path, thread_id, root_id, parent_id, "
+            "classified_type, session_id, pipeline_status, pipeline_error, processed_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                2, "feishu", "om_txt_cache_002", "oc_x", "ou_x", "tester",
+                "text", "帮我分析刚才的截图", now, "",
+                json.dumps({}, ensure_ascii=False),
+                "", "", "", "", None, 1, "pending", "", None, now,
+            ),
+        )
+        await db.commit()
+
+    monkeypatch.setattr(pipeline_mod, "DB_PATH", str(db_file))
+    monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
+
+    fake_client = SimpleNamespace(
+        get_image_bytes=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should reuse staged file")),
+        get_file_bytes=lambda *args, **kwargs: None,
+    )
+
+    with patch("core.connectors.feishu.FeishuClient", return_value=fake_client):
+        triage_dir = await pipeline_mod._materialize_analysis_workspace(
+            2,
+            {"id": 2, "content": "帮我分析刚才的截图", "platform_message_id": "om_txt_cache_002"},
+            {"id": 1, "title": "截图问题分析", "topic": "", "project": "allspark"},
+            1,
+        )
+
+    copied_path = triage_dir / "01-intake" / "attachments" / "om_img_cache_001" / "original" / "capture.png"
+    assert copied_path.exists()
+    assert copied_path.read_bytes() == b"\x89PNGcached-image"
+
+    refreshed = await pipeline_mod._read_message(1)
+    assert refreshed is not None
+    assert refreshed["attachment_path"] == str(staged_path.resolve())

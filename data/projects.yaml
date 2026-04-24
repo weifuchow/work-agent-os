@@ -16,12 +16,21 @@ projects:
   - name: allspark
     path: D:/standard/riot/allspark
     description: >
-      Riot 调度系统 3.0（allspark）。别名：riot3、RIOT3、riot3调度系统。
+      Riot 调度系统 3.0（allspark）后端/调度核心。别名：riot3、RIOT3、riot3调度系统。
       版本线索：3.x、v3.x、RIOT3.0。
       Java 11 + Spring Boot 2.7.6 + Gradle + TDengine。
       多机器人调度与控制系统：AGV 路径规划（TDSPP/A*）、死锁解决、行为树任务编排、
       设备管理（充电桩/电梯/风淋门，Modbus/S7/HTTP/SocketIO）、RBAC + JWT 安全层。
+      若用户明确提到 RIOT3 前端、frontend、页面/UI/Web 控制台，请优先路由到 riot-frontend-v3。
       模块：apps/ packages/ plugins/ src/ frontend/ ai/。
+
+  - name: riot-frontend-v3
+    path: D:/standard/riot/riot-frontend-v3
+    description: >
+      RIOT3 前端项目（riot-frontend-v3）。别名：riot3前端、riot3 前端、RIOT3前端、RIOT3 前端、riot3 frontend、riot3-frontend、allspark frontend。
+      关键词线索：前端、frontend、Web UI、页面、控制台、Vue 3、Vite、Pinia。
+      Riot 3.0 Web 控制台与前端工作台，处理页面/UI/交互/前端构建相关问题。
+      技术栈：Vue 3 + TypeScript + Vite + Pinia + Vue Router + UnoCSS。
 
   - name: riot-standalone
     path: D:/standard/riot/riot-standalone
