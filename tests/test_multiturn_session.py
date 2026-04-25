@@ -728,6 +728,8 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
             "project_name": project_name,
             "prompt": prompt,
             "session_id": session_id,
+            "skill": kwargs.get("skill"),
+            "exclude_skills": kwargs.get("exclude_skills"),
         })
         return {
             "text": "先给出结论：当前问题更像调度侧自动充电任务生成链路异常。",
@@ -752,13 +754,23 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
 
     assert msg["pipeline_status"] == "completed"
     assert session["project"] == "allspark"
-    assert session["agent_session_id"] == PROJECT_SESSION_ID
+    assert session["agent_session_id"] == ""
+    assert session["analysis_mode"] == 1
+    assert session["analysis_workspace"]
     assert mock_orch.await_count == 0, "Direct ONES route should not call orchestrator"
     assert mock_proj.await_count == 1
     assert project_calls[0]["project_name"] == "allspark"
     assert project_calls[0]["session_id"] is None
+    assert project_calls[0]["skill"] == "riot-log-triage"
+    assert project_calls[0]["exclude_skills"] == {"ones"}
     assert direct_route["prompt"] in project_calls[0]["prompt"]
     assert "[ONES 下载产物]" in project_calls[0]["prompt"]
+    assert "[RIOT 日志排障状态流]" in project_calls[0]["prompt"]
+    assert "search_worker_usage=" in project_calls[0]["prompt"]
+    assert "dsl_round1=" in project_calls[0]["prompt"]
+    state = json.loads((Path(session["analysis_workspace"]) / "00-state.json").read_text(encoding="utf-8"))
+    assert state["agent_context"]["session_id"] == PROJECT_SESSION_ID
+    assert state["agent_context"]["skill"] == "riot-log-triage"
     assert len(_feishu_replies) == 1
 
     print("\n[PASS] A4: Direct ONES route skips orchestrator and enters project agent")

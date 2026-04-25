@@ -25,6 +25,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module", default="", help="Best current guess for the affected module.")
     parser.add_argument("--timezone", default="", help="Timezone label for the reported problem time.")
     parser.add_argument(
+        "--issue-type",
+        default="",
+        choices=["", "order_execution", "other", "unknown"],
+        help="Optional issue type anchor for the triage state.",
+    )
+    parser.add_argument("--order-id", default="", help="Known order id or dispatch id.")
+    parser.add_argument("--vehicle-name", default="", help="Known vehicle name or number.")
+    parser.add_argument("--task-id", default="", help="Known task id or sub-task id.")
+    parser.add_argument(
+        "--primary-question",
+        default="",
+        help="The direct question this triage must keep answering through the whole loop.",
+    )
+    parser.add_argument(
+        "--process-stage",
+        default="",
+        help="Known process stage, gate, or sub-flow active at the problem time.",
+    )
+    parser.add_argument(
         "--artifact-status",
         default="unknown",
         choices=["unknown", "partial", "complete"],
@@ -61,6 +80,12 @@ def main() -> int:
         timezone=args.timezone,
         artifact_status=args.artifact_status,
         missing_items=args.missing_item,
+        issue_type=args.issue_type,
+        order_id=args.order_id,
+        vehicle_name=args.vehicle_name,
+        task_id=args.task_id,
+        primary_question=args.primary_question,
+        process_stage=args.process_stage,
     )
     state["work_dir"] = str(triage_dir)
     save_state(state_path, state)

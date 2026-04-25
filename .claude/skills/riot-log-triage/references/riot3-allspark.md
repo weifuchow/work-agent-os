@@ -50,6 +50,22 @@
 - 第一轮先确认附件来自哪个导出入口，以及最终是 `.zip` 还是 `tar.gz`。
 - 先确认问题属于哪条链路：调度、预约、MRS、通知、指标、设备。
 - 先判断是否属于`订单 / 车辆任务执行问题`；只要涉及车辆任务执行，默认按订单链路处理。
+- `订单 / 车辆任务执行问题`首轮优先看 `bootstrap.log`，因为任务状态机和主流程门禁日志大多先在这里；`reservation.log`、`notify.log`、`mini_trace.log`、`mapf.log` 作为补充，不要先跳过去。
 - `订单 / 车辆任务执行问题`优先按 `订单ID -> 车辆名称 -> 时间` 收敛；没有订单ID时，不要只靠模糊时间窗下结论。
 - 再按链路 grep 对应模块中的日志文本、异常类名、订单号、车辆名称、车辆号。
 - 如果涉及附件日志，先完成 `UTC+0` 到项目现场时区的换算，再筛选时间窗。
+
+## Deadlock / Unlock Routing
+
+对 `RIOT3 / allspark`：
+
+- 如果问题是`死锁 / 解锁 / 死锁解除 / reroute / 路网互锁 / 交通冲突`，优先看 `mapf.log`。
+- `mapf.log` 是第一优先，因为：
+  - `com.standard.allspark.agvexecutor.dispatch.kernel.route.mapf` 单独打到 `mapf.log`
+  - `com.standard.allspark.agvexecutor.dispatch.kernel.traffic.DeadLockDetector` 也单独打到 `mapf.log`
+- 这类问题的补充文件优先级：
+  - `mapf.log`
+  - `bootstrap.log`
+  - `reservation.log`
+  - `mini_trace.log`
+- 如果只是车号命中，不要先去看 `metric.log`；`metric.log` 默认视为性能监控补充，不是死锁/解锁首轮主文件。

@@ -38,6 +38,10 @@ data/sessions/
 
 # Local temp and logs
 .tmp/
+.gradle-home/
+.gradle-user/
+.tmp_sros_info
+.temp_resource/
 .triage/
 .review/
 .worktrees/

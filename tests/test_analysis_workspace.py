@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS messages (
 """
 
 
+def test_extract_vehicle_name_matches_chinese_adjacent_token():
+    import core.pipeline as pipeline_mod
+
+    assert pipeline_mod._extract_vehicle_name_from_text("车辆AG0019在电梯内不出来") == "AG0019"
+
+
 @pytest.mark.asyncio
 async def test_should_prepare_analysis_workspace_requires_explicit_analysis(tmp_path, monkeypatch):
     import core.pipeline as pipeline_mod
@@ -130,6 +136,172 @@ def test_should_capture_process_trace_for_ones_and_urgent_issue():
         session=None,
         parsed={"classified_type": "urgent_issue"},
     ) is True
+
+
+def test_resolve_riot_log_triage_strategy_prefers_saved_triage_session(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    strategy = pipeline_mod._resolve_riot_log_triage_strategy(
+        project_name="allspark",
+        analysis_dir=tmp_path / ".triage" / "case-1",
+        session={"analysis_mode": 1, "analysis_workspace": str(tmp_path / ".triage" / "case-1")},
+        triage_state={
+            "mode": "structured",
+            "agent_context": {
+                "session_id": "triage-session-001",
+                "runtime": "codex",
+                "skill": "riot-log-triage",
+            },
+        },
+        ones_artifacts={"task": {"number": 1}},
+        msg={"content": "继续分析这单"},
+        agent_runtime="codex",
+    )
+
+    assert strategy["enabled"] is True
+    assert strategy["session_id"] == "triage-session-001"
+    assert strategy["preferred_skill"] == "riot-log-triage"
+    assert strategy["exclude_skills"] == {"ones"}
+    assert strategy["route_mode"] == "triage_resume"
+
+
+def test_resolve_riot_log_triage_strategy_starts_fresh_on_correction_turn(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    strategy = pipeline_mod._resolve_riot_log_triage_strategy(
+        project_name="allspark",
+        analysis_dir=tmp_path / ".triage" / "case-1",
+        session={"analysis_mode": 1, "analysis_workspace": str(tmp_path / ".triage" / "case-1")},
+        triage_state={
+            "mode": "structured",
+            "agent_context": {
+                "session_id": "triage-session-001",
+                "runtime": "codex",
+                "skill": "riot-log-triage",
+            },
+        },
+        ones_artifacts=None,
+        msg={"content": "CrossMapManager日志打印出来，http是干扰项"},
+        agent_runtime="codex",
+    )
+
+    assert strategy["enabled"] is True
+    assert strategy["session_id"] == ""
+    assert strategy["route_mode"] == "triage_project"
+    assert strategy["correction_turn"] is True
+
+
+def test_ensure_riot_log_triage_state_ready_seeds_time_alignment_and_keyword_package(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    analysis_dir = tmp_path / ".triage" / "case-1"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    state = pipeline_mod._triage_state_payload(
+        session_id=88,
+        session={"project": "allspark", "title": "AG0019 乘梯后卡住"},
+        msg={"content": "帮我分析 AG0019 乘梯卡住"},
+        triage_dir=analysis_dir,
+    )
+    pipeline_mod._save_triage_state(analysis_dir, state)
+
+    ones_result = {
+        "summary_snapshot": {
+            "status": "ready",
+            "summary_text": "AG0019 在 2026-04-21 18:34 乘梯从 4 楼去 5 楼后长时间不动。",
+            "problem_time": "2026-04-21 18:34:00",
+            "version_normalized": "3.46.23",
+            "business_identifiers": ["AG0019", "taskKey=358208"],
+            "observations": ["涉及电梯切图和后续移动未继续下发"],
+            "image_findings": [],
+        },
+        "paths": {
+            "summary_snapshot_json": str(tmp_path / "summary_snapshot.json"),
+        },
+    }
+
+    updated = pipeline_mod._ensure_riot_log_triage_state_ready(
+        analysis_dir=analysis_dir,
+        session={"title": "AG0019 乘梯后卡住", "analysis_mode": 1, "analysis_workspace": str(analysis_dir)},
+        msg={"content": "继续分析 AG0019 乘梯卡住"},
+        project_name="allspark",
+        ones_artifacts=ones_result,
+        ones_check={"status": "complete"},
+    )
+
+    assert updated["phase"] == "keywords_ready"
+    assert updated["current_question"] == "围绕用户当前问题建立首轮证据锚点"
+    assert updated["version_info"]["value"] == "3.46.23"
+    assert updated["time_alignment"]["problem_timezone"] == "UTC+8"
+    assert updated["time_alignment"]["normalized_problem_time"] == "2026-04-21 10:34:00"
+    assert updated["time_alignment"]["normalized_window"]["start"] == "2026-04-21 10:04:00"
+    assert updated["evidence_anchor"]["vehicle_name"] == "AG0019"
+    assert updated["evidence_anchor"]["order_id"] == "358208"
+    assert updated["keyword_package_status"] == "ready"
+    assert updated["search_artifacts"]["dsl_round1"] == str(analysis_dir / "query.round1.dsl.txt")
+
+    keyword_path = analysis_dir / "keyword_package.round1.json"
+    dsl_path = analysis_dir / "query.round1.dsl.txt"
+    assert keyword_path.exists()
+    assert dsl_path.exists()
+    keyword_package = json.loads(keyword_path.read_text(encoding="utf-8"))
+    assert keyword_package["anchor_terms"] == ["AG0019", "358208"]
+    assert keyword_package["dsl_query"] == dsl_path.read_text(encoding="utf-8").strip()
+    assert '"AG0019"' in keyword_package["dsl_query"]
+    assert '"358208"' in keyword_package["dsl_query"]
+    assert keyword_package["gate_terms"] == []
+    assert keyword_package["generic_terms"] == []
+    assert keyword_package["target_files"] == []
+    assert keyword_package["preferred_files"] == []
+    assert keyword_package["excluded_files"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_project_agent_filters_ones_and_passes_preferred_skill(tmp_path, monkeypatch):
+    import core.pipeline as pipeline_mod
+    import core.projects as projects_mod
+    from core.orchestrator import agent_client as agent_client_mod
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_for_project(**kwargs):
+        captured.update(kwargs)
+        return {"text": "ok", "session_id": "triage-session-002"}
+
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: SimpleNamespace(name=name, path=tmp_path, description="demo project"),
+    )
+    monkeypatch.setattr(
+        projects_mod,
+        "prepare_project_runtime_context",
+        lambda project_name: SimpleNamespace(execution_path=tmp_path),
+    )
+    monkeypatch.setattr(projects_mod, "build_project_runtime_prompt_block", lambda runtime_context: "")
+    monkeypatch.setattr(
+        projects_mod,
+        "merge_skills",
+        lambda *args, **kwargs: {
+            "ones": SimpleNamespace(description="intake", prompt="ones prompt"),
+            "riot-log-triage": SimpleNamespace(description="triage", prompt="triage prompt"),
+            "other": SimpleNamespace(description="other", prompt="other prompt"),
+        },
+    )
+    monkeypatch.setattr(agent_client_mod.agent_client, "run_for_project", fake_run_for_project)
+
+    result = await pipeline_mod._run_project_agent(
+        "allspark",
+        "排查 AG0019",
+        "triage-session-001",
+        runtime="codex",
+        runtime_context=SimpleNamespace(execution_path=tmp_path),
+        skill="riot-log-triage",
+        exclude_skills={"ones"},
+    )
+
+    assert result["session_id"] == "triage-session-002"
+    assert captured["skill"] == "riot-log-triage"
+    assert set(captured["project_agents"]) == {"riot-log-triage", "other"}
 
 
 def test_summarize_codex_rollout_collects_commentary_and_tool_steps(tmp_path):
@@ -517,7 +689,7 @@ async def test_materialize_analysis_workspace_downloads_related_session_media(tm
     monkeypatch.setattr(pipeline_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
 
     fake_client = SimpleNamespace(
-        get_image_bytes=lambda image_key: (b"\x89PNGtriage-image", "capture.png"),
+        get_image_bytes=lambda image_key, **kwargs: (b"\x89PNGtriage-image", "capture.png"),
         get_file_bytes=lambda file_key: None,
     )
 

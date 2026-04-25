@@ -20,6 +20,11 @@ TIMESTAMP_PATTERNS = [
     re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3,6})?(?:Z|[+-]\d{2}:\d{2})?)"),
     re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"),
 ]
+ORDER_CANDIDATE_PATTERNS = [
+    ("vehicle_pipe", re.compile(r"(?P<vehicle>[A-Za-z0-9_-]+)\|(?P<order>\d{5,12})[.|:]")),
+    ("order_field", re.compile(r"\border(?:Key|Id|No)?\b\s*[:=]\s*['\"]?(?P<order>\d{5,12})['\"]?", re.IGNORECASE)),
+    ("json_order_field", re.compile(r'"order(?:Key|Id|No)?"\s*:\s*"?(?P<order>\d{5,12})"?', re.IGNORECASE)),
+]
 TEXT_EXTENSIONS = {
     ".log",
     ".txt",
@@ -34,6 +39,8 @@ TEXT_EXTENSIONS = {
     ".xml",
     ".properties",
 }
+GZIP_MAGIC = b"\x1f\x8b"
+ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where search_results.json and evidence_summary.md are written. "
              "Defaults to <state_dir>/search-runs/<timestamp> or <search_root>/search-runs/<timestamp>.",
     )
-    parser.add_argument("--max-hits", type=int, default=40, help="Maximum evidence hits to keep.")
+    parser.add_argument("--max-hits", type=int, default=100, help="Maximum evidence hits to keep.")
     parser.add_argument(
         "--context-lines",
         type=int,
@@ -87,19 +94,63 @@ def load_keyword_package(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def normalize_package(raw: dict[str, Any]) -> dict[str, Any]:
+    anchor_terms = [str(item).strip() for item in raw.get("anchor_terms", []) if str(item).strip()]
+    gate_terms = [str(item).strip() for item in raw.get("gate_terms", []) if str(item).strip()]
+    generic_terms = [str(item).strip() for item in raw.get("generic_terms", []) if str(item).strip()]
     include_terms = [str(item).strip() for item in raw.get("include_terms", []) if str(item).strip()]
+    if not include_terms and (anchor_terms or gate_terms or generic_terms):
+        include_terms = [*anchor_terms, *gate_terms, *generic_terms]
     exclude_terms = [str(item).strip() for item in raw.get("exclude_terms", []) if str(item).strip()]
     target_files = [str(item).strip() for item in raw.get("target_files", []) if str(item).strip()]
+    preferred_files = [str(item).strip() for item in raw.get("preferred_files", []) if str(item).strip()]
+    excluded_files = [str(item).strip() for item in raw.get("excluded_files", []) if str(item).strip()]
     hypotheses = [str(item).strip() for item in raw.get("hypotheses", []) if str(item).strip()]
     normalized = {
+        "anchor_terms": anchor_terms,
+        "gate_terms": gate_terms,
+        "generic_terms": generic_terms,
         "include_terms": include_terms,
         "exclude_terms": exclude_terms,
         "target_files": target_files,
+        "preferred_files": preferred_files,
+        "excluded_files": excluded_files,
         "hypotheses": hypotheses,
         "require_all_terms": bool(raw.get("require_all_terms", False)),
+        "require_anchor": bool(raw.get("require_anchor", False)),
         "time_window": normalize_time_window(raw.get("time_window") or {}),
     }
     return normalized
+
+
+def enforce_state_constraints(package: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return package
+
+    constrained = dict(package)
+    evidence_anchor = dict(state.get("evidence_anchor") or {})
+    vehicle_name = str(evidence_anchor.get("vehicle_name") or "").strip()
+    anchor_terms = list(constrained.get("anchor_terms") or [])
+    include_terms = list(constrained.get("include_terms") or [])
+    order_id = str(evidence_anchor.get("order_id") or "").strip()
+
+    if vehicle_name:
+        if vehicle_name not in anchor_terms:
+            anchor_terms.insert(0, vehicle_name)
+        if vehicle_name not in include_terms:
+            include_terms.insert(0, vehicle_name)
+    if order_id:
+        if order_id not in anchor_terms:
+            anchor_terms.append(order_id)
+        if order_id not in include_terms:
+            include_terms.append(order_id)
+
+    if not anchor_terms:
+        return constrained
+
+    constrained["anchor_terms"] = anchor_terms
+    constrained["include_terms"] = include_terms
+    constrained["require_anchor"] = True
+    return constrained
 
 
 def normalize_time_window(raw: dict[str, Any]) -> dict[str, str]:
@@ -120,32 +171,53 @@ def make_output_dir(args: argparse.Namespace, state_path: Path | None, search_ro
 
 
 def should_scan_path(path_str: str, package: dict[str, Any]) -> bool:
+    excluded = package.get("excluded_files") or []
+    lowered = path_str.lower()
+    if any(excluded_name.lower() in lowered for excluded_name in excluded):
+        return False
     targets = package.get("target_files") or []
     if not targets:
         return True
-    lowered = path_str.lower()
     return any(target.lower() in lowered for target in targets)
 
 
+def _path_priority(path_str: str, package: dict[str, Any]) -> tuple[int, str]:
+    lowered = path_str.lower()
+    preferred = package.get("preferred_files") or []
+    for index, preferred_name in enumerate(preferred):
+        if preferred_name.lower() in lowered:
+            return index, lowered
+    return len(preferred), lowered
+
+
 def iter_documents(root: Path, package: dict[str, Any]) -> Iterator[tuple[str, Iterator[str]]]:
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
+    paths = [path for path in root.rglob("*") if path.is_file()]
+    paths.sort(key=lambda path: _path_priority(str(path.relative_to(root)), package))
+    for path in paths:
         display_path = str(path.relative_to(root))
-        if not should_scan_path(display_path, package):
-            continue
         suffixes = [suffix.lower() for suffix in path.suffixes]
-        if path.suffix.lower() in TEXT_EXTENSIONS or path.suffix == "":
-            yield display_path, iter_text_lines(path)
-            continue
         if suffixes[-2:] == [".tar", ".gz"] or path.suffix.lower() in {".tgz", ".tar"}:
+            # For archives, filter on members inside the bundle rather than the outer archive name.
+            lowered = display_path.lower()
+            excluded = package.get("excluded_files") or []
+            if any(excluded_name.lower() in lowered for excluded_name in excluded):
+                continue
             yield from iter_tar_documents(path, root, package)
             continue
         if path.suffix.lower() == ".zip":
+            lowered = display_path.lower()
+            excluded = package.get("excluded_files") or []
+            if any(excluded_name.lower() in lowered for excluded_name in excluded):
+                continue
             yield from iter_zip_documents(path, root, package)
             continue
+        if not should_scan_path(display_path, package):
+            continue
+        if path.suffix.lower() in TEXT_EXTENSIONS or path.suffix == "":
+            yield display_path, iter_text_lines(path)
+            continue
         if path.suffix.lower() == ".gz":
-            yield display_path, iter_gzip_lines(path)
+            yield display_path, iter_maybe_compressed_file(path)
 
 
 def iter_text_lines(path: Path) -> Iterator[str]:
@@ -160,12 +232,43 @@ def iter_gzip_lines(path: Path) -> Iterator[str]:
             yield line.rstrip("\n")
 
 
+def detect_binary_format(header: bytes) -> str:
+    if header.startswith(GZIP_MAGIC):
+        return "gzip"
+    if any(header.startswith(magic) for magic in ZIP_MAGICS):
+        return "zip"
+    return "text"
+
+
+def iter_zip_bytes_lines(data: bytes) -> Iterator[str]:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = [name for name in archive.namelist() if not name.endswith("/")]
+        text_names = [name for name in names if is_text_member(name)]
+        selected_names = text_names or names
+        for name in selected_names:
+            with archive.open(name, "r") as handle:
+                yield from iter_bytes_lines(handle)
+
+
+def iter_maybe_compressed_file(path: Path) -> Iterator[str]:
+    with path.open("rb") as handle:
+        header = handle.read(4)
+    binary_format = detect_binary_format(header)
+    if binary_format == "gzip":
+        yield from iter_gzip_lines(path)
+        return
+    if binary_format == "zip":
+        yield from iter_zip_bytes_lines(path.read_bytes())
+        return
+    yield from iter_text_lines(path)
+
+
 def iter_tar_documents(path: Path, root: Path, package: dict[str, Any]) -> Iterator[tuple[str, Iterator[str]]]:
     mode = "r:gz" if path.suffix.lower() in {".gz", ".tgz"} else "r:"
     with tarfile.open(path, mode) as archive:
-        for member in archive.getmembers():
-            if not member.isfile():
-                continue
+        members = [member for member in archive.getmembers() if member.isfile()]
+        members.sort(key=lambda member: _path_priority(f"{path.relative_to(root)}::{member.name}", package))
+        for member in members:
             display_path = f"{path.relative_to(root)}::{member.name}"
             if not should_scan_path(display_path, package):
                 continue
@@ -175,16 +278,16 @@ def iter_tar_documents(path: Path, root: Path, package: dict[str, Any]) -> Itera
             if extracted is None:
                 continue
             if member.name.lower().endswith(".gz"):
-                yield display_path, iter_gzip_member_lines(extracted)
+                yield display_path, iter_maybe_compressed_member_lines(extracted)
             else:
                 yield display_path, iter_bytes_lines(extracted)
 
 
 def iter_zip_documents(path: Path, root: Path, package: dict[str, Any]) -> Iterator[tuple[str, Iterator[str]]]:
     with zipfile.ZipFile(path) as archive:
-        for name in archive.namelist():
-            if name.endswith("/"):
-                continue
+        names = [name for name in archive.namelist() if not name.endswith("/")]
+        names.sort(key=lambda name: _path_priority(f"{path.relative_to(root)}::{name}", package))
+        for name in names:
             display_path = f"{path.relative_to(root)}::{name}"
             if not should_scan_path(display_path, package):
                 continue
@@ -192,7 +295,7 @@ def iter_zip_documents(path: Path, root: Path, package: dict[str, Any]) -> Itera
                 continue
             with archive.open(name, "r") as handle:
                 if name.lower().endswith(".gz"):
-                    yield display_path, iter_gzip_member_lines(handle)
+                    yield display_path, iter_maybe_compressed_member_lines(handle)
                 else:
                     yield display_path, iter_bytes_lines(handle)
 
@@ -201,7 +304,12 @@ def is_text_member(name: str) -> bool:
     lower_name = name.lower()
     if any(lower_name.endswith(ext) for ext in TEXT_EXTENSIONS):
         return True
-    return lower_name.endswith(".log.gz")
+    if lower_name.endswith(".log.gz"):
+        return True
+    if lower_name.endswith(".gz"):
+        base_name = lower_name[:-3]
+        return any(ext in base_name for ext in TEXT_EXTENSIONS)
+    return False
 
 
 def iter_bytes_lines(handle: io.BufferedIOBase) -> Iterator[str]:
@@ -219,6 +327,20 @@ def iter_gzip_member_lines(handle: io.BufferedIOBase) -> Iterator[str]:
         with io.TextIOWrapper(gzip_handle, encoding="utf-8", errors="replace") as wrapper:
             for line in wrapper:
                 yield line.rstrip("\n")
+
+
+def iter_maybe_compressed_member_lines(handle: io.BufferedIOBase) -> Iterator[str]:
+    buffered = io.BufferedReader(handle)
+    header = buffered.peek(4)[:4]
+    binary_format = detect_binary_format(header)
+    if binary_format == "gzip":
+        yield from iter_gzip_member_lines(buffered)
+        return
+    if binary_format == "zip":
+        data = buffered.read()
+        yield from iter_zip_bytes_lines(data)
+        return
+    yield from iter_bytes_lines(buffered)
 
 
 def parse_timestamp(text: str) -> str:
@@ -262,18 +384,74 @@ def comparable_datetime(value: str) -> datetime:
     return dt
 
 
-def match_terms(text: str, package: dict[str, Any]) -> list[str]:
+def should_collect_order_candidates(state: dict[str, Any] | None) -> bool:
+    if not state:
+        return False
+    evidence_anchor = dict(state.get("evidence_anchor") or {})
+    issue_type = str(evidence_anchor.get("issue_type") or "").strip()
+    vehicle_name = str(evidence_anchor.get("vehicle_name") or "").strip()
+    return issue_type == "order_execution" and bool(vehicle_name)
+
+
+def extract_order_candidates_from_line(*, line: str, vehicle_name: str) -> list[dict[str, str]]:
+    if not vehicle_name or vehicle_name not in line:
+        return []
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source, pattern in ORDER_CANDIDATE_PATTERNS:
+        for match in pattern.finditer(line):
+            matched_vehicle = str(match.groupdict().get("vehicle") or "").strip()
+            if matched_vehicle and matched_vehicle != vehicle_name:
+                continue
+            order_id = str(match.group("order") or "").strip()
+            if not order_id:
+                continue
+            key = (order_id, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"order_id": order_id, "source": source})
+    return candidates
+
+
+def classify_match(text: str, package: dict[str, Any]) -> dict[str, Any]:
     lowered = text.lower()
     exclude_terms = package.get("exclude_terms") or []
     if any(term.lower() in lowered for term in exclude_terms):
-        return []
+        return {"accepted": False, "matched_terms": [], "suppressed_reason": ""}
+
+    anchor_terms = package.get("anchor_terms") or []
+    gate_terms = package.get("gate_terms") or []
+    generic_terms = package.get("generic_terms") or []
+    matched_anchor = [term for term in anchor_terms if term.lower() in lowered]
+    matched_gate = [term for term in gate_terms if term.lower() in lowered]
+    matched_generic = [term for term in generic_terms if term.lower() in lowered]
+
+    categorized_terms = [*matched_anchor, *matched_gate, *matched_generic]
+    if categorized_terms:
+        if package.get("require_anchor") and anchor_terms and not matched_anchor:
+            return {
+                "accepted": False,
+                "matched_terms": categorized_terms,
+                "suppressed_reason": "missing_anchor",
+            }
+        return {
+            "accepted": True,
+            "matched_terms": categorized_terms,
+            "suppressed_reason": "",
+        }
+
     include_terms = package.get("include_terms") or []
     if not include_terms:
-        return []
+        return {"accepted": False, "matched_terms": [], "suppressed_reason": ""}
     matched = [term for term in include_terms if term.lower() in lowered]
     if package.get("require_all_terms"):
-        return matched if len(matched) == len(include_terms) else []
-    return matched
+        return {
+            "accepted": len(matched) == len(include_terms),
+            "matched_terms": matched if len(matched) == len(include_terms) else [],
+            "suppressed_reason": "",
+        }
+    return {"accepted": bool(matched), "matched_terms": matched, "suppressed_reason": ""}
 
 
 def matched_file_targets(path_str: str, package: dict[str, Any]) -> list[str]:
@@ -338,13 +516,22 @@ def scan_documents(
     max_hits: int,
     context_lines: int,
     max_documents: int,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     hits: list[dict[str, Any]] = []
     per_file_counter: Counter[str] = Counter()
+    suppressed_counter: Counter[str] = Counter()
+    order_candidate_counter: Counter[str] = Counter()
+    order_candidate_sources: dict[str, set[str]] = {}
+    order_candidate_samples: dict[str, list[dict[str, Any]]] = {}
     scanned_documents = 0
     truncated = False
     scanned_paths: list[str] = []
     skipped_documents: list[dict[str, str]] = []
+    collect_order_candidates = should_collect_order_candidates(state)
+    vehicle_name = ""
+    if state:
+        vehicle_name = str(dict(state.get("evidence_anchor") or {}).get("vehicle_name") or "").strip()
 
     for display_path, lines_iter in iter_documents(root, package):
         if scanned_documents >= max_documents:
@@ -362,6 +549,25 @@ def scan_documents(
             ts = parse_timestamp(line)
             if ts:
                 last_timestamp = ts
+            if (
+                collect_order_candidates
+                and vehicle_name
+                and timestamp_in_window(last_timestamp, package)
+                and vehicle_name in line
+            ):
+                for candidate in extract_order_candidates_from_line(line=line, vehicle_name=vehicle_name):
+                    order_id = candidate["order_id"]
+                    source = candidate["source"]
+                    order_candidate_counter[order_id] += 1
+                    order_candidate_sources.setdefault(order_id, set()).add(source)
+                    samples = order_candidate_samples.setdefault(order_id, [])
+                    if len(samples) < 3:
+                        samples.append({
+                            "path": display_path,
+                            "line_number": line_number,
+                            "timestamp": last_timestamp,
+                            "line": line[:600],
+                        })
             if pending_hit is not None and post_context > 0:
                 pending_hit["excerpt_lines"].append(line)
                 post_context -= 1
@@ -369,8 +575,17 @@ def scan_documents(
                     finalize_hit(hits, pending_hit)
                     pending_hit = None
 
-            matched_terms = match_terms(line, package)
-            if matched_terms and timestamp_in_window(last_timestamp, package):
+            match_info = classify_match(line, package)
+            matched_terms = list(match_info.get("matched_terms") or [])
+            if (
+                not match_info.get("accepted")
+                and matched_terms
+                and match_info.get("suppressed_reason")
+                and timestamp_in_window(last_timestamp, package)
+            ):
+                suppressed_counter[display_path] += 1
+
+            if match_info.get("accepted") and matched_terms and timestamp_in_window(last_timestamp, package):
                 if len(hits) >= max_hits:
                     truncated = True
                     break
@@ -419,6 +634,20 @@ def scan_documents(
             {"path": path, "hits": count}
             for path, count in per_file_counter.most_common(10)
         ],
+        "suppressed_hits_total": int(sum(suppressed_counter.values())),
+        "suppressed_top_files": [
+            {"path": path, "hits": count}
+            for path, count in suppressed_counter.most_common(10)
+        ],
+        "order_candidates": [
+            {
+                "order_id": order_id,
+                "hits": count,
+                "sources": sorted(order_candidate_sources.get(order_id) or []),
+                "samples": order_candidate_samples.get(order_id) or [],
+            }
+            for order_id, count in order_candidate_counter.most_common(10)
+        ],
         "evidence_hits": hits,
         "skipped_documents": skipped_documents,
     }
@@ -439,24 +668,47 @@ def finalize_hit(hits: list[dict[str, Any]], pending_hit: dict[str, Any]) -> Non
 
 
 def write_markdown_summary(output_path: Path, result: dict[str, Any]) -> None:
+    round_no = int(result.get("round_no") or 0)
+    focus_question = str(result.get("focus_question") or "").strip()
+    window_label = format_time_window(dict(result.get("keyword_package", {}).get("time_window") or {}))
     lines = [
         "# Evidence Summary",
         "",
+    ]
+    if round_no:
+        lines.append(f"- Narrowing round: {round_no}")
+    if focus_question:
+        lines.append(f"- Focus question: {focus_question}")
+    if window_label:
+        lines.append(f"- Time window: {window_label}")
+    lines.extend([
         f"- Search root: `{result['search_root']}`",
         f"- Documents scanned: {result['documents_scanned']}",
         f"- Hits total: {result['hits_total']}",
         f"- Hits truncated: {'yes' if result['hits_truncated'] else 'no'}",
+        f"- Suppressed hits: {int(result.get('suppressed_hits_total') or 0)}",
         f"- Matched terms: {', '.join(result['matched_terms']) if result['matched_terms'] else 'none'}",
         f"- Unmatched terms: {', '.join(result['unmatched_terms']) if result['unmatched_terms'] else 'none'}",
         "",
         "## Top Files",
         "",
-    ]
+    ])
     if result["top_files"]:
         for item in result["top_files"]:
             lines.append(f"- `{item['path']}`: {item['hits']} hits")
     else:
         lines.append("- No matching files")
+
+    if result.get("order_candidates"):
+        lines.extend(["", "## Order Candidates", ""])
+        for item in result["order_candidates"]:
+            source_label = ", ".join(item.get("sources") or []) or "unknown"
+            lines.append(f"- `{item['order_id']}`: {item['hits']} hits ({source_label})")
+
+    if result.get("suppressed_top_files"):
+        lines.extend(["", "## Suppressed Files", ""])
+        for item in result["suppressed_top_files"]:
+            lines.append(f"- `{item['path']}`: {item['hits']} suppressed hits")
 
     lines.extend(["", "## Evidence Table", ""])
     if result["evidence_hits"]:
@@ -489,27 +741,64 @@ def write_markdown_summary(output_path: Path, result: dict[str, Any]) -> None:
         lines.append("- No hits")
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
-
-def update_state_after_search(state_path: Path, result_json: Path, summary_md: Path, hits_total: int) -> None:
+def update_state_after_search(
+    state_path: Path,
+    result_json: Path,
+    summary_md: Path,
+    result: dict[str, Any],
+    round_no: int,
+) -> None:
     state = load_state(state_path)
     state["search_status"] = "returned"
-    state["search_artifacts"] = {
+    search_artifacts = dict(state.get("search_artifacts") or {})
+    search_artifacts.update({
         "last_result_json": str(result_json),
         "last_result_md": str(summary_md),
+    })
+    state["search_artifacts"] = search_artifacts
+    state["order_candidates"] = list(result.get("order_candidates") or [])
+    state["target_log_files"] = list(result.get("keyword_package", {}).get("target_files") or [])
+    time_window = dict(result.get("keyword_package", {}).get("time_window") or {})
+    state["time_alignment"]["normalized_window"] = {
+        "start": str(time_window.get("start") or "").strip(),
+        "end": str(time_window.get("end") or "").strip(),
     }
-    if hits_total > 0 and state.get("evidence_chain_status") == "weak":
+    state["delegation"]["status"] = "completed"
+    state["delegation"]["last_scope"] = result.get("search_root", "")
+    history = list(state.get("narrowing_round", {}).get("history") or [])
+    history.append({
+        "round": round_no,
+        "focus_question": state.get("current_question") or state.get("primary_question") or state.get("problem_summary", ""),
+        "time_window": time_window,
+        "target_files": state["target_log_files"],
+        "include_terms": list(result.get("keyword_package", {}).get("include_terms") or []),
+        "exclude_terms": list(result.get("keyword_package", {}).get("exclude_terms") or []),
+        "hits_total": int(result.get("hits_total") or 0),
+        "matched_terms": list(result.get("matched_terms") or []),
+        "unmatched_terms": list(result.get("unmatched_terms") or []),
+        "result_json": str(result_json),
+        "summary_md": str(summary_md),
+    })
+    state["narrowing_round"]["history"] = history
+    if result["hits_total"] > 0 and state.get("evidence_chain_status") == "weak":
         state["evidence_chain_status"] = "partial"
-    if state.get("phase") == "keywords_ready":
-        state["phase"] = "search_delegated"
+    if state.get("phase") in {"keywords_ready", "search_delegated"}:
+        state["phase"] = "evidence_reviewed"
     save_state(state_path, state)
 
 
-def mark_search_started(state_path: Path) -> None:
+def mark_search_started(state_path: Path, *, search_root: Path) -> int:
     state = load_state(state_path)
+    next_round = int(state.get("narrowing_round", {}).get("current") or 0) + 1
+    state["narrowing_round"]["current"] = next_round
     state["search_status"] = "delegated"
+    state["delegation"]["search_mode"] = "subagent_or_skill"
+    state["delegation"]["status"] = "running"
+    state["delegation"]["last_scope"] = str(search_root)
     if state.get("phase") == "keywords_ready":
         state["phase"] = "search_delegated"
     save_state(state_path, state)
+    return next_round
 
 
 def main() -> int:
@@ -519,10 +808,13 @@ def main() -> int:
         raise SystemExit(f"Search root does not exist: {search_root}")
 
     state_path = Path(args.state).resolve() if args.state else None
+    state = load_state(state_path) if state_path else None
     package = normalize_package(load_keyword_package(args))
+    package = enforce_state_constraints(package, state)
     output_dir = make_output_dir(args, state_path, search_root)
+    round_no = 0
     if state_path:
-        mark_search_started(state_path)
+        round_no = mark_search_started(state_path, search_root=search_root)
 
     result = scan_documents(
         root=search_root,
@@ -530,7 +822,19 @@ def main() -> int:
         max_hits=args.max_hits,
         context_lines=args.context_lines,
         max_documents=args.max_documents,
+        state=state,
     )
+    if state_path:
+        current_state = load_state(state_path)
+        result["focus_question"] = (
+            current_state.get("current_question")
+            or current_state.get("primary_question")
+            or current_state.get("problem_summary")
+            or ""
+        )
+    else:
+        result["focus_question"] = ""
+    result["round_no"] = round_no
 
     result_json = output_dir / "search_results.json"
     result_md = output_dir / "evidence_summary.md"
@@ -538,12 +842,13 @@ def main() -> int:
     write_markdown_summary(result_md, result)
 
     if state_path:
-        update_state_after_search(state_path, result_json, result_md, result["hits_total"])
+        update_state_after_search(state_path, result_json, result_md, result, round_no)
 
     payload = {
         "output_dir": str(output_dir),
         "result_json": str(result_json),
         "summary_md": str(result_md),
+        "round_no": round_no,
         "hits_total": result["hits_total"],
         "top_files": result["top_files"],
         "unmatched_terms": result["unmatched_terms"],

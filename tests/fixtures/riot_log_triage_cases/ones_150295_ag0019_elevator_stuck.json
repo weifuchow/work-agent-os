@@ -1,0 +1,84 @@
+{
+  "case_id": "ones-150295-ag0019-elevator-stuck",
+  "title": "【玉晶光电(厦门)有限公司厦门集美工厂项目】RIot3.46.23小车AG0019乘梯时在电梯里面不出来",
+  "source": {
+    "type": "ones",
+    "task_number": 150295,
+    "task_uuid": "H5KnYfup2tU5dOZu",
+    "url": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/H5KnYfup2tU5dOZu"
+  },
+  "input": {
+    "project": "allspark",
+    "version": "3.46.23",
+    "problem_time_local": "2026-04-21 18:34:00",
+    "problem_timezone": "UTC+8",
+    "vehicle_name": "AG0019",
+    "summary": "小车乘梯从4楼去往5楼，切换地图后就一直在电梯里面不出来，十多分钟后，小车才开始移动。",
+    "prompt_without_hints": "RIot3.46.23 小车 AG0019 在 2026-04-21 18:34 乘梯从 4 楼去往 5 楼，切换地图后一直在电梯里面不出来，十多分钟后才开始移动。请分析日志原因。"
+  },
+  "artifacts": {
+    "attachments": [
+      {
+        "name": "allspark-log_20260423095934840.tar",
+        "kind": "log_bundle"
+      },
+      {
+        "name": "回放监控 - RIoT - Google Chrome 2026-04-23 09-55-08.mp4",
+        "kind": "video"
+      }
+    ]
+  },
+  "expected_progression": {
+    "issue_type": "order_execution",
+    "target_process_stage": "elevator-cross-map-next-move-gate",
+    "target_round": 2,
+    "must_establish": [
+      "问题时间点车辆状态快照",
+      "问题时间点订单/任务所在步骤",
+      "RIOT3 现场时间到 UTC+0 日志时间窗换算",
+      "乘梯/切图完成后的期望下一步动作"
+    ],
+    "target_focus_questions": [
+      "问题时间点车辆处于什么状态",
+      "问题时间点订单/任务处于什么步骤",
+      "乘梯/切图后理论下一步应该由谁下发什么动作",
+      "为什么后续移动没有继续下发"
+    ],
+    "should_seek_from_logs": [
+      "order_id",
+      "current_request",
+      "current_sub_task",
+      "ChangeMapRequest completion",
+      "vehicleProcState",
+      "next move dispatch gate"
+    ],
+    "must_use_code_to_infer": [
+      "切图/乘梯成功后理论下一步如何继续执行",
+      "哪个类/方法负责后续移动下发",
+      "哪个状态门禁会导致后续移动不再下发"
+    ]
+  },
+  "expected_convergence": {
+    "primary_stage": "先收敛到乘梯/切图后的后续移动未继续下发，而不是先停留在泛化现象层。",
+    "candidate_gate_terms": [
+      "CrossMapManager",
+      "vehicleProcState",
+      "IN_CHANGE_MAP",
+      "ChangeMapRequest",
+      "next move dispatch"
+    ],
+    "evidence_chain_shape": "问题现象 -> 问题时间点状态/步骤 -> 乘梯/切图门禁 -> 理论下一步 -> 实际未下发"
+  },
+  "acceptance": [
+    "在没有人工提示 CrossMapManager、vehicleProcState、HttpAct、订单号的情况下，优先收敛到乘梯/切图链路。",
+    "在 2 轮以内把主问题收口到“为什么后续移动没有继续下发”。",
+    "先还原运行过程，再依据代码判断期望下一步，而不是直接把现象词当根因。",
+    "把订单号作为需要从日志中继续补齐的强证据，而不是缺失后直接给高置信结论。"
+  ],
+  "anti_patterns": [
+    "直接把“没有规划路径”当成主因。",
+    "在没有还原运行过程前，直接把 HttpAct hang 当成直接原因。",
+    "不做 UTC+8 到 UTC+0 的时间换算。",
+    "不追问题时间点的订单/任务步骤，只围绕单条报错做解释。"
+  ]
+}

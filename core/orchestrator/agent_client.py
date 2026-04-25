@@ -556,9 +556,74 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     except Exception as e:
         logger.warning("Failed to create dispatch AgentRun: {}", e)
 
+    triage_managed = False
+    triage_analysis_dir: Path | None = None
+    triage_state: dict[str, Any] | None = None
+    triage_ones_artifacts: dict[str, Any] | None = None
+    preferred_skill: str | None = None
+    exclude_skills: set[str] = set()
+    session_context: dict[str, Any] | None = None
+    combined_context = "\n\n".join(part for part in [task, context] if str(part).strip())
+    if db_session_id:
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT id, project, analysis_mode, analysis_workspace FROM sessions WHERE id = ?",
+                    (db_session_id,),
+                )
+                row = await cursor.fetchone()
+                session_context = dict(row) if row else None
+        except Exception as e:
+            logger.warning("Failed to read session {} before dispatch: {}", db_session_id, e)
+
+    if session_context:
+        analysis_workspace = str(session_context.get("analysis_workspace") or "").strip()
+        if analysis_workspace:
+            triage_analysis_dir = Path(analysis_workspace)
+            try:
+                from core import pipeline as pipeline_mod
+
+                triage_state = pipeline_mod._load_triage_state(triage_analysis_dir)
+                triage_ones_artifacts = pipeline_mod._load_ones_artifacts_from_triage_state(triage_analysis_dir)
+                triage_strategy = pipeline_mod._resolve_riot_log_triage_strategy(
+                    project_name=project_name,
+                    analysis_dir=triage_analysis_dir,
+                    session=session_context,
+                    triage_state=triage_state,
+                    ones_artifacts=triage_ones_artifacts,
+                    msg={"content": combined_context},
+                    agent_runtime=runtime,
+                )
+                triage_managed = bool(triage_strategy.get("enabled"))
+                preferred_skill = str(triage_strategy.get("preferred_skill") or "").strip() or None
+                exclude_skills = set(triage_strategy.get("exclude_skills") or set())
+                if triage_managed:
+                    resume_session_id = str(triage_strategy.get("session_id") or "").strip() or None
+                    triage_state = pipeline_mod._ensure_riot_log_triage_state_ready(
+                        analysis_dir=triage_analysis_dir,
+                        session=session_context,
+                        msg={"content": combined_context},
+                        project_name=project_name,
+                        ones_artifacts=triage_ones_artifacts,
+                        ones_check=None,
+                    )
+                    task += "\n\n" + pipeline_mod._build_riot_log_triage_prompt_context(
+                        analysis_dir=triage_analysis_dir,
+                        triage_state=triage_state,
+                    )
+            except Exception as e:
+                logger.warning("Failed to prepare triage strategy for dispatch_to_project: {}", e)
+
     # Merge skills: project overrides global while inheriting shared workflow skills
     merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
-    runtime_context = prepare_project_runtime_context(project_name)
+    if exclude_skills:
+        merged_agents = {
+            name: definition
+            for name, definition in merged_agents.items()
+            if name not in exclude_skills
+        }
+    runtime_context = prepare_project_runtime_context(project_name, ones_result=triage_ones_artifacts)
     runtime_block = build_project_runtime_prompt_block(runtime_context)
 
     # List project-specific skills for the prompt
@@ -603,10 +668,24 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             project_agents=merged_agents,
             max_turns=20,
             session_id=resume_session_id,
+            skill=preferred_skill,
             runtime=runtime,
         )
 
         new_session_id = result.get("session_id")
+
+        if triage_managed and triage_analysis_dir and new_session_id and preferred_skill:
+            try:
+                from core import pipeline as pipeline_mod
+
+                pipeline_mod._persist_triage_agent_context(
+                    triage_analysis_dir,
+                    agent_session_id=str(new_session_id),
+                    agent_runtime=runtime,
+                    skill=preferred_skill,
+                )
+            except Exception as e:
+                logger.warning("Failed to persist triage agent context after dispatch: {}", e)
 
         # Update dispatch AgentRun with result
         if dispatch_run_id:
@@ -628,7 +707,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                 async with aiosqlite.connect(str(db_path)) as db:
                     updates = ["project = ?", "agent_runtime = ?", "updated_at = ?"]
                     params = [project_name, runtime, datetime.now().isoformat()]
-                    if new_session_id:
+                    if new_session_id and not triage_managed:
                         updates.append("agent_session_id = ?")
                         params.append(new_session_id)
                     params.append(db_session_id)
@@ -700,13 +779,15 @@ PROJECT_AGENT_RESPONSE_RULES = """
 5. 如果问题存在多层实现或多个可能口径，优先先给出你已经能确认的部分结论，再说明还缺哪一个关键信息。
 6. 对 ONES / 现场问题，先做证据完整性检查。若缺少问题时间、相关日志/异常堆栈、业务 ID、配置截图/配置片段等关键证据，先要求最小补料，不要直接分析根因。
 7. 对 ONES / 现场问题，现场证据只能来自当前工单、当前会话补料和仓库内能确认的代码/配置事实。不要把本机或仓库里其他无关历史日志当作现场证据；若引用，只能标注为实现参考。
-8. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
-9. `format=rich` 示例：
+8. 默认按纯静态分析处理：只读代码、配置、日志、历史记录和状态文件。除非用户明确要求“运行/构建/编译/测试/复现/启动服务”，禁止执行任何会启动项目、解析依赖或产生构建副作用的命令，例如 gradle/gradlew/mvn/npm/yarn/pnpm、docker compose、java -jar、pytest 等。需要验证时优先用已有日志和代码推理。
+9. Bash 仅用于只读检索与轻量文件盘点，例如 rg、Get-Content、Get-ChildItem、git status/show/describe、压缩包目录查看；不要为了“顺手验证”运行项目构建、依赖解析、测试或服务启动。
+10. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
+11. `format=rich` 示例：
    {"format":"rich","title":"标题","summary":"一句话总结","sections":[{"title":"结论","content":"核心结论"},{"title":"说明","content":"补充说明"}],"table":{"columns":[{"key":"item","label":"检查项","type":"text"}],"rows":[{"item":"配置"}]},"fallback_text":"纯文本兜底"}
-10. `format=flow` 示例：
+12. `format=flow` 示例：
    {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[开始]-->B[结束]","fallback_text":"纯文本兜底"}
-11. 闲聊、问候、极短确认可以继续输出自然语言正文。
-12. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
+13. 闲聊、问候、极短确认可以继续输出自然语言正文。
+14. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
 """.strip()
 
 # Orchestrator: separate MCP server with limited tools only.
@@ -1610,6 +1691,7 @@ class AgentClient:
         project_agents: dict,
         max_turns: int = 20,
         session_id: Optional[str] = None,
+        skill: Optional[str] = None,
         model: Optional[str] = None,
         runtime: Optional[str] = None,
         image_paths: list[str] | None = None,
@@ -1631,12 +1713,16 @@ class AgentClient:
                     system_prompt=system_prompt,
                     max_turns=max_turns,
                     session_id=session_id,
+                    skill=skill,
                     model=model,
                     cwd=project_cwd,
                     project_agents=project_agents,
                     scope="project",
                     image_paths=image_paths,
                 )
+
+            if skill and isinstance(prompt, str):
+                prompt = f"请使用 {skill} agent 来处理以下内容：\n\n{prompt}"
 
             if session_id and isinstance(prompt, str):
                 selected_model = self._select_model(model)
@@ -1653,6 +1739,7 @@ class AgentClient:
                 system_prompt=system_prompt,
                 max_turns=max_turns,
                 session_id=session_id,
+                skill=skill,
                 project_cwd=project_cwd,
                 project_agents=project_agents,
                 exclude_tools=[name for name in CUSTOM_TOOL_NAMES if name not in PROJECT_TOOL_NAMES],

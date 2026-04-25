@@ -23,6 +23,7 @@ import tempfile
 from types import SimpleNamespace
 import uuid
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
@@ -1056,15 +1057,6 @@ async def _process_message_locked(message_id: int, msg: dict,
     agent_runtime = normalize_agent_runtime(
         (session or {}).get("agent_runtime") or _get_default_agent_runtime()
     )
-    if ones_artifacts:
-        try:
-            await _ensure_ones_summary_snapshot(
-                msg=msg,
-                ones_result=ones_artifacts,
-                runtime=agent_runtime,
-            )
-        except Exception as e:
-            logger.warning("Pipeline: failed to build ONES summary snapshot: {}", e)
     direct_project = None
     active_project = project
     project_runtime_context = None
@@ -1084,13 +1076,61 @@ async def _process_message_locked(message_id: int, msg: dict,
     is_ones_case = bool(not staged_media_reply and (ones_artifacts or _ones_link_detected(msg) or ((triage_state or {}).get("ones_context"))))
     if is_ones_case:
         ones_check = _evaluate_ones_artifact_completeness(msg, ones_artifacts, analysis_dir)
-        if analysis_dir:
-            _persist_ones_context_to_triage_state(
-                analysis_dir,
+    if ones_artifacts and ones_check and ones_check.get("status") == "complete":
+        try:
+            await _ensure_ones_summary_snapshot(
+                msg=msg,
                 ones_result=ones_artifacts,
-                check=ones_check,
-                project_name=active_project or project,
+                runtime=agent_runtime,
             )
+        except Exception as e:
+            logger.warning("Pipeline: failed to build ONES summary snapshot: {}", e)
+    if _should_prepare_riot_log_triage_workspace_for_ones(
+        project_name=active_project or project,
+        analysis_dir=analysis_dir,
+        session_id=session_id,
+        msg=msg,
+        ones_artifacts=ones_artifacts,
+        ones_check=ones_check,
+        staged_media_reply=staged_media_reply,
+    ):
+        analysis_dir = await _materialize_analysis_workspace(message_id, msg, session, session_id)
+        triage_state = _load_triage_state(analysis_dir)
+    if is_ones_case and analysis_dir and ones_check:
+        _persist_ones_context_to_triage_state(
+            analysis_dir,
+            ones_result=ones_artifacts,
+            check=ones_check,
+            project_name=active_project or project,
+        )
+        triage_state = _load_triage_state(analysis_dir)
+    triage_agent_strategy = _resolve_riot_log_triage_strategy(
+        project_name=active_project or project,
+        analysis_dir=analysis_dir,
+        session=session,
+        triage_state=triage_state,
+        ones_artifacts=ones_artifacts,
+        msg=msg,
+        agent_runtime=agent_runtime,
+    )
+    triage_managed = bool(triage_agent_strategy.get("enabled"))
+    project_agent_skill = str(triage_agent_strategy.get("preferred_skill") or "").strip() or None
+    project_agent_exclude_skills = triage_agent_strategy.get("exclude_skills") or set()
+    triage_agent_sid = str(triage_agent_strategy.get("session_id") or "").strip()
+    if triage_managed and analysis_dir:
+        triage_state = _ensure_riot_log_triage_state_ready(
+            analysis_dir=analysis_dir,
+            session=session,
+            msg=msg,
+            project_name=active_project or project,
+            ones_artifacts=ones_artifacts,
+            ones_check=ones_check,
+        )
+        triage_state = await _run_riot_log_search_worker_if_ready(
+            analysis_dir=analysis_dir,
+            triage_state=triage_state,
+            ones_artifacts=ones_artifacts,
+        )
 
     # 4. Audit: log before agent call
     prompt = _build_prompt(msg, session)
@@ -1099,11 +1139,10 @@ async def _process_message_locked(message_id: int, msg: dict,
     if ones_check and ones_check.get("status") == "complete":
         prompt += _build_ones_evidence_guard_context(ones_check)
     if analysis_dir:
-        prompt += (
-            f"\n\n[分析工作目录] {analysis_dir}"
-            f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
-            f"\n[目录展示规则] 如果回复里需要展示目录，只展示分析工作目录：{analysis_dir}；"
-            "不要同时展示主仓库目录、执行目录或 worktree 目录。"
+        prompt += _build_analysis_workspace_prompt_context(
+            analysis_dir=analysis_dir,
+            triage_managed=triage_managed,
+            triage_state=triage_state,
         )
     session_image_paths: list[str] = []
     if session_id and _message_references_recent_session_image(msg):
@@ -1180,7 +1219,8 @@ async def _process_message_locked(message_id: int, msg: dict,
         )
 
         if agent_sid and project:
-            route_mode = "project_resume"
+            resume_session_id = triage_agent_sid if triage_managed else agent_sid
+            route_mode = str(triage_agent_strategy.get("route_mode") or "project_resume") if triage_managed else "project_resume"
             try:
                 from core.projects import prepare_project_runtime_context
 
@@ -1191,10 +1231,12 @@ async def _process_message_locked(message_id: int, msg: dict,
             result = await _run_project_agent(
                 project,
                 agent_input,
-                agent_sid,
+                resume_session_id,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
                 image_paths=agent_images,
+                skill=project_agent_skill,
+                exclude_skills=project_agent_exclude_skills,
             )
             # Fallback: context overflow → compact session then retry
             if (
@@ -1206,22 +1248,24 @@ async def _process_message_locked(message_id: int, msg: dict,
                 proj = _get_proj(project)
                 cwd = str(proj.path) if proj else None
                 if cwd:
-                    logger.warning("Pipeline: session {} context overflow, compacting...", agent_sid)
-                    compacted = await _compact_agent_session(agent_sid, cwd)
+                    logger.warning("Pipeline: session {} context overflow, compacting...", resume_session_id)
+                    compacted = await _compact_agent_session(resume_session_id, cwd)
                     if compacted:
                         await _audit("context_compacted", "session", str(session_id),
-                                      {"agent_session_id": agent_sid, "trigger": "overflow"})
+                                      {"agent_session_id": resume_session_id, "trigger": "overflow"})
                         result = await _run_project_agent(
                             project,
                             agent_input,
-                            agent_sid,
+                            resume_session_id,
                             runtime_context=project_runtime_context,
                             image_paths=agent_images,
+                            skill=project_agent_skill,
+                            exclude_skills=project_agent_exclude_skills,
                         )
                     else:
-                        logger.error("Pipeline: compact failed, cannot recover session {}", agent_sid)
+                        logger.error("Pipeline: compact failed, cannot recover session {}", resume_session_id)
         elif known_project_route:
-            route_mode = "known_project"
+            route_mode = str(triage_agent_strategy.get("route_mode") or "known_project") if triage_managed else "known_project"
             await _audit("pipeline_known_project_route", "message", str(message_id), {
                 "project_name": project,
                 "session_id": session_id,
@@ -1237,14 +1281,16 @@ async def _process_message_locked(message_id: int, msg: dict,
             result = await _run_project_agent(
                 project,
                 agent_input,
-                None,
+                triage_agent_sid if triage_managed else None,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
                 image_paths=agent_images,
+                skill=project_agent_skill,
+                exclude_skills=project_agent_exclude_skills,
             )
         elif direct_project:
             active_project = direct_project["project_name"]
-            route_mode = "direct_project"
+            route_mode = str(triage_agent_strategy.get("route_mode") or "direct_project") if triage_managed else "direct_project"
             await _audit("pipeline_direct_route", "message", str(message_id), {
                 "project_name": active_project,
                 "confidence": direct_project["confidence"],
@@ -1258,6 +1304,12 @@ async def _process_message_locked(message_id: int, msg: dict,
                 project_prompt += _build_ones_artifact_context(ones_artifacts)
             if ones_check:
                 project_prompt += _build_ones_evidence_guard_context(ones_check)
+            if analysis_dir:
+                project_prompt += _build_analysis_workspace_prompt_context(
+                    analysis_dir=analysis_dir,
+                    triage_managed=triage_managed,
+                    triage_state=triage_state,
+                )
             try:
                 from core.projects import prepare_project_runtime_context
 
@@ -1268,10 +1320,12 @@ async def _process_message_locked(message_id: int, msg: dict,
             result = await _run_project_agent(
                 active_project,
                 project_prompt,
-                None,
+                triage_agent_sid if triage_managed else None,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
                 image_paths=agent_images,
+                skill=project_agent_skill,
+                exclude_skills=project_agent_exclude_skills,
             )
         else:
             result = await _run_orchestrator(
@@ -1296,9 +1350,11 @@ async def _process_message_locked(message_id: int, msg: dict,
             retry_result = await _run_project_agent(
                 active_project,
                 retry_prompt,
-                new_agent_sid or agent_sid,
+                new_agent_sid or triage_agent_sid or agent_sid,
                 runtime=agent_runtime,
                 runtime_context=project_runtime_context,
+                skill=project_agent_skill,
+                exclude_skills=project_agent_exclude_skills,
             )
             result = retry_result
             result_text = retry_result.get("text", "")
@@ -1307,12 +1363,18 @@ async def _process_message_locked(message_id: int, msg: dict,
     else:
         parsed = _parse_result(result_text)
 
+    parsed = _sanitize_spurious_project_binding(
+        parsed,
+        msg=msg,
+        session=session,
+    )
+
     # 6. Audit: log agent result
     # Read effective agent_session_id from DB (dispatch_to_project may have
     # written the project agent's session_id directly, which differs from
     # the orchestrator's own session_id returned in new_agent_sid).
-    effective_agent_sid = new_agent_sid
-    if session_id:
+    effective_agent_sid = new_agent_sid or triage_agent_sid
+    if session_id and not triage_managed:
         fresh = await _read_session(session_id)
         if fresh and fresh.get("agent_session_id"):
             effective_agent_sid = fresh["agent_session_id"]
@@ -1411,10 +1473,17 @@ async def _process_message_locked(message_id: int, msg: dict,
             return
 
     # 8. Persist session state (agent_session_id, project, thread_id)
+    if analysis_dir and triage_managed and (effective_agent_sid or new_agent_sid) and project_agent_skill:
+        _persist_triage_agent_context(
+            analysis_dir,
+            agent_session_id=str(effective_agent_sid or new_agent_sid),
+            agent_runtime=agent_runtime,
+            skill=project_agent_skill,
+        )
     if session_id:
         await _update_session_state(
             session_id,
-            agent_session_id=new_agent_sid,
+            agent_session_id=None if triage_managed else new_agent_sid,
             agent_runtime=agent_runtime,
             project=parsed.get("project_name") or active_project or "",
             thread_id=thread_id,
@@ -1426,9 +1495,12 @@ async def _process_message_locked(message_id: int, msg: dict,
             trace_session = await _read_session(session_id)
             if trace_session:
                 analysis_dir = await _materialize_analysis_workspace(message_id, msg, trace_session, session_id)
-                effective_agent_sid = (
-                    str((trace_session.get("agent_session_id") or effective_agent_sid or new_agent_sid or "")).strip()
-                )
+                if triage_managed:
+                    effective_agent_sid = str(effective_agent_sid or new_agent_sid or "").strip()
+                else:
+                    effective_agent_sid = (
+                        str((trace_session.get("agent_session_id") or effective_agent_sid or new_agent_sid or "")).strip()
+                    )
                 analysis_trace = _extract_rollout_trace(agent_runtime, effective_agent_sid or new_agent_sid)
                 _write_process_trace_artifacts(
                     analysis_dir,
@@ -1598,6 +1670,8 @@ async def _run_project_agent(
     runtime: str | None = None,
     runtime_context: Any = None,
     image_paths: list[str] | None = None,
+    skill: str | None = None,
+    exclude_skills: set[str] | None = None,
 ) -> dict:
     from core.orchestrator.agent_client import agent_client
     from core.orchestrator.agent_client import PROJECT_AGENT_RESPONSE_RULES
@@ -1617,6 +1691,12 @@ async def _run_project_agent(
     runtime_context = runtime_context or prepare_project_runtime_context(project_name)
     runtime_block = build_project_runtime_prompt_block(runtime_context)
     merged = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
+    if exclude_skills:
+        merged = {
+            name: definition
+            for name, definition in merged.items()
+            if name not in exclude_skills
+        }
     system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。处理用户的请求。"
         f"{runtime_block}"
@@ -1624,8 +1704,14 @@ async def _run_project_agent(
     )
 
     prompt_preview = prompt[:100] if isinstance(prompt, str) else "[multimodal prompt]"
-    logger.info("_run_project_agent: project={}, session_id={}, cwd={}, prompt={}",
-                project_name, session_id, str(project.path), prompt_preview)
+    logger.info(
+        "_run_project_agent: project={}, session_id={}, cwd={}, skill={}, prompt={}",
+        project_name,
+        session_id,
+        str(project.path),
+        skill or "-",
+        prompt_preview,
+    )
 
     return await agent_client.run_for_project(
         prompt=prompt,
@@ -1634,6 +1720,7 @@ async def _run_project_agent(
         project_agents=merged,
         max_turns=20,
         session_id=session_id,
+        skill=skill,
         runtime=runtime,
         image_paths=image_paths,
     )
@@ -2055,6 +2142,24 @@ _REVIEW_KEYWORDS = (
 
 _GITLAB_ISSUE_URL_RE = re.compile(r"https?://[^\s]+/-/issues/\d+", flags=re.IGNORECASE)
 _GITLAB_MR_URL_RE = re.compile(r"https?://[^\s]+/-/merge_requests/\d+", flags=re.IGNORECASE)
+_RIOT_LOG_TRIAGE_PROJECTS = {"allspark", "riot-standalone", "fms-java"}
+_STRUCTURED_TRIAGE_DEFAULT_FOCUS = "围绕用户当前问题建立首轮证据锚点"
+_ANALYSIS_CORRECTION_MARKERS = (
+    "干扰项",
+    "只看",
+    "重点看",
+    "重点是",
+    "不是这个方向",
+    "不是这个",
+    "偏了",
+    "纠正",
+    "先别看",
+    "不要再看",
+    "不用看",
+)
+_VEHICLE_NAME_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d{3,6})(?![A-Za-z0-9])")
+_ORDER_HINT_RE = re.compile(r"(?:订单|order(?:Key|Id|No)?|taskKey)\s*[:：=]?\s*['\"]?(\d{5,12})['\"]?", flags=re.IGNORECASE)
+_PIPE_ORDER_RE = re.compile(r"\|(\d{5,12})(?:[.|:])")
 
 
 def _analysis_requested(msg: dict) -> bool:
@@ -2160,6 +2265,709 @@ async def _should_prepare_analysis_workspace(msg: dict, session: dict | None, se
     return _analysis_requested(msg)
 
 
+def _is_riot_log_triage_project(project_name: str | None) -> bool:
+    return str(project_name or "").strip() in _RIOT_LOG_TRIAGE_PROJECTS
+
+
+def _is_triage_correction_turn(msg: dict) -> bool:
+    content = str(msg.get("content") or "").strip()
+    if not content:
+        return False
+    return any(marker in content for marker in _ANALYSIS_CORRECTION_MARKERS)
+
+
+def _should_prepare_riot_log_triage_workspace_for_ones(
+    *,
+    project_name: str | None,
+    analysis_dir: Path | None,
+    session_id: int | None,
+    msg: dict,
+    ones_artifacts: dict[str, Any] | None,
+    ones_check: dict[str, Any] | None,
+    staged_media_reply: str,
+) -> bool:
+    if analysis_dir or not session_id or staged_media_reply:
+        return False
+    if _review_requested(msg):
+        return False
+    if not _is_riot_log_triage_project(project_name):
+        return False
+    if not (ones_artifacts or _ones_link_detected(msg)):
+        return False
+    return str((ones_check or {}).get("status") or "").strip() == "complete"
+
+
+def _should_use_riot_log_triage(
+    *,
+    project_name: str | None,
+    analysis_dir: Path | None,
+    session: dict | None,
+    triage_state: dict[str, Any] | None,
+    ones_artifacts: dict[str, Any] | None,
+    msg: dict,
+) -> bool:
+    if not analysis_dir:
+        return False
+    if not _is_riot_log_triage_project(project_name):
+        return False
+    if _review_requested(msg):
+        return False
+    has_explicit_triage_context = bool(
+        session and (
+            bool(session.get("analysis_mode"))
+            or str(session.get("analysis_workspace") or "").strip()
+        )
+    )
+    has_ones_context = bool((triage_state or {}).get("ones_context"))
+    if not (has_explicit_triage_context or ones_artifacts or has_ones_context or _analysis_requested(msg)):
+        return False
+    if ones_artifacts:
+        return True
+    if isinstance(triage_state, dict) and str(triage_state.get("mode") or "").strip() == "structured":
+        return True
+    return _analysis_requested(msg)
+
+
+def _load_triage_agent_context(triage_state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(triage_state, dict):
+        return {}
+    payload = triage_state.get("agent_context") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_riot_log_triage_strategy(
+    *,
+    project_name: str | None,
+    analysis_dir: Path | None,
+    session: dict | None,
+    triage_state: dict[str, Any] | None,
+    ones_artifacts: dict[str, Any] | None,
+    msg: dict,
+    agent_runtime: str,
+) -> dict[str, Any]:
+    preferred_skill = "riot-log-triage"
+    if not _should_use_riot_log_triage(
+        project_name=project_name,
+        analysis_dir=analysis_dir,
+        session=session,
+        triage_state=triage_state,
+        ones_artifacts=ones_artifacts,
+        msg=msg,
+    ):
+        return {
+            "enabled": False,
+            "session_id": "",
+            "preferred_skill": "",
+            "exclude_skills": set(),
+            "persist_session_id": True,
+            "route_mode": "",
+        }
+
+    context = _load_triage_agent_context(triage_state)
+    saved_sid = str(context.get("session_id") or "").strip()
+    saved_runtime = str(context.get("runtime") or "").strip()
+    saved_skill = str(context.get("skill") or "").strip()
+    correction_turn = _is_triage_correction_turn(msg)
+    if correction_turn:
+        saved_sid = ""
+
+    if saved_sid and saved_runtime and saved_runtime != agent_runtime:
+        saved_sid = ""
+    if saved_sid and saved_skill and saved_skill != preferred_skill:
+        saved_sid = ""
+
+    return {
+        "enabled": True,
+        "session_id": saved_sid,
+        "preferred_skill": preferred_skill,
+        "exclude_skills": {"ones"},
+        "persist_session_id": False,
+        "route_mode": "triage_resume" if saved_sid else "triage_project",
+        "correction_turn": correction_turn,
+    }
+
+
+def _extract_vehicle_name_from_text(text: str) -> str:
+    match = _VEHICLE_NAME_RE.search(str(text or ""))
+    return match.group(1) if match else ""
+
+
+def _extract_order_id_from_text(text: str) -> str:
+    raw = str(text or "")
+    for pattern in (_ORDER_HINT_RE, _PIPE_ORDER_RE):
+        match = pattern.search(raw)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
+
+
+def _extract_identifier_candidates(*texts: str) -> dict[str, str]:
+    vehicle_name = ""
+    order_id = ""
+    for text in texts:
+        if not vehicle_name:
+            vehicle_name = _extract_vehicle_name_from_text(text)
+        if not order_id:
+            order_id = _extract_order_id_from_text(text)
+        if vehicle_name and order_id:
+            break
+    return {"vehicle_name": vehicle_name, "order_id": order_id}
+
+
+def _parse_utc_offset(value: str) -> timedelta:
+    text = str(value or "").strip().upper()
+    if not text:
+        raise ValueError("empty utc offset")
+    if text.startswith("UTC"):
+        text = text[3:]
+    if not text:
+        return timedelta(0)
+    sign = 1
+    if text[0] == "+":
+        text = text[1:]
+    elif text[0] == "-":
+        sign = -1
+        text = text[1:]
+    if ":" in text:
+        hours_str, minutes_str = text.split(":", 1)
+    else:
+        hours_str, minutes_str = text, "0"
+    hours = int(hours_str or "0")
+    minutes = int(minutes_str or "0")
+    return timedelta(hours=sign * hours, minutes=sign * minutes)
+
+
+def _normalize_problem_time_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    replacements = {
+        "年": "-",
+        "月": "-",
+        "日": " ",
+        "号": " ",
+        "点": ":",
+        "时": ":",
+        "分": "",
+        "秒": "",
+        "/": "-",
+        "T": " ",
+    }
+    for src, target in replacements.items():
+        text = text.replace(src, target)
+    text = text.replace("上午", "").replace("下午", "").replace("晚上", "").replace("中午", "")
+    text = text.replace("左右", "").replace("约", "").replace("大概", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _parse_problem_time(value: str) -> datetime | None:
+    normalized = _normalize_problem_time_text(value)
+    if not normalized:
+        return None
+    candidates = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H",
+    ]
+    for fmt in candidates:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _project_log_offset(project_name: str) -> timedelta:
+    normalized = str(project_name or "").strip().lower()
+    if normalized == "allspark":
+        return timedelta(0)
+    return _parse_utc_offset("UTC+8")
+
+
+def _build_riot_log_search_window(
+    *,
+    project_name: str,
+    problem_time: str,
+    problem_timezone: str,
+    before_minutes: int = 30,
+    after_minutes: int = 30,
+) -> dict[str, str]:
+    parsed_time = _parse_problem_time(problem_time)
+    if not parsed_time or not str(problem_timezone or "").strip():
+        return {"problem_time_local": "", "problem_time_log": "", "start": "", "end": ""}
+    try:
+        local_offset = _parse_utc_offset(problem_timezone)
+        log_offset = _project_log_offset(project_name)
+    except ValueError:
+        return {"problem_time_local": "", "problem_time_log": "", "start": "", "end": ""}
+    as_utc = parsed_time - local_offset
+    log_time = as_utc + log_offset
+    start = log_time - timedelta(minutes=before_minutes)
+    end = log_time + timedelta(minutes=after_minutes)
+    return {
+        "problem_time_local": parsed_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "problem_time_log": log_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _build_riot_log_dsl_query(
+    *,
+    anchor_terms: list[str],
+    gate_terms: list[str],
+    generic_terms: list[str],
+    exclude_terms: list[str],
+) -> str:
+    def _quote(term: str) -> str:
+        return '"' + term.replace('"', '\\"') + '"'
+
+    anchors = [item for item in dict.fromkeys(str(term).strip() for term in anchor_terms) if item]
+    positives = [
+        item
+        for item in dict.fromkeys(str(term).strip() for term in [*gate_terms, *generic_terms])
+        if item and item not in anchors
+    ]
+    negatives = [
+        item
+        for item in dict.fromkeys(str(term).strip() for term in exclude_terms)
+        if item
+    ]
+
+    sections: list[str] = []
+    if anchors:
+        anchor_expr = " OR ".join(_quote(term) for term in anchors)
+        sections.append(anchor_expr if len(anchors) == 1 else f"({anchor_expr})")
+    if positives:
+        positive_expr = " OR ".join(_quote(term) for term in positives)
+        sections.append(positive_expr if len(positives) == 1 else f"({positive_expr})")
+
+    query = " AND ".join(sections)
+    if negatives:
+        negative_expr = " AND ".join(f"NOT {_quote(term)}" for term in negatives)
+        query = f"{query} AND {negative_expr}" if query else negative_expr
+    return query.strip()
+
+
+def _build_riot_log_seed_keyword_package(
+    *,
+    project_name: str,
+    issue_type: str,
+    vehicle_name: str,
+    order_id: str,
+    text: str,
+    normalized_window: dict[str, str],
+) -> dict[str, Any]:
+    # Keep pipeline-owned search seeds generic. Domain-specific expansion
+    # belongs to the riot-log-triage skill/references, not pipeline routing.
+    _ = (project_name, issue_type, text)
+    target_files: list[str] = []
+    preferred_files: list[str] = []
+    excluded_files: list[str] = []
+    gate_terms: list[str] = []
+    generic_terms: list[str] = []
+
+    anchor_terms = [item for item in [vehicle_name, order_id] if item]
+    target_files = list(dict.fromkeys(item for item in target_files if item))
+    preferred_files = list(dict.fromkeys(item for item in preferred_files if item))
+    excluded_files = list(dict.fromkeys(item for item in excluded_files if item))
+    gate_terms = list(dict.fromkeys(item for item in gate_terms if item))
+    generic_terms = list(dict.fromkeys(item for item in generic_terms if item))
+    include_terms = [*anchor_terms, *gate_terms, *generic_terms]
+    exclude_terms: list[str] = []
+    return {
+        "include_terms": include_terms,
+        "anchor_terms": anchor_terms,
+        "gate_terms": gate_terms,
+        "generic_terms": generic_terms,
+        "exclude_terms": exclude_terms,
+        "target_files": target_files,
+        "preferred_files": preferred_files,
+        "excluded_files": excluded_files,
+        "hypotheses": [],
+        "require_anchor": bool(anchor_terms),
+        "time_window": {
+            "start": str(normalized_window.get("start") or ""),
+            "end": str(normalized_window.get("end") or ""),
+        },
+        "dsl_query": _build_riot_log_dsl_query(
+            anchor_terms=anchor_terms,
+            gate_terms=gate_terms,
+            generic_terms=generic_terms,
+            exclude_terms=exclude_terms,
+        ),
+    }
+
+
+def _ensure_riot_log_triage_state_ready(
+    *,
+    analysis_dir: Path,
+    session: dict | None,
+    msg: dict,
+    project_name: str,
+    ones_artifacts: dict[str, Any] | None,
+    ones_check: dict[str, Any] | None,
+) -> dict[str, Any]:
+    state = _load_triage_state(analysis_dir) or {}
+    snapshot = _load_ones_summary_snapshot(ones_artifacts) or {}
+    correction_turn = _is_triage_correction_turn(msg)
+    text_fragments = [
+        str(msg.get("content") or "").strip(),
+        str((session or {}).get("title") or "").strip(),
+        str((session or {}).get("topic") or "").strip(),
+        str(snapshot.get("summary_text") or "").strip(),
+        "\n".join(str(item).strip() for item in (snapshot.get("observations") or []) if str(item).strip()),
+        "\n".join(str(item).strip() for item in (snapshot.get("business_identifiers") or []) if str(item).strip()),
+    ]
+    identifiers = _extract_identifier_candidates(*text_fragments)
+    vehicle_name = identifiers.get("vehicle_name") or str(dict(state.get("evidence_anchor") or {}).get("vehicle_name") or "").strip()
+    order_id = identifiers.get("order_id") or str(dict(state.get("evidence_anchor") or {}).get("order_id") or "").strip()
+    problem_time = (
+        str(snapshot.get("problem_time") or "").strip()
+        or str(dict(state.get("time_alignment") or {}).get("problem_time") or "").strip()
+    )
+    problem_timezone = str(dict(state.get("time_alignment") or {}).get("problem_timezone") or "").strip()
+    if not problem_timezone and project_name == "allspark":
+        problem_timezone = "UTC+8"
+
+    version_value = (
+        str(snapshot.get("version_normalized") or "").strip()
+        or str(dict((session or {}).get("project_runtime") or {}).get("normalized_version") or "").strip()
+        or str(dict((session or {}).get("project_runtime") or {}).get("current_version") or "").strip()
+    )
+    issue_type = "order_execution" if vehicle_name or order_id else "unknown"
+    primary_question = (
+        str(state.get("primary_question") or "").strip()
+        or str(snapshot.get("summary_text") or "").strip()
+        or ((session or {}).get("title") or "")
+        or str(msg.get("content") or "").strip()
+    )
+    normalized_window = _build_riot_log_search_window(
+        project_name=project_name,
+        problem_time=problem_time,
+        problem_timezone=problem_timezone,
+    )
+
+    state.setdefault("project", project_name)
+    state.setdefault("mode", "structured")
+    state["problem_summary"] = str(state.get("problem_summary") or primary_question)[:200]
+    state["primary_question"] = primary_question
+    if correction_turn:
+        state["current_question"] = _STRUCTURED_TRIAGE_DEFAULT_FOCUS
+        state["phase"] = "incident_snapshot_built"
+        state["keyword_package_status"] = "pending"
+        state["search_status"] = "pending"
+        state["evidence_chain_status"] = "weak"
+        state["confidence"] = "low"
+        state["hypotheses"] = []
+    else:
+        state["current_question"] = str(state.get("current_question") or "").strip() or _STRUCTURED_TRIAGE_DEFAULT_FOCUS
+    state.setdefault("version_info", {"value": "", "status": "missing"})
+    state["version_info"]["value"] = version_value
+    state["version_info"]["status"] = "known" if version_value else "missing"
+    state.setdefault("artifact_completeness", {"status": "unknown", "notes": []})
+    if ones_check and str(ones_check.get("status") or "").strip():
+        state["artifact_completeness"]["status"] = str(ones_check.get("status") or "").strip()
+    state.setdefault("time_alignment", {})
+    state["time_alignment"].update({
+        "problem_time": problem_time,
+        "problem_timezone": problem_timezone,
+        "log_time_format": str(state["time_alignment"].get("log_time_format") or "YYYY-MM-DD HH:mm:ss"),
+        "log_timezone": "UTC+0" if project_name == "allspark" else (problem_timezone or str(state["time_alignment"].get("log_timezone") or "")),
+        "normalized_problem_time": str(normalized_window.get("problem_time_log") or ""),
+        "normalized_window": {
+            "start": str(normalized_window.get("start") or ""),
+            "end": str(normalized_window.get("end") or ""),
+        },
+        "status": "aligned" if normalized_window.get("problem_time_log") else "unknown",
+    })
+    state.setdefault("evidence_anchor", {})
+    state["evidence_anchor"].update({
+        "issue_type": issue_type,
+        "order_id": order_id,
+        "vehicle_name": vehicle_name,
+        "task_id": str(state["evidence_anchor"].get("task_id") or "").strip(),
+        "key_time": problem_time,
+        "status": "strong" if order_id and vehicle_name and problem_time else ("partial" if vehicle_name or order_id or problem_time else "weak"),
+    })
+    state.setdefault("incident_snapshot", {})
+    state["incident_snapshot"].update({
+        "vehicle_system_state": str(state["incident_snapshot"].get("vehicle_system_state") or ""),
+        "vehicle_proc_state": str(state["incident_snapshot"].get("vehicle_proc_state") or ""),
+        "order_stage": str(state["incident_snapshot"].get("order_stage") or ""),
+        "process_stage": str(state["incident_snapshot"].get("process_stage") or ""),
+        "current_action": str(state["incident_snapshot"].get("current_action") or ""),
+        "expected_next_action": str(state["incident_snapshot"].get("expected_next_action") or ""),
+        "status": "partial" if vehicle_name or order_id or problem_time else str(state["incident_snapshot"].get("status") or "unknown"),
+        "source_evidence": list(dict.fromkeys([
+            *[str(item).strip() for item in (state["incident_snapshot"].get("source_evidence") or []) if str(item).strip()],
+            *([str((ones_artifacts or {}).get("paths", {}).get("summary_snapshot_json") or "").strip()] if snapshot else []),
+        ])),
+    })
+    state.setdefault("search_artifacts", {})
+    state.setdefault("narrowing_round", {"current": 0, "history": []})
+
+    if str(state.get("phase") or "").strip() == "initialized":
+        state["phase"] = "incident_snapshot_built"
+
+    keyword_package_path = analysis_dir / "keyword_package.round1.json"
+    dsl_query_path = analysis_dir / "query.round1.dsl.txt"
+    if correction_turn or not keyword_package_path.exists():
+        package = _build_riot_log_seed_keyword_package(
+            project_name=project_name,
+            issue_type=issue_type,
+            vehicle_name=vehicle_name,
+            order_id=order_id,
+            text="\n".join(fragment for fragment in text_fragments if fragment),
+            normalized_window=normalized_window,
+        )
+        keyword_package_path.write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        dsl_query_path.write_text(str(package.get("dsl_query") or "").strip() + "\n", encoding="utf-8")
+        state["search_artifacts"]["keyword_package_round1"] = str(keyword_package_path)
+        state["search_artifacts"]["dsl_round1"] = str(dsl_query_path)
+        state["keyword_package_status"] = "ready"
+        state["target_log_files"] = list(package.get("target_files") or [])
+        state["narrowing_round"] = {
+            "current": 1,
+            "history": [
+                {
+                    "round": 1,
+                    "focus_question": state["current_question"],
+                    "time_window": dict(package.get("time_window") or {}),
+                    "target_files": list(package.get("target_files") or []),
+                    "include_terms": list(package.get("include_terms") or []),
+                    "exclude_terms": list(package.get("exclude_terms") or []),
+                    "keyword_package": str(keyword_package_path),
+                    "dsl_query": str(package.get("dsl_query") or ""),
+                }
+            ],
+        }
+    else:
+        state["search_artifacts"].setdefault("keyword_package_round1", str(keyword_package_path))
+        state["search_artifacts"].setdefault("dsl_round1", str(dsl_query_path))
+        if not dsl_query_path.exists():
+            try:
+                existing_package = json.loads(keyword_package_path.read_text(encoding="utf-8"))
+                dsl_query_path.write_text(
+                    str(existing_package.get("dsl_query") or "").strip() + "\n",
+                    encoding="utf-8",
+                )
+            except (json.JSONDecodeError, OSError, ValueError):
+                pass
+        if str(state.get("keyword_package_status") or "").strip() == "pending":
+            state["keyword_package_status"] = "ready"
+
+    if state.get("phase") in {"incident_snapshot_built", "initialized"}:
+        state["phase"] = "keywords_ready"
+
+    _save_triage_state(analysis_dir, state)
+    return state
+
+
+def _build_riot_log_triage_prompt_context(
+    *,
+    analysis_dir: Path,
+    triage_state: dict[str, Any],
+) -> str:
+    time_alignment = dict(triage_state.get("time_alignment") or {})
+    evidence_anchor = dict(triage_state.get("evidence_anchor") or {})
+    incident_snapshot = dict(triage_state.get("incident_snapshot") or {})
+    search_artifacts = dict(triage_state.get("search_artifacts") or {})
+    state_path = analysis_dir / "00-state.json"
+    search_worker_path = settings.project_root / ".claude" / "skills" / "riot-log-triage" / "scripts" / "search_worker.py"
+
+    lines = [
+        "[RIOT 日志排障状态流]",
+        f"phase={triage_state.get('phase') or ''}",
+        f"search_status={triage_state.get('search_status') or ''}",
+        f"primary_question={triage_state.get('primary_question') or ''}",
+        f"current_question={triage_state.get('current_question') or ''}",
+        f"vehicle_name={evidence_anchor.get('vehicle_name') or ''}",
+        f"order_id={evidence_anchor.get('order_id') or ''}",
+        f"problem_time={time_alignment.get('problem_time') or ''}",
+        f"problem_timezone={time_alignment.get('problem_timezone') or ''}",
+        f"normalized_problem_time={time_alignment.get('normalized_problem_time') or ''}",
+        f"process_stage={incident_snapshot.get('process_stage') or ''}",
+        f"expected_next_action={incident_snapshot.get('expected_next_action') or ''}",
+    ]
+    keyword_package_path = str(search_artifacts.get("keyword_package_round1") or "").strip()
+    dsl_query_path = str(search_artifacts.get("dsl_round1") or "").strip()
+    if keyword_package_path:
+        lines.append(f"keyword_package_round1={keyword_package_path}")
+    if dsl_query_path:
+        lines.append(f"dsl_round1={dsl_query_path}")
+        try:
+            dsl_query = Path(dsl_query_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            dsl_query = ""
+        if dsl_query:
+            lines.append(f"dsl_query_round1={dsl_query}")
+    lines.extend([
+        f"state_path={state_path}",
+        f"search_runs_dir={analysis_dir / 'search-runs'}",
+        f"search_worker={search_worker_path}",
+    ])
+    if keyword_package_path:
+        lines.append(
+            "search_worker_usage="
+            f"python {search_worker_path} --state {state_path} "
+            "--search-root <日志目录或附件目录> "
+            f"--keyword-package-file {keyword_package_path}"
+        )
+    lines.extend([
+        "[强制规则]",
+        "1. 当前轮先回答 current_question，不要扩题到其他根因路径。",
+        "2. ONES 在本 case 只作为 intake 结果，禁止重新走 ones 技能做代码分析。",
+        "3. 未完成状态流证据闭合前，不要把单个现象直接包装成主因；先按 riot-log-triage skill 工作流还原时间点状态和流程位点。",
+        "4. 当前已到 keywords_ready 且 search_status 仍为 pending 时，只要需要搜索日志或附件，第一步必须运行 search_worker.py 并让它写入 search-runs/；不要用临时 rg/grep/Python 代替首轮搜索产物。",
+        f"5. 当前分析目录固定为 {analysis_dir}，优先复用 00-state.json 和已有 search-runs/ 产物。",
+        "6. 日志检索必须按 keyword_package 和 dsl_query 收敛；需要改关键词时先生成下一轮 keyword package/DSL，再继续搜索。",
+    ])
+    return "\n".join(lines)
+
+
+def _build_analysis_workspace_prompt_context(
+    *,
+    analysis_dir: Path,
+    triage_managed: bool = False,
+    triage_state: dict[str, Any] | None = None,
+) -> str:
+    parts = [
+        (
+            f"[分析工作目录] {analysis_dir}"
+            f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
+            f"\n[目录展示规则] 如果回复里需要展示目录，只展示分析工作目录：{analysis_dir}；"
+            "不要同时展示主仓库目录、执行目录或 worktree 目录。"
+        )
+    ]
+    if triage_managed and triage_state:
+        parts.append(_build_riot_log_triage_prompt_context(
+            analysis_dir=analysis_dir,
+            triage_state=triage_state,
+        ))
+    return "\n\n" + "\n\n".join(parts)
+
+
+def _collect_riot_log_search_roots(
+    *,
+    analysis_dir: Path,
+    ones_artifacts: dict[str, Any] | None,
+) -> list[Path]:
+    def _has_files(path: Path) -> bool:
+        if path.is_file():
+            return True
+        if not path.is_dir():
+            return False
+        try:
+            return any(child.is_file() for child in path.rglob("*"))
+        except OSError:
+            return False
+
+    candidates: list[Path] = []
+    paths = (ones_artifacts or {}).get("paths") or {}
+    for key in ("task_dir",):
+        raw = str(paths.get(key) or "").strip()
+        if raw:
+            candidates.append(Path(raw) / "attachment")
+
+    for record in _collect_ones_downloaded_files(ones_artifacts or {}):
+        raw = str(record.get("path") or "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        candidates.append(path if path.is_dir() else path.parent)
+
+    candidates.append(analysis_dir / "01-intake" / "attachments")
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if not _has_files(resolved):
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
+async def _run_riot_log_search_worker_if_ready(
+    *,
+    analysis_dir: Path,
+    triage_state: dict[str, Any],
+    ones_artifacts: dict[str, Any] | None,
+) -> dict[str, Any]:
+    phase = str(triage_state.get("phase") or "").strip()
+    search_status = str(triage_state.get("search_status") or "").strip()
+    if phase != "keywords_ready" or search_status != "pending":
+        return triage_state
+
+    search_artifacts = dict(triage_state.get("search_artifacts") or {})
+    keyword_package = Path(str(search_artifacts.get("keyword_package_round1") or "").strip())
+    state_path = analysis_dir / "00-state.json"
+    if not keyword_package.exists() or not state_path.exists():
+        return triage_state
+
+    roots = _collect_riot_log_search_roots(
+        analysis_dir=analysis_dir,
+        ones_artifacts=ones_artifacts,
+    )
+    if not roots:
+        return triage_state
+
+    search_worker = settings.project_root / ".claude" / "skills" / "riot-log-triage" / "scripts" / "search_worker.py"
+    if not search_worker.exists():
+        logger.warning("Pipeline: riot-log search_worker not found: {}", search_worker)
+        return triage_state
+
+    command = [
+        sys.executable,
+        str(search_worker),
+        "--state",
+        str(state_path),
+        "--search-root",
+        str(roots[0]),
+        "--keyword-package-file",
+        str(keyword_package),
+    ]
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(settings.project_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except TimeoutError:
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        logger.warning("Pipeline: riot-log search_worker timed out after 180s")
+        return triage_state
+    except Exception as e:
+        logger.warning("Pipeline: failed to run riot-log search_worker: {}", e)
+        return triage_state
+
+    if proc and proc.returncode != 0:
+        logger.warning(
+            "Pipeline: riot-log search_worker exited with {}: {}",
+            proc.returncode,
+            (stderr or stdout).decode("utf-8", errors="replace")[:800],
+        )
+        return triage_state
+
+    return _load_triage_state(analysis_dir) or triage_state
+
+
 async def _bind_session_analysis_workspace(session_id: int, triage_dir: Path) -> None:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2190,10 +2998,40 @@ def _triage_state_payload(session_id: int, session: dict | None, msg: dict, tria
         "mode": "structured",
         "phase": "initialized",
         "problem_summary": ((session or {}).get("title") or msg.get("content") or "")[:200],
+        "primary_question": str(msg.get("content") or "").strip(),
+        "current_question": "",
         "version_info": {"value": "", "status": "missing"},
         "artifact_completeness": {"status": "unknown", "notes": []},
-        "time_alignment": {"problem_time": "", "log_time_format": "", "timezone": "", "status": "unknown"},
+        "time_alignment": {
+            "problem_time": "",
+            "problem_timezone": "",
+            "log_time_format": "",
+            "log_timezone": "",
+            "normalized_problem_time": "",
+            "normalized_window": {"start": "", "end": ""},
+            "status": "unknown",
+        },
+        "evidence_anchor": {
+            "issue_type": "unknown",
+            "order_id": "",
+            "vehicle_name": "",
+            "task_id": "",
+            "key_time": "",
+            "status": "weak",
+        },
+        "incident_snapshot": {
+            "vehicle_system_state": "",
+            "vehicle_proc_state": "",
+            "order_stage": "",
+            "process_stage": "",
+            "current_action": "",
+            "expected_next_action": "",
+            "status": "unknown",
+            "source_evidence": [],
+        },
         "module_hypothesis": [],
+        "hypotheses": [],
+        "noise_candidates": [],
         "target_log_files": [],
         "call_chain_status": "pending",
         "keyword_package_status": "pending",
@@ -2201,8 +3039,11 @@ def _triage_state_payload(session_id: int, session: dict | None, msg: dict, tria
         "evidence_chain_status": "weak",
         "confidence": "low",
         "missing_items": [],
+        "order_candidates": [],
+        "narrowing_round": {"current": 0, "history": []},
+        "delegation": {"search_mode": "", "status": "pending", "last_scope": "", "notes": []},
         "user_confirmation": {"formal_report": False},
-        "search_artifacts": {"last_result_json": "", "last_result_md": ""},
+        "search_artifacts": {"last_result_json": "", "last_result_md": "", "last_rerank_json": "", "last_rerank_md": ""},
         "session_id": session_id,
         "work_dir": str(triage_dir.resolve()),
         "created_at": now,
@@ -2233,6 +3074,26 @@ def _save_triage_state(triage_dir: Path, state: dict[str, Any]) -> None:
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _persist_triage_agent_context(
+    triage_dir: Path,
+    *,
+    agent_session_id: str,
+    agent_runtime: str,
+    skill: str,
+) -> None:
+    state = _load_triage_state(triage_dir) or {}
+    context = state.get("agent_context") or {}
+    if not isinstance(context, dict):
+        context = {}
+    context.update({
+        "session_id": agent_session_id,
+        "runtime": agent_runtime,
+        "skill": skill,
+    })
+    state["agent_context"] = context
+    _save_triage_state(triage_dir, state)
 
 
 def _write_json_artifact(path: Path, payload: dict[str, Any]) -> None:
@@ -2845,11 +3706,14 @@ async def _materialize_message_media(
 
             client = FeishuClient()
             for index, image_key in enumerate(image_keys, start=1):
-                payload = client.get_image_bytes(
-                    image_key,
-                    message_id=str(msg.get("platform_message_id") or ""),
-                    resource_type="image",
-                )
+                try:
+                    payload = client.get_image_bytes(
+                        image_key,
+                        message_id=str(msg.get("platform_message_id") or ""),
+                        resource_type="image",
+                    )
+                except TypeError:
+                    payload = client.get_image_bytes(image_key)
                 if not payload:
                     continue
                 data, downloaded_name = payload
@@ -2919,17 +3783,23 @@ async def _materialize_message_media(
         client = FeishuClient()
         payload: tuple[bytes, str | None] | None = None
         if media_type == "image":
-            payload = client.get_image_bytes(
-                str(remote_key),
-                message_id=str(msg.get("platform_message_id") or ""),
-                resource_type="image",
-            )
+            try:
+                payload = client.get_image_bytes(
+                    str(remote_key),
+                    message_id=str(msg.get("platform_message_id") or ""),
+                    resource_type="image",
+                )
+            except TypeError:
+                payload = client.get_image_bytes(str(remote_key))
         else:
-            payload = client.get_file_bytes(
-                str(remote_key),
-                message_id=str(msg.get("platform_message_id") or ""),
-                resource_type=media_type,
-            )
+            try:
+                payload = client.get_file_bytes(
+                    str(remote_key),
+                    message_id=str(msg.get("platform_message_id") or ""),
+                    resource_type=media_type,
+                )
+            except TypeError:
+                payload = client.get_file_bytes(str(remote_key))
 
         if not payload:
             media_info["download_status"] = "failed"
@@ -3477,6 +4347,52 @@ def _normalize_project_result(
         "reply_content": reply_content,
         "reason": parsed.get("reason") or "resumed project session",
     }
+
+
+_WORK_AGENT_OS_BINDING_HINTS = (
+    "work-agent-os",
+    "pipeline",
+    "feishu",
+    "codex",
+    "claude",
+    "agent",
+    "triage",
+    ".triage",
+    "fastapi",
+    "react",
+    "session",
+    "orchestrator",
+    "路由",
+    "工作流",
+    "pipeline_status",
+)
+
+
+def _sanitize_spurious_project_binding(
+    parsed: dict[str, Any],
+    *,
+    msg: dict,
+    session: dict | None,
+) -> dict[str, Any]:
+    project_name = str(parsed.get("project_name") or "").strip()
+    classified_type = str(parsed.get("classified_type") or "").strip()
+    if project_name != "work-agent-os" or classified_type != "chat":
+        return parsed
+    if str((session or {}).get("project") or "").strip():
+        return parsed
+    if _match_explicit_project_switch(str(msg.get("content") or "")):
+        return parsed
+    if _ones_link_detected(msg) or _review_requested(msg):
+        return parsed
+    content = str(msg.get("content") or "").lower()
+    if any(token in content for token in _WORK_AGENT_OS_BINDING_HINTS):
+        return parsed
+    sanitized = dict(parsed)
+    sanitized["project_name"] = None
+    sanitized["reason"] = (
+        str(parsed.get("reason") or "").strip() + "; stripped spurious work-agent-os binding"
+    ).strip("; ")
+    return sanitized
 
 
 def _should_retry_project_response(parsed: dict) -> bool:

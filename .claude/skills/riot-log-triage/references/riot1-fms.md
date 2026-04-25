@@ -40,3 +40,16 @@
 - `订单 / 车辆任务执行问题`优先按 `订单ID -> 车辆名称 -> 时间` 收敛；非订单问题至少保证时间和车辆名称匹配。
 - 如果是请求入口、SQL 性能或拦截器行为，优先看 `fms-monitor.*.log`。
 - 如果是常规业务异常、线程报错、服务内部流程，优先看 `fms.*.log` 和对应源码中的 logger 文本，并按服务器时间筛选窗口。
+
+## Deadlock / Unlock Routing
+
+对 `RIOT1 / fms-java`：
+
+- 如果问题是`死锁 / 解锁 / 循环死锁 / reroute / 交通区域释放`，首轮优先看 `fms.*.log`，不要硬套 `mapf.log`。
+- 原因是 RIOT1 没有独立 `mapf.log`；死锁检测、死锁后重规划、车辆解锁、上层交通区域申请，主要都在主业务日志里。
+- 这类问题的优先文件应按下面顺序看：
+  - `fms.*.log`
+  - `fms-monitor.*.log`
+- 使用建议：
+  - `fms.*.log`：看 `AllocatorTask`、`RerouteCircularDeadlock`、`DefaultVehicleController`、`OrderHandler` 这类主业务链路
+  - `fms-monitor.*.log`：只在需要补请求入口、性能拦截器、上层交通区接口时再看

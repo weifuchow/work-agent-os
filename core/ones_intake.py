@@ -858,6 +858,7 @@ def build_ones_missing_info_reply(check: dict[str, Any], project_name: str = "")
 
     return {
         "format": "rich",
+        "card_variant": "supplement",
         "title": "补充排障材料",
         "summary": f"已识别项目为 {project_name}。这类 ONES 问题要先补齐最小证据链，再开始分析。" if project_name else "这类 ONES 问题要先补齐最小证据链，再开始分析。",
         "sections": sections,

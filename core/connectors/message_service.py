@@ -111,17 +111,23 @@ async def _download_media_if_needed(session: AsyncSession, msg: Message, event_d
     client = FeishuClient()
     payload: tuple[bytes, str | None] | None = None
     if media_type == "image":
-        payload = client.get_image_bytes(
-            str(remote_key),
-            message_id=str(msg.platform_message_id or ""),
-            resource_type="image",
-        )
+        try:
+            payload = client.get_image_bytes(
+                str(remote_key),
+                message_id=str(msg.platform_message_id or ""),
+                resource_type="image",
+            )
+        except TypeError:
+            payload = client.get_image_bytes(str(remote_key))
     else:
-        payload = client.get_file_bytes(
-            str(remote_key),
-            message_id=str(msg.platform_message_id or ""),
-            resource_type=media_type,
-        )
+        try:
+            payload = client.get_file_bytes(
+                str(remote_key),
+                message_id=str(msg.platform_message_id or ""),
+                resource_type=media_type,
+            )
+        except TypeError:
+            payload = client.get_file_bytes(str(remote_key))
 
     if not payload:
         media_info["download_status"] = "failed"
