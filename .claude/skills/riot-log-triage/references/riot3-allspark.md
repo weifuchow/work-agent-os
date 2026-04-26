@@ -41,18 +41,18 @@
   - `reservation.log`
   - `mini_trace.log`
 - 专属 logger 常见 `additivity=false`，意味着日志可能只进专属文件，不一定回流到主日志。
-- 本项目已有本地 skill：`.claude/skills/log-analysis/SKILL.md`。
-  - 用它做日志文件路由定位、滚动日志搜索和批量日志筛选。
-  - 你负责把它的结果和代码、配置、现场现象合并成最终结论。
+- 如果当前仓库存在本地 skill：`.claude/skills/log-analysis/SKILL.md`，可用它做日志文件路由定位、滚动日志搜索和批量日志筛选。
+  - 如果不存在，使用 `riot-log-triage/scripts/search_worker.py` 做批量搜索。
+  - 主线程负责把搜索结果和代码、配置、现场现象合并成最终结论。
 
 ## Search Priorities
 
 - 第一轮先确认附件来自哪个导出入口，以及最终是 `.zip` 还是 `tar.gz`。
 - 先确认问题属于哪条链路：调度、预约、MRS、通知、指标、设备。
 - 先判断是否属于`订单 / 车辆任务执行问题`；只要涉及车辆任务执行，默认按订单链路处理。
-- `订单 / 车辆任务执行问题`首轮优先看 `bootstrap.log`，因为任务状态机和主流程门禁日志大多先在这里；`reservation.log`、`notify.log`、`mini_trace.log`、`mapf.log` 作为补充，不要先跳过去。
-- `订单 / 车辆任务执行问题`优先按 `订单ID -> 车辆名称 -> 时间` 收敛；没有订单ID时，不要只靠模糊时间窗下结论。
-- 再按链路 grep 对应模块中的日志文本、异常类名、订单号、车辆名称、车辆号。
+- `订单 / 车辆任务执行问题`首轮优先看 `bootstrap.log`，因为任务状态机和主流程门禁日志大多先在这里；`reservation.log`、`notify.log`、`mini_trace.log`、`mapf.log` 作为补充，不要反过来只从专项文件起手。
+- `订单 / 车辆任务执行问题`最终按 `订单ID -> 车辆名称 -> 时间` 收敛；没有订单ID时，首轮先按 `车辆名称 + 时间窗 + 业务门禁词` 找 `order_candidates`，不能只靠车号或模糊时间窗下结论。
+- 再按链路 grep 对应模块中的日志文本、异常类名、订单号、车辆名称、车辆号；乘梯/切图/不继续移动类问题首轮应加入 `ChangeMapRequest`、`CrossMapManager`、`vehicleProcState`、`IN_CHANGE_MAP`、`MoveRequest` 等门禁词作为排序依据。
 - 如果涉及附件日志，先完成 `UTC+0` 到项目现场时区的换算，再筛选时间窗。
 
 ## Deadlock / Unlock Routing

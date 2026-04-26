@@ -70,6 +70,14 @@ def test_build_next_round_generates_dsl_and_updates_state(tmp_path):
             "keep_terms": ["AG0019"],
             "drop_terms": ["hang", "charger"],
             "add_terms": ["ChangeMapRequest", "vehicleProcState", "CrossMapManager"],
+            "core_terms": ["crossMapSuccessAction"],
+            "exception_terms": ["AGV_CHANGE_MAP_TIME_OUT_ERROR"],
+            "log_message_terms": ["车辆执行状态不符合"],
+            "stage_terms": ["IN_CHANGE_MAP"],
+            "term_priorities": [
+                {"term": "CrossMapManager", "score": 18, "category": "core"},
+                {"term": "AGV_CHANGE_MAP_TIME_OUT_ERROR", "score": 30, "category": "exception"},
+            ],
             "target_files": ["bootstrap.log.2026-04-21-10.*", "*device*.log*"],
         },
     })
@@ -88,6 +96,16 @@ def test_build_next_round_generates_dsl_and_updates_state(tmp_path):
     assert package["anchor_terms"] == ["AG0019", "358208"]
     assert "ChangeMapRequest" in package["gate_terms"]
     assert "vehicleProcState" in package["gate_terms"]
+    assert "CrossMapManager" in package["core_terms"]
+    assert "crossMapSuccessAction" in package["core_terms"]
+    assert "AGV_CHANGE_MAP_TIME_OUT_ERROR" in package["exception_terms"]
+    assert "车辆执行状态不符合" in package["log_message_terms"]
+    assert "车辆执行状态不符合" in package["gate_terms"]
+    assert "IN_CHANGE_MAP" in package["stage_terms"]
+    assert "IN_CHANGE_MAP" in package["gate_terms"]
+    assert any(item["term"] == "车辆执行状态不符合" for item in package["term_priorities"])
+    assert any(item["term"] == "IN_CHANGE_MAP" for item in package["term_priorities"])
+    assert package["term_priorities"][0]["term"] == "AGV_CHANGE_MAP_TIME_OUT_ERROR"
     assert package["excluded_files"] == ["hang", "charger"]
     assert package["target_files"] == ["bootstrap.log.2026-04-21-10.*", "*device*.log*"]
     assert package["require_anchor"] is True

@@ -5,7 +5,7 @@ description: 分析 RIOT 1.0 / 2.0 / 3.0 项目的日志问题、现场问题、
 
 # Riot Log Triage
 
-对 RIOT 项目的日志类问题执行“先日志产物、再配置、再业务代码”的排障工作流。先看日志导出包怎么组织和压缩，再看 logging 配置与 logger 路由，最后下钻到具体类和业务链路；对车辆/订单执行问题，先回答“问题时间点车辆处于什么状态、卡在哪个流程门禁、理论下一步动作是什么”，再谈根因；只有在缺失信息会改变结论时才追问。
+对 RIOT 项目的日志类问题执行分阶段排障：先确认日志产物、时间口径和文件路由；再用首轮日志搜索建立订单/车辆/状态候选；然后读代码推导期望下一步和关键门禁；最后回日志验证为什么没有走到下一步。对车辆/订单执行问题，先建立可证伪的“问题时间点快照”；缺订单号时先找 `order_candidates`，不要停在追问，也不要把未闭合证据包装成高置信根因。
 
 ## Select the Project
 
@@ -44,9 +44,18 @@ description: 分析 RIOT 1.0 / 2.0 / 3.0 项目的日志问题、现场问题、
 - `RIOT3 / allspark` 原始日志时间按 `UTC+0` 记录。对照现场时间时，必须先换算到项目所在时区：国内项目统一按 `UTC+8`，其他项目按项目所在地时区。输出证据时，优先同时标注“日志原始时间”和“换算后的现场时间”。
 - `RIOT2 / riot-standalone` 和 `RIOT1 / fms` 以服务器时间为准，不要套用 `RIOT3` 的 `UTC+0` 规则；先确认服务器时区，再判断时间窗是否对齐。
 
+## Separate Discovery From Verification
+
+把日志搜索分成两类，不要混用规则：
+
+- `首轮探索 / order_discovery`：目标是找 `order_candidates`、关键状态、当前动作和可能的流程门禁。缺订单号时，用`车辆名称 + 时间窗 + 问题业务门禁词`做宽召回，业务词之间可以 OR，按目标文件和 `term_priorities` 排序；这轮可以 `anchor_match_mode=prefer`，但必须在输出里标注哪些命中还没有订单闭合。
+- `二轮及以后 / verification`：目标是验证某个具体假设。拿到订单候选后，搜索应收紧为`订单ID + 车辆名称 + 时间窗 + 门禁/代码关键词`；这轮默认要求锚点闭合，不能只靠泛词或相似报错。
+- `结论分级`：探索轮只能给部分结论或候选假设；只有验证轮把订单、车辆、时间、关键日志和代码门禁闭合后，才能给高置信根因。
+- `DSL 口径`：DSL 是给人和工具看的检索意图。首轮可以是 `AG0019 OR ChangeMapRequest OR CrossMapManager` 这类宽召回；验证轮应变成 `AG0019 AND 358208 AND (ChangeMapRequest OR vehicleProcState)` 这类强约束。
+
 ## Use the Bundled Scripts
 
-复杂模式优先复用两个脚本：
+复杂模式优先复用这些脚本：
 
 - 初始化轻量状态目录：
 
@@ -87,6 +96,15 @@ python .claude/skills/riot-log-triage/scripts/search_worker.py \
 python .claude/skills/riot-log-triage/scripts/replay_case.py \
   --case-file tests/fixtures/riot_log_triage_cases/ones_150295_ag0019_elevator_stuck.json \
   --prepare-worktree
+```
+
+- 从源码提取下一轮核心类 / 方法 / 异常关键词及得分：
+
+```bash
+python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
+  --state .triage/order-freeze/00-state.json \
+  --code-root D:/standard/riot/allspark \
+  --keyword-package-file .triage/order-freeze/keyword_package.round2.json
 ```
 
 ## Run the Workflow
@@ -137,13 +155,13 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 - 区分问题类型：`bug candidate`、`现场问题`、`配置/部署问题`、`数据问题`、`误操作`、`证据不足`。
 - 列出已有证据：日志片段、完整日志文件、异常堆栈、截图、附件、配置文件、订单号、任务号、车辆名称、车辆号、设备号、线程名、主机名。
 - 先把`主问题`写成一句话，并持续保留在状态里；对订单/车辆执行问题，优先写成“为什么这辆车在这个时间点没有继续执行/没有下发下一段动作”。
-- 对`订单 / 车辆任务执行问题`，先建立“问题时间点快照”，至少包含：
+- 对`订单 / 车辆任务执行问题`，先建立“问题时间点快照”。首轮快照允许是 `partial`：先填已经确定的时间、车辆、候选订单、候选流程和待验证项；不要因为缺订单号或状态字段就停止搜索。最终快照至少包含：
   - 车辆系统状态，例如 `SystemState`
   - 车辆执行状态，例如 `vehicleProcState`
   - 当前子任务 / 当前动作 / 当前请求
   - 所处流程门禁，例如切图监听、回调校验、锁路、过电梯、等待资源
   - 理论上的下一步动作是什么，谁负责下发
-- 如果这 5 项还答不出来，不要急着把“没有规划路径”“HttpAct 卡住”“定位异常”“状态抖动”包装成主因。
+- 如果这些项还没有闭合，不要急着把“没有规划路径”“HttpAct 卡住”“定位异常”“状态抖动”包装成主因；先把缺口写入 `missing_items` 或下一轮 `focus_question`。
 
 ### 4. Inspect logging config and routing
 
@@ -164,9 +182,9 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 
 - 先标准化所有硬标识：精确时间、异常类名、logger 名称、订单/任务/车辆名称/车辆号/设备/request ID、容器或主机名。
 - 强证据链优先锚点固定为：`订单ID -> 车辆名称 -> 时间`。
-- 对`订单 / 车辆任务执行问题`，必须先收敛到同一 `订单ID`，再检查车辆名称和时间是否闭合；不能只靠模糊时间窗或相似报错替代订单证据。
+- 对`订单 / 车辆任务执行问题`，验证主因前必须收敛到同一 `订单ID`，再检查车辆名称和时间是否闭合；首轮如果还没有订单号，应明确这是 `order_discovery`，不能只靠模糊时间窗或相似报错替代订单证据。
 - 对明确的非订单链路问题，至少确认车辆名称和时间与现场一致；如果两者对不上，先视为证据链未闭合。
-- 对`订单 / 车辆任务执行问题`，证据包里必须显式放入一份 `incident snapshot`：
+- 对`订单 / 车辆任务执行问题`，证据包里必须显式放入一份 `incident snapshot`，并标注 `partial` 或 `confirmed`：
   - 问题时间点车辆状态是什么
   - 问题时间点流程走到哪一步
   - 当时正在等待什么条件
@@ -174,36 +192,67 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
   - 当前哪条代码判断直接拦住了下一步
 - 把现象分层：`主因候选`、`触发条件`、`伴随现象`、`干扰项`。只有能直接解释“为什么没继续下发下一步动作”的，才能放进主因候选。
 - 如果用户说“看下附件 / 看下图片”，先检查已经给出的内容，不要直接反问。
-- 如果当前项目存在本地 `log-analysis` skill，优先把“日志文件路由定位”或“批量日志筛选”委派给它，你自己负责最终综合结论。
+- 如果当前项目存在本地 `log-analysis` skill 或宿主系统提供等价批量搜索机制，优先把“日志文件路由定位”或“批量日志筛选”交给它；否则使用本 skill 自带的 `search_worker.py`。主线程负责最终综合结论。
 - 如果当前输入只有媒体占位信息，没有真正的图片或文件正文，明确指出“证据当前不可机读”，再追问最小补料，例如原始截图文字、原始异常堆栈或日志附件。
 
 ### 6. Locate the concrete classes and business path
 
 - 先搜“导出日志 / 下载日志 / 打包日志”的控制器、service、presenter、工具类，确认日志包不是被二次改写过的。
-- 再搜实际业务异常相关的源码：异常类、日志文本、相关业务链路、关键模块、入口方法。
+- 在首轮日志已经确定候选时间线、订单候选或关键门禁后，再搜实际业务异常相关的源码：异常类、日志文本、相关业务链路、关键模块、入口方法。只有源码搜索成本很低且能直接生成首轮关键词时，才可以提前做轻量代码词提取。
 - 去看具体 logger 所在类，而不是只看报错文案。
 - 如果一个问题跨多层实现，先画出最短链路：入口接口 -> service -> domain/engine -> logger 类。
+- 分析执行过程前必须先读懂执行链路；没有链路复盘时，只能说“命中到片段”，不能直接说“已经解释过程”。
+- 执行链路至少要回答：
+  - 入口动作是谁触发的，例如订单阶段、子任务、设备回调或监听器。
+  - 当前状态/阶段是谁写入，谁读取，日志里的状态名对应哪个代码枚举或字段。
+  - 请求下发、回调成功、状态校验、下一步动作之间的先后关系是什么。
+  - 正常路径下一步应该调用哪个类/方法，现场证据显示它是否执行。
+  - 异常路径是抛异常、返回失败、提前 return、挂起等待，还是被并发状态覆盖。
 - 对“为什么没继续下发下一步动作”这类问题，优先找真正的决策门禁：
   - 谁设置了当前状态
   - 谁读取了当前状态
   - 哪个类/方法决定“继续下发 / 提前返回 / 挂起等待”
   - 哪个条件分支最直接解释现场不动
+- 代码分析必须服务于日志证据、首轮候选和时间线，不要从代码结构自由发散：
+  - 先按日志时间排序还原 `T1 -> T2 -> T3`，再读取对应 logger 类。
+  - 读取类时优先找“日志文案所在方法 -> 状态读写 -> 下一步动作下发/提前返回”的最短路径。
+  - 没有在日志时间线上出现的代码路径只能作为待验证候选，不能覆盖已有时间顺序。
 
 ### 7. Build the call chain and keyword package
 
-- 从问题描述先梳理核心调用链，再回到代码验证：
+- 从问题描述和首轮日志候选先梳理最小调用链，再回到代码验证：
   - 涉及模块
   - 入口接口/入口任务
   - 中间 service / domain / engine
   - 关键 logger 类
   - 关键异常类
 - 对订单/车辆执行问题，调用链优先画成“状态设置方 -> 状态读取方 -> 下一步动作门禁”。
+- 下一轮搜索词必须从执行链路节点提取，而不是只从报错文案扩展：
+  - 入口节点：订单阶段、子任务类型、请求对象。
+  - 状态节点：状态枚举、阶段名、状态字段、状态更新方法。
+  - 决策节点：门禁判断方法、提前返回日志、失败枚举。
+  - 输出节点：下一步请求、回调类、后续动作方法。
+  - 异常节点：异常类、错误码、失败结果构造方法。
+- 关键词提取顺序固定为：执行链路/调用链 -> 关键类/方法 -> 关键日志文案 -> 下一轮检索词。不要跳过调用链直接从日志泛词扩展。
+- 从关键类提取关键日志时，保留“类名/方法名/日志文案/异常词”的绑定关系，例如 `CrossMapManager.crossMapSuccessAction -> 切换地图成功,车辆执行状态不符合`。
 - 只保留“能帮助搜索日志”的关键类，不要把整条调用链全部塞进主上下文。
+- 代码分析产出的关键词必须结构化，避免模型凭感觉扩词：
+  - `core_terms`：类名、方法名、核心请求/响应类型，例如 `CrossMapManager`、`doCrossMap`、`ChangeMapRequest`。
+  - `exception_terms`：异常类、错误码、失败枚举，例如 `AGV_CHANGE_MAP_TIME_OUT_ERROR`。
+  - `log_message_terms`：源码里的关键日志文案，例如“切换地图成功,车辆执行状态不符合”。
+  - `stage_terms`：状态、阶段、门禁条件，例如 `IN_CHANGE_MAP`、`ASSIGN_NEXT_SUB_TASK`。
+  - `term_priorities`：按证据价值排序，优先级来自“是否贴近日志时间线、是否对应决策门禁、是否同时解释车辆/订单状态”。
 - 为每个假设或每类日志文件生成一个 `keyword package`，至少包含：
   - `include_terms`：订单号、车辆名称、车辆号、任务号、设备号、异常类、关键方法、关键日志文案
   - `exclude_terms`：已知噪音、无关模块、误导性公共报错
   - `target_files`：预计命中的日志文件
   - `time_window`：按问题时间推导出的最小搜索窗口
+- 首轮 `keyword package` 的目标是探索，不是证明根因：
+  - 有订单号：可以放入 `anchor_terms`，但仍要加入业务门禁词，避免只扫订单/车号。
+  - 缺订单号：保留车辆锚点，同时加入从问题描述和轻量代码词提取出的 `gate_terms/core_terms/log_message_terms/stage_terms`；允许业务词 OR 召回，并用 `term_priorities` 排序。
+  - 首轮必须写明 `focus_question`，例如“找出 AG0019 在问题窗口内的订单候选和切图后状态”。
+- 验证轮 `keyword package` 必须从已命中的时间线和代码门禁生成；默认用 `订单ID + 车辆名称 + 时间窗` 收紧，并把探索轮噪音加入 `exclude_terms` 或降级为 `noise_candidates`。
+- 下一轮 `keyword package` 必须保留车辆/订单锚点；代码关键词按 `core_terms / exception_terms / log_message_terms / stage_terms` 分组，并写入 `term_priorities`。
 - 逐轮收敛时，每一轮只解决 1 个 focus question，例如：
   - 这一刻车处于什么状态
   - 这一刻卡在哪个流程
@@ -216,20 +265,20 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 
 ### 8. Delegate heavy search outside the main context
 
-- 多文件日志搜索、批量 grep/zgrep、滚动日志筛选、日志去噪，优先交给项目本地 `log-analysis` skill 或独立子 agent / Task。
+- 多文件日志搜索、批量 grep/zgrep、滚动日志筛选、日志去噪，优先使用 `search_worker.py`。如果宿主系统明确提供项目本地 `log-analysis` skill、独立子 agent 或 Task 机制，也可以下沉给它们。
 - 如果已经进入复杂模式，优先先初始化 `.triage/.../00-state.json`，再让搜索 worker 基于 `keyword package` 执行。
-- 只要满足下面任一条件，就默认把搜索下沉到子 agent / 子 skill：
+- 只要满足下面任一条件，就默认把搜索下沉到 `search_worker.py` 或宿主系统允许的批量搜索执行器：
   - 目标日志跨 3 个以上文件或跨多个滚动分片
   - 单轮命中结果明显超过主线程可直接消化的量
   - 需要 2 轮以上逐步缩小时间窗和关键词
   - 需要同时验证主因候选和干扰项
-- 子 agent 只接收最小必要输入：
+- 下沉执行器只接收最小必要输入：
   - 当前问题摘要
   - 本轮 focus question
   - 时间窗口
   - `keyword package`
   - 目标日志文件或目录
-- 子 agent 返回时只回传：
+- 下沉执行器返回时只回传：
   - 命中的关键证据摘要
   - 关联文件路径和时间点
   - 精选的原始日志内容
@@ -266,6 +315,11 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
   - 是否有匹配的车辆名称
   - 是否有命中的关键 logger 或异常
   - 是否能对应到代码里的关键类和方法
+- 必须单独检查时序一致性：
+  - 搜索结果的高分排序只代表阅读优先级；结论必须按 `timeline_hits` 或原始日志时间顺序复盘。
+  - 如果一个高分 hit 发生在低分 hit 之后，不能把它写成前置原因，除非有明确的跨文件时间校准证据。
+  - 没有时间戳的结构化 trace 或摘要只能辅助定位阶段，不能单独推翻有时间戳的业务日志。
+  - 如果时间顺序存在缺口，先写成 `temporal_gaps`，再决定是否缩小时间窗或补搜。
 - `订单 / 车辆任务执行问题`缺少 `订单ID` 时，证据链最多算 `partial`，不要直接给高置信根因。
 - 如果时间或车辆名称对不上，优先判断为时区错位、对象错位或日志窗口选错。
 - 证据链不完整时，先判断缺口来自：
@@ -298,7 +352,7 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 - 先说清楚已经确认了什么。
 - 再只问最小阻塞问题，通常 1 个，最多给 3 个可选补料方向。
 - 优先追要：
-  - `订单 / 车辆任务执行问题`先要 `订单ID`
+  - `订单 / 车辆任务执行问题`如果日志探索无法抽取或候选冲突，再要 `订单ID`
   - 精确故障时间和对应时区
   - 该时间窗附近的原始日志片段
   - 截图中的原始报错文字或完整堆栈
@@ -339,6 +393,8 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 ### 15. Return the result
 
 对工作类问题，优先输出 `format=rich` 的结构化 JSON。
+
+`format=rich` 可以用于中间结论、证据摘要和补料请求；它不等同于正式报告。用户未确认前，不要在 rich 输出里塞入完整 `5 why`、最终根因定稿或正式报告章节。
 
 默认包含：
 

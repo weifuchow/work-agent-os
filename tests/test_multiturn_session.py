@@ -35,6 +35,10 @@ SENDER_ID = "ou_test_user_001"
 ORCH_SESSION_ID = "sdk-orch-session-abc123"
 PROJECT_SESSION_ID = "sdk-proj-session-xyz789"
 
+CLAUDE_API_DISABLED_REASON = (
+    "disabled: direct ONES/project-agent route tests depend on the Claude API-backed agent flow"
+)
+
 TEST_DB_PATH: str = ""
 
 # ---------------------------------------------------------------------------
@@ -692,6 +696,7 @@ async def test_noise_message_no_reply():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=CLAUDE_API_DISABLED_REASON)
 async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
     """High-confidence ONES routing should dispatch to project agent on the first turn."""
     from core.pipeline import process_message
@@ -777,6 +782,7 @@ async def test_direct_ones_route_skips_orchestrator_and_enters_project_agent():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=CLAUDE_API_DISABLED_REASON)
 async def test_direct_ones_route_prepares_worktree_context_for_kioxia_charge_issue():
     """The KIOXIA charge-task ONES case should carry a prepared worktree context into the project agent."""
     from core.pipeline import process_message
@@ -943,6 +949,7 @@ async def test_incomplete_ones_evidence_blocks_project_analysis():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason=CLAUDE_API_DISABLED_REASON)
 async def test_direct_ones_route_only_applies_on_first_turn():
     """Direct ONES route must not hijack later turns in an existing non-project session."""
     from core.pipeline import process_message
@@ -1396,19 +1403,22 @@ async def test_work_question_plain_text_is_cardified_for_feishu():
 
 @pytest.mark.asyncio
 async def test_structured_card_includes_project_runtime_context():
-    """Project issue cards should expose runtime info without redundant directory fields."""
+    """Project issue cards should expose analysis version and code worktree clearly."""
     from core.pipeline import _deliver_reply
 
     project_context = SimpleNamespace(
         running_project="fms-java",
         business_project_name="KIOXIA岩手工厂日本自动搬运复购项目",
         project_path=Path("D:/standard/riot/fms-java"),
+        execution_path=Path("D:/standard/work-agent-os/.worktrees/fms-java/149268-1FmsdpJjHT3JPyWL-4.9.2"),
         current_branch="dev",
         current_version="dev@3cf57f15",
         target_branch="master",
         target_tag="v4.9.2",
+        checkout_ref="v4.9.2",
         version_source_field="FMS/RIoT版本",
         version_source_value="4.9.2-186-g96fb6f2f9_20250723",
+        normalized_version="4.9.2",
         recommended_worktree=Path("D:/standard/work-agent-os/.worktrees/fms-java/149268-1FmsdpJjHT3JPyWL-4.9.2"),
     )
     payload = {
@@ -1441,16 +1451,20 @@ async def test_structured_card_includes_project_runtime_context():
     card_text = json.dumps(card, ensure_ascii=False)
     assert "运行的项目" in card_text
     assert "fms-java" in card_text
-    assert "目录" in card_text
-    assert "对应 Tag" in card_text
-    assert "建议 worktree" not in card_text
+    assert "分析版本" in card_text
+    assert "代码基线" in card_text
+    assert "代码目录（worktree）" in card_text
+    assert "149268-1FmsdpJjHT3JPyWL-4.9.2" in card_text
+    assert "当前版本" not in card_text
+    assert "当前分支" not in card_text
+    assert "对应 Tag" not in card_text
 
     print("\n[PASS] C6.1: Structured project card includes runtime context")
 
 
 @pytest.mark.asyncio
 async def test_structured_card_prefers_analysis_workspace_as_only_directory():
-    """When analysis workspace exists, runtime card should only show that directory."""
+    """When analysis workspace exists, runtime card should distinguish analysis and code directories."""
     from core.pipeline import _deliver_reply
 
     project_context = SimpleNamespace(
@@ -1462,6 +1476,7 @@ async def test_structured_card_prefers_analysis_workspace_as_only_directory():
         current_branch="2.0.7-avary-standard",
         current_version="2.0.7",
         target_branch="master",
+        checkout_ref="master",
         recommended_worktree=Path("D:/standard/work-agent-os/.worktrees/riot-standalone/149531-branch"),
     )
     payload = {
@@ -1491,9 +1506,9 @@ async def test_structured_card_prefers_analysis_workspace_as_only_directory():
     card_text = json.dumps(card, ensure_ascii=False)
     assert "分析目录" in card_text
     assert "D:/standard/work-agent-os/.triage/session-68-demo" in card_text
+    assert "代码目录（worktree）" in card_text
+    assert "149531-branch" in card_text
     assert "D:/standard/riot/riot-standalone" not in card_text
-    assert "149531-branch" not in card_text
-    assert "建议 worktree" not in card_text
 
     print("\n[PASS] C6.2: Structured project card prefers analysis workspace as only directory")
 

@@ -14,7 +14,6 @@ import base64
 import hashlib
 import json
 import mimetypes
-import os
 import re
 import shutil
 import subprocess
@@ -587,31 +586,32 @@ def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
     project_path = str(getattr(project_context, "project_path", "") or "").strip()
     if analysis_workspace:
         lines.append(f"- 分析目录：`{analysis_workspace}`")
-    elif execution_path:
-        lines.append(f"- 目录：`{execution_path}`")
-    elif project_path:
-        lines.append(f"- 目录：`{project_path}`")
-
-    current_branch = str(getattr(project_context, "current_branch", "") or "").strip()
-    if current_branch:
-        lines.append(f"- 当前分支：`{current_branch}`")
-
-    current_version = str(getattr(project_context, "current_version", "") or "").strip()
-    if current_version:
-        lines.append(f"- 当前版本：`{current_version}`")
-
-    target_branch = str(getattr(project_context, "target_branch", "") or "").strip()
-    if target_branch:
-        lines.append(f"- 对齐分支：`{target_branch}`")
-
-    target_tag = str(getattr(project_context, "target_tag", "") or "").strip()
-    if target_tag:
-        lines.append(f"- 对应 Tag：`{target_tag}`")
 
     version_field = str(getattr(project_context, "version_source_field", "") or "").strip()
     version_value = str(getattr(project_context, "version_source_value", "") or "").strip()
+    normalized_version = str(getattr(project_context, "normalized_version", "") or "").strip()
+    analysis_version = normalized_version or version_value
     if version_field and version_value:
-        lines.append(f"- 版本线索：`{version_field} = {version_value}`")
+        lines.append(f"- 分析版本：`{version_value}`（来源：{version_field}）")
+    elif analysis_version:
+        lines.append(f"- 分析版本：`{analysis_version}`")
+
+    checkout_ref = str(getattr(project_context, "checkout_ref", "") or "").strip()
+    target_tag = str(getattr(project_context, "target_tag", "") or "").strip()
+    target_branch = str(getattr(project_context, "target_branch", "") or "").strip()
+    code_baseline = checkout_ref or target_tag or target_branch or analysis_version
+    if code_baseline:
+        lines.append(f"- 代码基线：`{code_baseline}`")
+
+    recommended_worktree = str(getattr(project_context, "recommended_worktree", "") or "").strip()
+    code_path = _select_project_code_path(
+        execution_path=execution_path,
+        project_path=project_path,
+        recommended_worktree=recommended_worktree,
+    )
+    if code_path:
+        code_label = "代码目录（worktree）" if _looks_like_worktree_path(code_path, project_path, recommended_worktree) else "代码目录（当前目录）"
+        lines.append(f"- {code_label}：`{code_path}`")
 
     if not lines:
         return []
@@ -620,6 +620,27 @@ def _project_runtime_elements(project_context: Any) -> list[dict[str, Any]]:
         _section_title("运行信息"),
         _lark_md_div("\n".join(lines)),
     ]
+
+
+def _select_project_code_path(*, execution_path: str, project_path: str, recommended_worktree: str) -> str:
+    if execution_path and _looks_like_worktree_path(execution_path, project_path, recommended_worktree):
+        return execution_path
+    if recommended_worktree:
+        return recommended_worktree
+    return execution_path or project_path
+
+
+def _looks_like_worktree_path(path: str, project_path: str = "", recommended_worktree: str = "") -> bool:
+    path_text = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not path_text:
+        return False
+    recommended_text = str(recommended_worktree or "").strip().replace("\\", "/").rstrip("/")
+    if recommended_text and path_text.lower() == recommended_text.lower():
+        return True
+    project_text = str(project_path or "").strip().replace("\\", "/").rstrip("/")
+    if project_text and path_text.lower() == project_text.lower():
+        return False
+    return "/.worktrees/" in path_text.lower()
 
 
 def _project_context_for_reply(
@@ -2519,6 +2540,7 @@ def _build_riot_log_dsl_query(
     gate_terms: list[str],
     generic_terms: list[str],
     exclude_terms: list[str],
+    combine_operator: str = "AND",
 ) -> str:
     def _quote(term: str) -> str:
         return '"' + term.replace('"', '\\"') + '"'
@@ -2535,19 +2557,111 @@ def _build_riot_log_dsl_query(
         if item
     ]
 
-    sections: list[str] = []
-    if anchors:
-        anchor_expr = " OR ".join(_quote(term) for term in anchors)
-        sections.append(anchor_expr if len(anchors) == 1 else f"({anchor_expr})")
-    if positives:
-        positive_expr = " OR ".join(_quote(term) for term in positives)
-        sections.append(positive_expr if len(positives) == 1 else f"({positive_expr})")
-
-    query = " AND ".join(sections)
+    operator = str(combine_operator or "AND").strip().upper()
+    if operator == "OR":
+        positive_parts = [_quote(term) for term in [*anchors, *positives]]
+        query = " OR ".join(positive_parts)
+        if len(positive_parts) > 1:
+            query = f"({query})"
+    else:
+        sections: list[str] = []
+        if anchors:
+            anchor_expr = " OR ".join(_quote(term) for term in anchors)
+            sections.append(anchor_expr if len(anchors) == 1 else f"({anchor_expr})")
+        if positives:
+            positive_expr = " OR ".join(_quote(term) for term in positives)
+            sections.append(positive_expr if len(positives) == 1 else f"({positive_expr})")
+        query = " AND ".join(sections)
     if negatives:
         negative_expr = " AND ".join(f"NOT {_quote(term)}" for term in negatives)
         query = f"{query} AND {negative_expr}" if query else negative_expr
     return query.strip()
+
+
+def _dedupe_nonempty(values: list[str]) -> list[str]:
+    return [item for item in dict.fromkeys(str(value).strip() for value in values) if item]
+
+
+def _contains_any_text(text: str, keywords: tuple[str, ...]) -> bool:
+    lowered = str(text or "").lower()
+    return any(keyword.lower() in lowered for keyword in keywords)
+
+
+def _build_riot_log_seed_term_priorities(
+    *,
+    anchor_terms: list[str],
+    gate_terms: list[str],
+    core_terms: list[str],
+    log_message_terms: list[str],
+    stage_terms: list[str],
+    generic_terms: list[str],
+) -> list[dict[str, Any]]:
+    priorities: list[dict[str, Any]] = []
+    for term in anchor_terms:
+        priorities.append({
+            "term": term,
+            "score": 28,
+            "category": "anchor",
+            "reason": "车辆/订单首轮证据锚点",
+        })
+    for term in core_terms:
+        priorities.append({
+            "term": term,
+            "score": 22,
+            "category": "core",
+            "reason": "执行链路关键类/请求",
+        })
+    for term in log_message_terms:
+        priorities.append({
+            "term": term,
+            "score": 20,
+            "category": "log_message",
+            "reason": "源码或业务链路关键日志文案",
+        })
+    for term in stage_terms:
+        priorities.append({
+            "term": term,
+            "score": 18,
+            "category": "stage",
+            "reason": "执行状态/流程门禁词",
+        })
+    for term in gate_terms:
+        priorities.append({
+            "term": term,
+            "score": 12,
+            "category": "gate",
+            "reason": "问题描述推导的业务门禁词",
+        })
+    for term in generic_terms:
+        priorities.append({
+            "term": term,
+            "score": 2,
+            "category": "generic",
+            "reason": "低权重辅助现象词",
+        })
+    return _dedupe_term_priority_items(priorities)
+
+
+def _dedupe_term_priority_items(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_term: dict[str, dict[str, Any]] = {}
+    for item in values:
+        term = str(item.get("term") or "").strip()
+        if not term:
+            continue
+        try:
+            score = int(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        normalized = {
+            "term": term,
+            "score": score,
+            "category": str(item.get("category") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+        }
+        current = by_term.get(term)
+        if current is None or score > int(current.get("score") or 0):
+            by_term[term] = normalized
+    return sorted(by_term.values(), key=lambda item: int(item.get("score") or 0), reverse=True)
 
 
 def _build_riot_log_seed_keyword_package(
@@ -2559,43 +2673,129 @@ def _build_riot_log_seed_keyword_package(
     text: str,
     normalized_window: dict[str, str],
 ) -> dict[str, Any]:
-    # Keep pipeline-owned search seeds generic. Domain-specific expansion
-    # belongs to the riot-log-triage skill/references, not pipeline routing.
-    _ = (project_name, issue_type, text)
+    project_key = str(project_name or "").strip().lower()
+    issue_key = str(issue_type or "").strip()
+    text_blob = str(text or "")
     target_files: list[str] = []
     preferred_files: list[str] = []
     excluded_files: list[str] = []
     gate_terms: list[str] = []
+    core_terms: list[str] = []
+    log_message_terms: list[str] = []
+    stage_terms: list[str] = []
     generic_terms: list[str] = []
 
     anchor_terms = [item for item in [vehicle_name, order_id] if item]
-    target_files = list(dict.fromkeys(item for item in target_files if item))
-    preferred_files = list(dict.fromkeys(item for item in preferred_files if item))
-    excluded_files = list(dict.fromkeys(item for item in excluded_files if item))
-    gate_terms = list(dict.fromkeys(item for item in gate_terms if item))
-    generic_terms = list(dict.fromkeys(item for item in generic_terms if item))
-    include_terms = [*anchor_terms, *gate_terms, *generic_terms]
+
+    if project_key in {"allspark", "riot3"}:
+        target_files.extend(["bootstrap", "reservation", "mini_trace"])
+        preferred_files.append("bootstrap")
+    elif project_key in {"riot-standalone", "riot2"}:
+        target_files.append("bootstrap")
+        preferred_files.append("bootstrap")
+    elif project_key in {"fms-java", "riot1", "fms"}:
+        target_files.append("fms")
+        preferred_files.append("fms")
+
+    if issue_key == "order_execution":
+        if project_key in {"allspark", "riot3"}:
+            target_files.extend(["bootstrap", "reservation", "mini_trace"])
+            preferred_files.insert(0, "bootstrap")
+            excluded_files.append("metric")
+            core_terms.extend(["AbstractVehicleTaskManager", "VehicleRequestManagerImpl"])
+            stage_terms.extend(["SystemState", "vehicleProcState"])
+        elif project_key in {"riot-standalone", "riot2"}:
+            target_files.append("bootstrap")
+            preferred_files.insert(0, "bootstrap")
+
+    if _contains_any_text(text_blob, ("电梯", "乘梯", "elevator", "lift")):
+        target_files.extend(["bootstrap", "reservation", "mini_trace", "notify"])
+        gate_terms.extend(["电梯", "乘梯", "elevator"])
+        core_terms.append("ElevatorResourceDevice")
+
+    if _contains_any_text(text_blob, ("切换地图", "切图", "change map", "cross map")):
+        target_files.extend(["bootstrap", "mini_trace", "reservation"])
+        gate_terms.extend(["切换地图", "切图", "ChangeMapRequest"])
+        core_terms.append("CrossMapManager")
+        log_message_terms.extend(["切换地图成功", "车辆执行状态不符合"])
+        stage_terms.extend(["IN_CHANGE_MAP", "vehicleProcState"])
+
+    if _contains_any_text(text_blob, ("不出来", "不动", "没继续移动", "没有继续下发", "十多分钟")):
+        target_files.extend(["bootstrap", "reservation", "notify", "mini_trace"])
+        gate_terms.extend(["MoveRequest", "CheckPointRequest"])
+        core_terms.extend(["GlobalRequestHandler", "TrafficApplyCallBackImpl"])
+        stage_terms.extend(["MT_WAIT_FOR_CHECKPOINT", "MT_WAIT_FOR_START"])
+        generic_terms.append("hang")
+
+    if _contains_any_text(text_blob, ("路径", "规划", "route", "mapf", "no path")):
+        target_files.extend(["mapf", "bootstrap", "reservation"])
+        gate_terms.extend(["路径", "规划", "route"])
+
+    if _contains_any_text(text_blob, ("死锁", "解锁", "deadlock", "unlock", "reroute", "锁路", "交通冲突")):
+        if project_key in {"allspark", "riot3"}:
+            target_files.extend(["mapf", "bootstrap", "reservation", "mini_trace"])
+            preferred_files.extend(["mapf"])
+        elif project_key in {"riot-standalone", "riot2"}:
+            target_files.extend([
+                "DeadLockDetector",
+                "TrafficSubSystem",
+                "ShapeTrafficManager",
+                "WorldRoute",
+                "bootstrap",
+            ])
+        gate_terms.extend(["死锁", "解锁", "deadlock", "unlock", "reroute"])
+
+    if _contains_any_text(text_blob, ("http", "回调", "callback", "notify", "httpact")):
+        target_files.extend(["notify", "reservation", "bootstrap"])
+        gate_terms.extend(["callback", "notify", "http"])
+
+    anchor_terms = _dedupe_nonempty(anchor_terms)
+    target_files = _dedupe_nonempty(target_files)
+    preferred_files = _dedupe_nonempty(preferred_files)
+    excluded_files = _dedupe_nonempty(excluded_files)
+    gate_terms = _dedupe_nonempty(gate_terms)
+    core_terms = _dedupe_nonempty(core_terms)
+    log_message_terms = _dedupe_nonempty(log_message_terms)
+    stage_terms = _dedupe_nonempty(stage_terms)
+    generic_terms = _dedupe_nonempty(generic_terms)
+    positive_terms = _dedupe_nonempty([*gate_terms, *core_terms, *log_message_terms, *stage_terms, *generic_terms])
+    include_terms = _dedupe_nonempty([*anchor_terms, *positive_terms])
     exclude_terms: list[str] = []
+    term_priorities = _build_riot_log_seed_term_priorities(
+        anchor_terms=anchor_terms,
+        gate_terms=gate_terms,
+        core_terms=core_terms,
+        log_message_terms=log_message_terms,
+        stage_terms=stage_terms,
+        generic_terms=generic_terms,
+    )
     return {
         "include_terms": include_terms,
         "anchor_terms": anchor_terms,
         "gate_terms": gate_terms,
+        "core_terms": core_terms,
+        "log_message_terms": log_message_terms,
+        "stage_terms": stage_terms,
         "generic_terms": generic_terms,
         "exclude_terms": exclude_terms,
         "target_files": target_files,
         "preferred_files": preferred_files,
         "excluded_files": excluded_files,
+        "term_priorities": term_priorities,
         "hypotheses": [],
-        "require_anchor": bool(anchor_terms),
+        "anchor_match_mode": "prefer" if positive_terms else "require",
+        "require_anchor": bool(anchor_terms) and not positive_terms,
+        "require_gate_when_present": False,
         "time_window": {
             "start": str(normalized_window.get("start") or ""),
             "end": str(normalized_window.get("end") or ""),
         },
         "dsl_query": _build_riot_log_dsl_query(
             anchor_terms=anchor_terms,
-            gate_terms=gate_terms,
+            gate_terms=[*gate_terms, *core_terms, *log_message_terms, *stage_terms],
             generic_terms=generic_terms,
             exclude_terms=exclude_terms,
+            combine_operator="OR" if positive_terms else "AND",
         ),
     }
 
@@ -2765,6 +2965,74 @@ def _ensure_riot_log_triage_state_ready(
     return state
 
 
+def _path_has_files(path: Path) -> bool:
+    if path.is_file():
+        return True
+    if not path.is_dir():
+        return False
+    try:
+        return any(child.is_file() for child in path.rglob("*"))
+    except OSError:
+        return False
+
+
+def _collect_attachment_search_candidates(attachment_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for pattern in ("logs_extracted", "extracted", "detail_log_unpacked", "logs_plain*"):
+        try:
+            extracted_dirs = sorted(
+                path for path in attachment_root.glob(pattern)
+                if path.is_dir()
+            )
+        except OSError:
+            extracted_dirs = []
+        candidates.extend(extracted_dirs)
+    candidates.append(attachment_root)
+    return candidates
+
+
+def _ones_task_dir_from_triage_state(triage_state: dict[str, Any] | None) -> Path | None:
+    if not isinstance(triage_state, dict):
+        return None
+    ones_context = dict(triage_state.get("ones_context") or {})
+    task_dir_raw = str(ones_context.get("task_dir") or "").strip()
+    if task_dir_raw:
+        return Path(task_dir_raw)
+    for key in ("task_json", "messages_json", "report_md", "summary_snapshot_json"):
+        raw = str(ones_context.get(key) or "").strip()
+        if raw:
+            return Path(raw).parent
+    return None
+
+
+def _ones_attachment_root_from_triage_state(triage_state: dict[str, Any] | None) -> Path | None:
+    task_dir = _ones_task_dir_from_triage_state(triage_state)
+    if not task_dir:
+        return None
+    return task_dir / "attachment"
+
+
+def _collect_ones_log_roots_from_triage_state(triage_state: dict[str, Any] | None) -> list[Path]:
+    attachment_root = _ones_attachment_root_from_triage_state(triage_state)
+    if not attachment_root:
+        return []
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in _collect_attachment_search_candidates(attachment_root):
+        try:
+            if not path.exists() or not _path_has_files(path):
+                continue
+            resolved = path.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
 def _build_riot_log_triage_prompt_context(
     *,
     analysis_dir: Path,
@@ -2776,6 +3044,8 @@ def _build_riot_log_triage_prompt_context(
     search_artifacts = dict(triage_state.get("search_artifacts") or {})
     state_path = analysis_dir / "00-state.json"
     search_worker_path = settings.project_root / ".claude" / "skills" / "riot-log-triage" / "scripts" / "search_worker.py"
+    ones_attachment_root = _ones_attachment_root_from_triage_state(triage_state)
+    ones_log_roots = _collect_ones_log_roots_from_triage_state(triage_state)
 
     lines = [
         "[RIOT 日志排障状态流]",
@@ -2808,12 +3078,21 @@ def _build_riot_log_triage_prompt_context(
         f"search_runs_dir={analysis_dir / 'search-runs'}",
         f"search_worker={search_worker_path}",
     ])
+    if ones_attachment_root:
+        try:
+            attachment_label = str(ones_attachment_root.resolve())
+        except OSError:
+            attachment_label = str(ones_attachment_root)
+        lines.append(f"ones_attachment_dir={attachment_label}")
+    if ones_log_roots:
+        lines.append("ones_log_search_roots=" + " ; ".join(str(path) for path in ones_log_roots[:8]))
     if keyword_package_path:
+        default_search_root = str(ones_log_roots[0]) if ones_log_roots else "<日志目录或附件目录>"
         lines.append(
             "search_worker_usage="
-            f"python {search_worker_path} --state {state_path} "
-            "--search-root <日志目录或附件目录> "
-            f"--keyword-package-file {keyword_package_path}"
+            f"python {search_worker_path} --state \"{state_path}\" "
+            f"--search-root \"{default_search_root}\" "
+            f"--keyword-package-file \"{keyword_package_path}\""
         )
     lines.extend([
         "[强制规则]",
@@ -2833,12 +3112,23 @@ def _build_analysis_workspace_prompt_context(
     triage_managed: bool = False,
     triage_state: dict[str, Any] | None = None,
 ) -> str:
+    ones_attachment_root = _ones_attachment_root_from_triage_state(triage_state)
+    ones_log_roots = _collect_ones_log_roots_from_triage_state(triage_state)
+    ones_context_lines: list[str] = []
+    if ones_attachment_root:
+        try:
+            ones_context_lines.append(f"[ONES附件目录] {ones_attachment_root.resolve()}")
+        except OSError:
+            ones_context_lines.append(f"[ONES附件目录] {ones_attachment_root}")
+    if ones_log_roots:
+        ones_context_lines.append("[ONES日志候选目录] " + " ; ".join(str(path) for path in ones_log_roots[:8]))
     parts = [
         (
             f"[分析工作目录] {analysis_dir}"
             f"\n[附件目录] {analysis_dir / '01-intake' / 'attachments'}"
-            f"\n[目录展示规则] 如果回复里需要展示目录，只展示分析工作目录：{analysis_dir}；"
-            "不要同时展示主仓库目录、执行目录或 worktree 目录。"
+            + ("\n" + "\n".join(ones_context_lines) if ones_context_lines else "")
+            + f"\n[目录展示规则] 分析目录只表示过程产物位置：{analysis_dir}。"
+            + "如果回复涉及代码定位，必须单独说明代码目录；使用 worktree 时必须明确标注 worktree。"
         )
     ]
     if triage_managed and triage_state:
@@ -2854,22 +3144,13 @@ def _collect_riot_log_search_roots(
     analysis_dir: Path,
     ones_artifacts: dict[str, Any] | None,
 ) -> list[Path]:
-    def _has_files(path: Path) -> bool:
-        if path.is_file():
-            return True
-        if not path.is_dir():
-            return False
-        try:
-            return any(child.is_file() for child in path.rglob("*"))
-        except OSError:
-            return False
-
     candidates: list[Path] = []
     paths = (ones_artifacts or {}).get("paths") or {}
     for key in ("task_dir",):
         raw = str(paths.get(key) or "").strip()
         if raw:
-            candidates.append(Path(raw) / "attachment")
+            attachment_root = Path(raw) / "attachment"
+            candidates.extend(_collect_attachment_search_candidates(attachment_root))
 
     for record in _collect_ones_downloaded_files(ones_artifacts or {}):
         raw = str(record.get("path") or "").strip()
@@ -2889,7 +3170,7 @@ def _collect_riot_log_search_roots(
             resolved = path.resolve()
         except OSError:
             continue
-        if not _has_files(resolved):
+        if not _path_has_files(resolved):
             continue
         key = str(resolved).lower()
         if key in seen:
@@ -2937,6 +3218,8 @@ async def _run_riot_log_search_worker_if_ready(
         str(roots[0]),
         "--keyword-package-file",
         str(keyword_package),
+        "--max-hits",
+        "80",
     ]
     proc: asyncio.subprocess.Process | None = None
     try:

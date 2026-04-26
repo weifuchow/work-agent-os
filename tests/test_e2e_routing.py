@@ -44,6 +44,8 @@ from unittest.mock import MagicMock, patch, AsyncMock
 import aiosqlite
 import pytest
 
+pytestmark = pytest.mark.skip(reason="disabled: real Claude API e2e tests require a paid Claude API subscription")
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------

@@ -100,6 +100,16 @@ def test_rerank_worker_keeps_only_selected_hits_and_updates_state(tmp_path, monk
         assert "h1" in prompt and "h2" in prompt and "h3" in prompt
         return {
             "summary": "关键证据是切图完成和 line:135 状态不符合，充电相关命中是噪音。",
+            "execution_chain_summary": [
+                "ChangeMapRequest 下发后，CrossMapManager 收到切图成功回调，但状态门禁读取到 IDLE 后提前返回。"
+            ],
+            "execution_chain_gaps": [
+                "还需确认 vehicleProcState 在切图成功前由谁从 IN_CHANGE_MAP 改成 IDLE。"
+            ],
+            "timeline_summary": [
+                "10:33:51 下发 ChangeMapRequest，10:33:56 切图成功后状态不符合。"
+            ],
+            "temporal_gaps": [],
             "relevant_hit_ids": ["h1", "h2"],
             "noise_hit_ids": ["h3"],
             "noise_patterns": ["charging collision noise"],
@@ -110,6 +120,7 @@ def test_rerank_worker_keeps_only_selected_hits_and_updates_state(tmp_path, monk
                 "keep_terms": ["AG0019", "ChangeMapRequest", "vehicleProcState"],
                 "drop_terms": ["hang"],
                 "add_terms": ["CrossMapManager", "IN_CHANGE_MAP"],
+                "stage_terms": ["IN_CHANGE_MAP"],
                 "target_files": ["bootstrap", "reservation"],
             },
             "confidence": "medium",
@@ -140,3 +151,5 @@ def test_rerank_worker_keeps_only_selected_hits_and_updates_state(tmp_path, monk
     assert updated_state["order_candidates"][0]["order_id"] == "358208"
     assert updated_state["noise_candidates"] == ["charging collision noise"]
     assert updated_state["narrowing_round"]["history"][-1]["rerank"]["relevant_hit_ids"] == ["h1", "h2"]
+    assert updated_state["narrowing_round"]["history"][-1]["rerank"]["execution_chain_summary"]
+    assert updated_state["narrowing_round"]["history"][-1]["rerank"]["timeline_summary"]

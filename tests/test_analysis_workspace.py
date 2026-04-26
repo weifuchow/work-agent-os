@@ -43,6 +43,65 @@ def test_extract_vehicle_name_matches_chinese_adjacent_token():
     assert pipeline_mod._extract_vehicle_name_from_text("车辆AG0019在电梯内不出来") == "AG0019"
 
 
+def test_collect_riot_log_search_roots_prefers_extracted_ones_logs(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    analysis_dir = tmp_path / ".triage" / "case"
+    (analysis_dir / "01-intake" / "attachments").mkdir(parents=True)
+    task_dir = tmp_path / ".ones" / "150295_x"
+    attachment_root = task_dir / "attachment"
+    logs_extracted = attachment_root / "logs_extracted"
+    logs_plain = attachment_root / "logs_plain_10"
+    logs_extracted.mkdir(parents=True)
+    logs_plain.mkdir()
+    (logs_extracted / "bootstrap.log.2026-04-21-10.0.gz").write_bytes(b"\x1f\x8bplaceholder")
+    (logs_plain / "bootstrap.log.2026-04-21-10.0").write_text("AG0019\n", encoding="utf-8")
+    (attachment_root / "attachment_01_bad.tar").write_bytes(b"not a tar")
+
+    roots = pipeline_mod._collect_riot_log_search_roots(
+        analysis_dir=analysis_dir,
+        ones_artifacts={"paths": {"task_dir": str(task_dir)}},
+    )
+
+    assert roots[0] == logs_extracted.resolve()
+    assert logs_plain.resolve() in roots
+    assert attachment_root.resolve() in roots
+    assert (analysis_dir / "01-intake" / "attachments").resolve() not in roots
+
+
+def test_analysis_workspace_prompt_exposes_ones_attachment_roots(tmp_path):
+    import core.pipeline as pipeline_mod
+
+    analysis_dir = tmp_path / ".triage" / "case"
+    task_dir = tmp_path / ".ones" / "150324_56pZcdYHUUWlIhQy"
+    logs_plain = task_dir / "attachment" / "logs_plain_10"
+    logs_plain.mkdir(parents=True)
+    (logs_plain / "bootstrap.log").write_text("AG0019\n", encoding="utf-8")
+    (task_dir / "task.json").write_text("{}", encoding="utf-8")
+    keyword_path = analysis_dir / "keyword_package.round1.json"
+    state = {
+        "project": "allspark",
+        "phase": "keywords_ready",
+        "search_status": "pending",
+        "search_artifacts": {
+            "keyword_package_round1": str(keyword_path),
+        },
+        "ones_context": {
+            "task_json": str(task_dir / "task.json"),
+        },
+    }
+
+    prompt = pipeline_mod._build_analysis_workspace_prompt_context(
+        analysis_dir=analysis_dir,
+        triage_managed=True,
+        triage_state=state,
+    )
+
+    assert f"[ONES附件目录] {task_dir / 'attachment'}" in prompt
+    assert str(logs_plain.resolve()) in prompt
+    assert f'--search-root "{logs_plain.resolve()}"' in prompt
+
+
 @pytest.mark.asyncio
 async def test_should_prepare_analysis_workspace_requires_explicit_analysis(tmp_path, monkeypatch):
     import core.pipeline as pipeline_mod
@@ -248,11 +307,12 @@ def test_ensure_riot_log_triage_state_ready_seeds_time_alignment_and_keyword_pac
     assert keyword_package["dsl_query"] == dsl_path.read_text(encoding="utf-8").strip()
     assert '"AG0019"' in keyword_package["dsl_query"]
     assert '"358208"' in keyword_package["dsl_query"]
-    assert keyword_package["gate_terms"] == []
-    assert keyword_package["generic_terms"] == []
-    assert keyword_package["target_files"] == []
-    assert keyword_package["preferred_files"] == []
-    assert keyword_package["excluded_files"] == []
+    assert "电梯" in keyword_package["gate_terms"]
+    assert "MoveRequest" in keyword_package["gate_terms"]
+    assert "ElevatorResourceDevice" in keyword_package["core_terms"]
+    assert "bootstrap" in keyword_package["target_files"]
+    assert "bootstrap" in keyword_package["preferred_files"]
+    assert "metric" in keyword_package["excluded_files"]
 
 
 @pytest.mark.asyncio

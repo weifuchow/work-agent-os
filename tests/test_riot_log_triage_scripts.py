@@ -220,6 +220,202 @@ def test_search_worker_prefers_preferred_files_first(tmp_path):
     assert payload["evidence_hits"][0]["path"].endswith("bootstrap.log")
 
 
+def test_search_worker_scores_file_priority_before_output_order(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "notify.log").write_text(
+        "2026-04-15 10:24:00.000 [http] INFO AG0019 callback retry\n",
+        encoding="utf-8",
+    )
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-15 10:24:01.000 [main] INFO AG0019 callback state gate\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "callback"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["callback"],
+        "target_files": ["notify", "bootstrap"],
+        "preferred_files": ["notify"],
+        "file_priorities": [
+            {"pattern": "bootstrap", "score": 80},
+            {"pattern": "notify", "score": 10},
+        ],
+        "require_anchor": True,
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["hits_total"] == 2
+    assert payload["evidence_hits"][0]["path"].endswith("bootstrap.log")
+    assert payload["evidence_hits"][0]["score"] > payload["evidence_hits"][1]["score"]
+
+
+def test_search_worker_keeps_chronological_timeline_separate_from_score_order(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "notify.log").write_text(
+        "2026-04-15 10:24:00.000 [http] INFO AG0019 callback retry\n",
+        encoding="utf-8",
+    )
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-15 10:25:00.000 [main] INFO AG0019 callback state gate\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "callback"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["callback"],
+        "target_files": ["notify", "bootstrap"],
+        "file_priorities": [
+            {"pattern": "bootstrap", "score": 80},
+            {"pattern": "notify", "score": 10},
+        ],
+        "require_anchor": True,
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["evidence_hits"][0]["path"].endswith("bootstrap.log")
+    assert payload["timeline_hits"][0]["path"].endswith("notify.log")
+
+
+def test_search_worker_reads_numbered_rolling_log_files(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log.2026-04-21-10.0").write_text(
+        "2026-04-21 10:34:00.000 [main] INFO AG0019 ChangeMapRequest sent\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "ChangeMapRequest"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["ChangeMapRequest"],
+        "target_files": ["bootstrap.log.2026-04-21-10.0"],
+        "preferred_files": ["bootstrap"],
+        "require_anchor": True,
+        "time_window": {
+            "start": "2026-04-21 10:28:00",
+            "end": "2026-04-21 10:50:30"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["documents_scanned"] == 1
+    assert payload["hits_total"] == 1
+    assert payload["evidence_hits"][0]["path"].endswith("bootstrap.log.2026-04-21-10.0")
+
+
+def test_search_worker_requires_gate_when_gate_terms_exist(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "mini_trace.log").write_text(
+        "\n".join([
+            "2026-04-21 10:34:00.000 [main] INFO 358208 state PROCESSING",
+            "2026-04-21 10:34:01.000 [main] INFO 358208 ChangeMapRequest sent",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["358208", "ChangeMapRequest"],
+        "anchor_terms": ["358208"],
+        "gate_terms": ["ChangeMapRequest"],
+        "target_files": ["mini_trace"],
+        "preferred_files": ["mini_trace"],
+        "require_anchor": True,
+        "time_window": {
+            "start": "2026-04-21 10:28:00",
+            "end": "2026-04-21 10:50:30"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["hits_total"] == 1
+    assert payload["suppressed_hits_total"] == 1
+    assert "ChangeMapRequest" in payload["evidence_hits"][0]["matched_terms"]
+
+
+def test_search_worker_scores_core_and_exception_terms(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-21 10:34:00.000 [main] INFO AG0019 CrossMapManager state gate",
+            "2026-04-21 10:34:01.000 [main] ERROR AG0019 AGV_CHANGE_MAP_TIME_OUT_ERROR in CrossMapManager",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019"],
+        "anchor_terms": ["AG0019"],
+        "core_terms": ["CrossMapManager"],
+        "exception_terms": ["AGV_CHANGE_MAP_TIME_OUT_ERROR"],
+        "term_priorities": [
+            {"term": "CrossMapManager", "score": 18, "category": "core"},
+            {"term": "AGV_CHANGE_MAP_TIME_OUT_ERROR", "score": 30, "category": "exception"},
+        ],
+        "target_files": ["bootstrap"],
+        "preferred_files": ["bootstrap"],
+        "require_anchor": True,
+        "time_window": {
+            "start": "2026-04-21 10:28:00",
+            "end": "2026-04-21 10:50:30"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["hits_total"] == 2
+    assert payload["evidence_hits"][0]["score"] > payload["evidence_hits"][1]["score"]
+    assert "AGV_CHANGE_MAP_TIME_OUT_ERROR" in payload["evidence_hits"][0]["matched_exception_terms"]
+    assert any("term_priority:AGV_CHANGE_MAP_TIME_OUT_ERROR+30" in item for item in payload["evidence_hits"][0]["score_reasons"])
+
+
 def test_search_worker_scans_matching_members_inside_tar_archive(tmp_path):
     log_root = tmp_path / "logs"
     log_root.mkdir()
@@ -416,6 +612,60 @@ def test_search_worker_injects_vehicle_anchor_from_state(tmp_path):
     assert payload["keyword_package"]["require_anchor"] is True
 
 
+def test_search_worker_anchor_prefer_mode_keeps_gate_only_seed_hits(tmp_path):
+    triage_result = _run_script(
+        INIT_STATE,
+        "--project", "allspark",
+        "--topic", "车辆卡住排查",
+        "--base-dir", str(tmp_path / ".triage"),
+        "--issue-type", "order_execution",
+        "--vehicle-name", "AG0019",
+    )
+    state_path = Path(triage_result["state_path"])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["phase"] = "keywords_ready"
+    state["keyword_package_status"] = "ready"
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-15 10:24:01.000 [main] INFO ChangeMapRequest finished",
+            "2026-04-15 10:24:02.000 [main] INFO AG0019 heartbeat",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["ChangeMapRequest"],
+        "gate_terms": ["ChangeMapRequest"],
+        "target_files": ["bootstrap"],
+        "preferred_files": ["bootstrap"],
+        "anchor_match_mode": "prefer",
+        "require_anchor": False,
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--state", str(state_path),
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["hits_total"] == 2
+    assert payload["suppressed_hits_total"] == 0
+    assert payload["keyword_package"]["anchor_terms"] == ["AG0019"]
+    assert payload["keyword_package"]["anchor_match_mode"] == "prefer"
+    assert payload["keyword_package"]["require_anchor"] is False
+
+
 def test_search_worker_default_max_hits_is_100():
     import importlib.util
 
@@ -536,3 +786,404 @@ def test_search_worker_still_collects_other_order_candidates_when_primary_order_
     order_ids = [item["order_id"] for item in payload["order_candidates"]]
     assert "358208" in order_ids
     assert "358209" in order_ids
+
+
+def test_search_worker_reports_empty_root_diagnostics(tmp_path):
+    log_root = tmp_path / "empty_logs"
+    log_root.mkdir()
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019"],
+        "target_files": ["bootstrap"],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["documents_scanned"] == 0
+    assert payload["root_diagnostics"]["root_file_count"] == 0
+    assert payload["search_warnings"]
+    summary = Path(result["summary_md"]).read_text(encoding="utf-8")
+    assert "Search Warnings" in summary
+
+
+def test_search_worker_skips_corrupt_archive_and_scans_valid_logs(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bad.tar").write_bytes(b"not a tar")
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-15 10:24:01.000 [main] INFO AG0019 ChangeMapRequest sent\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "ChangeMapRequest"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["ChangeMapRequest"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["hits_total"] == 1
+    assert payload["evidence_hits"][0]["path"].endswith("bootstrap.log")
+
+
+def test_search_worker_reports_unsupported_zst_archive(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bundle.tar.zst").write_bytes(b"\x28\xb5\x2f\xfdplaceholder")
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019"],
+        "target_files": ["bootstrap"],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["root_diagnostics"]["unsupported_archive_count"] == 1
+    assert any(".zst" in warning for warning in payload["search_warnings"])
+
+
+def test_search_worker_truncates_many_hits_by_score_for_rerank(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    lines = []
+    for index in range(10):
+        lines.append(f"2026-04-15 10:24:{index:02d}.000 [main] INFO AG0019 LowTerm event {index}")
+    for index in range(10):
+        lines.append(f"2026-04-15 10:25:{index:02d}.000 [main] INFO AG0019 MidTerm event {index}")
+    for index in range(10):
+        lines.append(f"2026-04-15 10:26:{index:02d}.000 [main] INFO AG0019 HighTerm event {index}")
+    (log_root / "bootstrap.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "LowTerm", "MidTerm", "HighTerm"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["LowTerm", "MidTerm", "HighTerm"],
+        "target_files": ["bootstrap"],
+        "term_priorities": [
+            {"term": "LowTerm", "score": 1, "category": "gate"},
+            {"term": "MidTerm", "score": 10, "category": "gate"},
+            {"term": "HighTerm", "score": 30, "category": "gate"}
+        ],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "5",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    scores = [hit["score"] for hit in payload["evidence_hits"]]
+    assert payload["returned_hits_total"] == 5
+    assert payload["accepted_hits_total"] == 30
+    assert payload["hits_truncated"] is True
+    assert payload["needs_rerank"] is True
+    assert scores == sorted(scores, reverse=True)
+    assert all("HighTerm" in hit["matched_terms"] for hit in payload["evidence_hits"])
+
+
+def test_search_worker_merges_same_vehicle_logger_line_template_hits(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    lines = []
+    for index in range(1, 21):
+        lines.append(
+            "2026-04-15 10:24:{0:02d}.000 [commonTaskExecutor-{0}] INFO  "
+            "c.s.a.a.d.k.m.TrafficApplyCallBackImpl line:141 - "
+            "AG0019|358208.Move_abc: appliedSteps successful, "
+            "sending checkPointRequest success, curCheckPointNo is {0}".format(index)
+        )
+    lines.append(
+        "2026-04-15 10:25:00.000 [change-map-thread--1] INFO  "
+        "c.s.a.a.d.k.v.m.CrossMapManager line:135 - "
+        "AG0019: 切换地图成功,车辆执行状态不符合：IDLE pre：358208，now:358208"
+    )
+    (log_root / "bootstrap.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "CheckPointRequest", "TrafficApplyCallBackImpl", "CrossMapManager", "车辆执行状态不符合"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["CheckPointRequest", "车辆执行状态不符合"],
+        "core_terms": ["TrafficApplyCallBackImpl", "CrossMapManager"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["returned_hits_limit"] == 100
+    assert payload["accepted_hits_total"] == 21
+    assert payload["hits_total"] == 2
+    assert payload["template_groups_total"] == 1
+    assert payload["template_merged_hits_total"] == 19
+
+    merged_hit = next(
+        hit for hit in payload["evidence_hits"]
+        if (hit.get("template_identity") or {}).get("class_name", "").endswith("TrafficApplyCallBackImpl")
+    )
+    assert merged_hit["template_identity"]["vehicle"] == "AG0019"
+    assert merged_hit["template_identity"]["task_key"] == "358208"
+    assert merged_hit["template_identity"]["source_line"] == "141"
+    assert merged_hit["template_merge"]["hit_count"] == 20
+    assert merged_hit["merged_summary"].startswith("模板合并: AG0019 task:358208")
+    assert any("checkpoint_no: 1 -> 20" in fact for fact in merged_hit["template_merge"]["change_facts"])
+
+    summary = Path(result["summary_md"]).read_text(encoding="utf-8")
+    assert "Template Groups" in summary
+    assert "Merged summary: 模板合并: AG0019 task:358208" in summary
+    assert "Template merged hits: `20`" in summary
+    assert "Template time range: `2026-04-15 10:24:01.000` ~ `2026-04-15 10:24:20.000`" in summary
+    assert "Template change facts:" in summary
+    assert "checkpoint_no: 1 -> 20" in summary
+
+
+def test_search_worker_does_not_merge_same_template_across_tasks(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    lines = []
+    for task_id in ("358208", "358209"):
+        for index in range(1, 6):
+            lines.append(
+                "2026-04-15 10:24:{0}{1}.000 [commonTaskExecutor-{1}] INFO  "
+                "c.s.a.a.d.k.m.TrafficApplyCallBackImpl line:141 - "
+                "AG0019|{0}.Move_abc: appliedSteps successful, "
+                "sending checkPointRequest success, curCheckPointNo is {1}".format(task_id, index)
+            )
+    (log_root / "bootstrap.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "CheckPointRequest", "TrafficApplyCallBackImpl"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["CheckPointRequest"],
+        "core_terms": ["TrafficApplyCallBackImpl"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    task_keys = sorted(
+        (hit.get("template_identity") or {}).get("task_key")
+        for hit in payload["evidence_hits"]
+        if hit.get("template_identity")
+    )
+    hit_counts = sorted(
+        (hit.get("template_merge") or {}).get("hit_count")
+        for hit in payload["evidence_hits"]
+        if hit.get("template_merge")
+    )
+    assert payload["accepted_hits_total"] == 10
+    assert payload["hits_total"] == 2
+    assert task_keys == ["358208", "358209"]
+    assert hit_counts == [5, 5]
+    assert payload["template_merged_hits_total"] == 8
+
+
+def test_search_worker_merges_template_without_task_key_as_none_scope(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-15 10:24:01.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:1",
+            "2026-04-15 10:24:02.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:2",
+            "2026-04-15 10:24:03.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:3",
+            "2026-04-15 10:24:04.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:4",
+            "2026-04-15 10:24:05.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:5",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "电梯", "ElevatorResourceDevice"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["电梯"],
+        "core_terms": ["ElevatorResourceDevice"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["accepted_hits_total"] == 5
+    assert payload["hits_total"] == 1
+    assert payload["template_merge_min_hits"] == 5
+    assert payload["template_groups_total"] == 1
+    merged_hit = payload["evidence_hits"][0]
+    assert merged_hit["template_identity"]["task_key"] == ""
+    assert merged_hit["template_identity"]["task_scope"] == "none"
+    assert merged_hit["template_identity"]["template_variant"]
+    assert merged_hit["template_merge"]["hit_count"] == 5
+    assert "task:none" in merged_hit["merged_summary"]
+    assert any("station: 1 -> 5" in fact for fact in merged_hit["template_merge"]["change_facts"])
+
+
+def test_search_worker_does_not_merge_template_below_min_hit_threshold(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-15 10:24:01.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:1",
+            "2026-04-15 10:24:02.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:2",
+            "2026-04-15 10:24:03.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:3",
+            "2026-04-15 10:24:04.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: deviceName:AG0019 apply success resource:AreaResource station:4",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "电梯", "ElevatorResourceDevice"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["电梯"],
+        "core_terms": ["ElevatorResourceDevice"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["accepted_hits_total"] == 4
+    assert payload["hits_total"] == 4
+    assert payload["template_merge_min_hits"] == 5
+    assert payload["template_groups_total"] == 0
+    assert payload["template_merged_hits_total"] == 0
+    assert all(not hit.get("merged_summary") for hit in payload["evidence_hits"])
+
+
+def test_search_worker_does_not_merge_template_without_vehicle_anchor(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-15 10:24:01.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: apply success resource:AreaResource station:1",
+            "2026-04-15 10:24:02.000 [main] INFO  c.s.a.a.d.k.p.d.h.e.ElevatorResourceDevice line:127 - 2号电梯: apply success resource:AreaResource station:2",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["电梯", "ElevatorResourceDevice"],
+        "gate_terms": ["电梯"],
+        "core_terms": ["ElevatorResourceDevice"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["accepted_hits_total"] == 2
+    assert payload["hits_total"] == 2
+    assert payload["template_groups_total"] == 0
+    assert all("template_identity" not in hit for hit in payload["evidence_hits"])
+
+
+def test_search_worker_keeps_no_task_state_variants_separate(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "\n".join([
+            "2026-04-15 10:24:01.000 [event-bus-record-1] INFO  c.s.a.a.d.l.ChargingStateListener line:41 - charging state VEHICLE_STOP_CHARGING change event {\"vehicle\":{\"name\":\"AG0019\"}}",
+            "2026-04-15 10:24:02.000 [event-bus-record-1] INFO  c.s.a.a.d.l.ChargingStateListener line:41 - charging state VEHICLE_CHARGING change event {\"vehicle\":{\"name\":\"AG0019\"}}",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "charging state", "ChargingStateListener"],
+        "anchor_terms": ["AG0019"],
+        "gate_terms": ["charging state"],
+        "core_terms": ["ChargingStateListener"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-15 10:20:00",
+            "end": "2026-04-15 10:30:00"
+        }
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    assert payload["accepted_hits_total"] == 2
+    assert payload["hits_total"] == 2
+    assert payload["template_groups_total"] == 0
+    variants = sorted(
+        (hit.get("template_identity") or {}).get("template_variant")
+        for hit in payload["evidence_hits"]
+        if hit.get("template_identity")
+    )
+    assert variants == [
+        "charging state VEHICLE_CHARGING change event",
+        "charging state VEHICLE_STOP_CHARGING change event",
+    ]

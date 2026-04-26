@@ -105,20 +105,28 @@
 
 ## Phase Rules
 
-- `keywords_ready` 之前，不要启动大规模日志搜索。
-- `incident_snapshot_built` 之前，不要把“没有规划路径”“HttpAct 卡住”“定位抖动”这类现象直接包装成主因；先回答问题时间点车辆处于什么状态、什么流程、在等什么。
+- `keywords_ready` 之前，不要启动大规模日志搜索；但可以做轻量文件盘点、时间换算、日志路由判断和代码词提取。
+- `incident_snapshot_built` 表示已经建立可继续搜索的初始快照，不表示所有状态都已确认。对订单执行问题，首轮允许 `incident_snapshot.status=partial`，至少要有时间口径、车辆/订单候选、问题类型、目标日志范围和下一轮 `focus_question`。
+- `incident_snapshot_built` 之前，不要把“没有规划路径”“HttpAct 卡住”“定位抖动”这类现象直接包装成主因；先明确还缺哪些状态或门禁证据。
 - `search_delegated` 阶段只允许把最小搜索输入交给子 agent，不要把大量原始日志塞回主线程。
 - `evidence_reviewed` 阶段必须判断证据链是否完整，以及置信度是否足够高。
 - `订单 / 车辆任务执行问题`在 `evidence_reviewed` 阶段至少要检查 `订单ID + 车辆名称 + 时间` 是否闭合；缺少订单ID时，不要推进到高置信结论。
-- `订单 / 车辆任务执行问题`在 `incident_snapshot_built` 阶段至少要补齐：问题时间点车辆系统状态、车辆执行状态、当前子任务/动作、流程门禁、理论下一步动作。
+- `订单 / 车辆任务执行问题`在 `evidence_reviewed` 阶段应补齐：问题时间点车辆系统状态、车辆执行状态、当前子任务/动作、流程门禁、理论下一步动作；如果仍缺，保持 `partial` 并写入 `missing_items`。
 - 对 `订单 / 车辆任务执行问题`，车辆名称是全程主锚点；如果问题窗口内同一车辆牵出多个订单，不要只保留一个模糊印象，必须把 `order_candidates` 显式记下来，再判断哪一个订单真正对应主问题。
 - `RIOT3` 要在状态里明确“现场时区”和 `UTC+0` 日志时区；`RIOT2 / FMS` 要明确服务器时间口径。
 - `ready_for_report` 仅表示“可以出正式报告”，不代表应该立刻输出。
 - `report_confirmed` 只有在用户明确同意后才能进入。
 
+## Search Round Contract
+
+- `round1 / order_discovery`：用于找订单候选、状态候选和流程门禁。缺订单号时，允许 `车辆名称 + 时间窗 + 业务门禁词` 宽召回；输出必须标注哪些证据未订单闭合。
+- `round2+ / verification`：用于验证具体假设。默认用 `订单ID + 车辆名称 + 时间窗 + 门禁/代码关键词` 收紧，并记录保留、删除、降级的关键词。
+- 高分排序只决定阅读优先级；结论必须按 `timeline_hits` 或原始日志时间顺序复盘。
+- 如果搜索轮次没有解决当前 `focus_question`，不要推进 `confidence`，先修改下一轮 `keyword_package`。
+
 ## Search Worker Contract
 
-把大规模搜索下沉到子 agent / 子 skill 时，输入尽量收敛：
+把大规模搜索下沉到 `search_worker.py`、子 agent 或子 skill 时，输入尽量收敛：
 
 - 问题摘要
 - 时间窗口
@@ -128,7 +136,7 @@
 - 目标日志文件或目录
 - 当前假设列表
 
-子 agent 返回时只保留：
+执行器返回时只保留：
 
 - 命中的关键日志条目摘要
 - 文件路径、时间点、命中次数

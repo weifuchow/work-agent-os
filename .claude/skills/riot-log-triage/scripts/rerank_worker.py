@@ -69,8 +69,27 @@ def build_hit_items(search_results: dict[str, Any]) -> list[dict[str, Any]]:
             "matched_line": str(hit.get("matched_line") or ""),
             "excerpt": str(hit.get("excerpt") or ""),
             "match_reason": str(hit.get("match_reason") or ""),
+            "merged_summary": str(hit.get("merged_summary") or ""),
+            "template_identity": dict(hit.get("template_identity") or {}),
+            "template_merge": compact_template_merge(hit.get("template_merge") or {}),
         })
     return items
+
+
+def compact_template_merge(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    hit_count = int(raw.get("hit_count") or 1)
+    if hit_count <= 1:
+        return {}
+    return {
+        "hit_count": hit_count,
+        "first_timestamp": str(raw.get("first_timestamp") or ""),
+        "last_timestamp": str(raw.get("last_timestamp") or ""),
+        "first_location": str(raw.get("first_location") or ""),
+        "last_location": str(raw.get("last_location") or ""),
+        "change_facts": list(raw.get("change_facts") or []),
+    }
 
 
 def build_prompt(*, state: dict[str, Any], search_results: dict[str, Any], hit_items: list[dict[str, Any]], max_kept_hits: int) -> str:
@@ -87,9 +106,31 @@ def build_prompt(*, state: dict[str, Any], search_results: dict[str, Any], hit_i
             "matched_line": item["matched_line"],
             "excerpt": item["excerpt"],
             "match_reason": item["match_reason"],
+            "merged_summary": item.get("merged_summary") or "",
+            "template_identity": item.get("template_identity") or {},
+            "template_merge": item.get("template_merge") or {},
         }
         for item in hit_items
     ]
+    hit_id_by_location = {
+        (item["path"], item["line_number"]): item["id"]
+        for item in hit_items
+    }
+    compact_timeline = []
+    for hit in list(search_results.get("timeline_hits") or []):
+        hit_id = hit_id_by_location.get((hit.get("path", ""), int(hit.get("line_number") or 0)), "")
+        compact_timeline.append({
+            "id": hit_id,
+            "path": hit.get("path", ""),
+            "line_number": int(hit.get("line_number") or 0),
+            "timestamp": str(hit.get("timestamp") or ""),
+            "matched_terms": list(hit.get("matched_terms") or []),
+            "matched_line": str(hit.get("matched_line") or ""),
+            "score": int(hit.get("score") or 0),
+            "merged_summary": str(hit.get("merged_summary") or ""),
+            "template_identity": dict(hit.get("template_identity") or {}),
+            "template_merge": compact_template_merge(hit.get("template_merge") or {}),
+        })
     payload = {
         "focus_question": state.get("current_question") or state.get("primary_question") or state.get("problem_summary") or "",
         "primary_question": state.get("primary_question") or "",
@@ -106,19 +147,30 @@ def build_prompt(*, state: dict[str, Any], search_results: dict[str, Any], hit_i
             "suppressed_hits_total": int(search_results.get("suppressed_hits_total") or 0),
         },
         "hits": compact_hits,
+        "timeline_hits": compact_timeline,
     }
     prompt = (
         "你在做 RIOT 日志排障的二次去噪。给定当前 focus question、state 和粗筛命中后，"
-        "只保留真正有价值、最能帮助回答主问题的命中。不要改写原始日志内容，只能按 hit id 选择、排序、归类。\n\n"
+        "只保留真正有价值、最能帮助回答主问题的命中。不要改写原始日志内容，只能按 hit id 选择、排序、归类；"
+        "分析结论必须先满足时间顺序，不能只按相关性高低倒推故事。\n\n"
         "规则：\n"
         "1. 优先保留能直接回答“问题时间点车辆处于什么状态、处于什么流程、为什么后续动作没有继续下发”的 hit。\n"
         "2. 优先保留带车辆锚点、订单候选、请求发送/完成、stage、状态变化、门禁判断的 hit。\n"
         "3. 充电、停车、周期监控、重复轮询、无关车辆、纯泛词 hang/fail 但没有直接主问题价值的 hit 视为噪音。\n"
-        "4. 只做精简，不改原始 hit 内容。\n"
-        f"5. relevant_hit_ids 最多返回 {max_kept_hits} 个。\n\n"
+        "4. 必须按 timeline_hits 复盘事件顺序：先发生、后发生、缺口、不确定点分别说明；没有时间戳的证据只能辅助，不能覆盖有时间戳证据。\n"
+        "5. 必须先读懂执行链路再分析过程：入口动作 -> 状态写入 -> 请求下发/回调 -> 状态读取/门禁 -> 下一步动作或提前返回。\n"
+        "6. 读取代码时先锁定日志对应类/方法/异常/错误码，再推导下一步；不要用未命中日志的代码路径替代现场证据。\n"
+        "7. 如果证据指向具体类、方法、异常类、错误码、状态/阶段词或关键日志文案，把它们放入 core_terms / exception_terms / stage_terms / log_message_terms，并按后续搜索价值给 term_priorities 打分。\n"
+        "8. 如果 hit 带 template_merge，说明同一车辆 + 类名 + 源码行模板已合并；优先读 hit_count、时间范围和 change_facts，不要把同一模板的周期性变化当成多条独立强证据。\n"
+        "9. 只做精简，不改原始 hit 内容。\n"
+        f"10. relevant_hit_ids 最多返回 {max_kept_hits} 个。\n\n"
         "返回严格 JSON：\n"
         "{\n"
         '  "summary": "...",\n'
+        '  "execution_chain_summary": ["入口->状态->请求/回调->门禁->下一步/提前返回..."],\n'
+        '  "execution_chain_gaps": ["链路缺口..."],\n'
+        '  "timeline_summary": ["先后顺序事实..."],\n'
+        '  "temporal_gaps": ["缺失或冲突的时间点..."],\n'
         '  "relevant_hit_ids": ["h1"],\n'
         '  "noise_hit_ids": ["h2"],\n'
         '  "noise_patterns": ["..."],\n'
@@ -129,6 +181,11 @@ def build_prompt(*, state: dict[str, Any], search_results: dict[str, Any], hit_i
         '    "keep_terms": ["..."],\n'
         '    "drop_terms": ["..."],\n'
         '    "add_terms": ["..."],\n'
+        '    "core_terms": ["CrossMapManager"],\n'
+        '    "exception_terms": ["ReservationConflictException"],\n'
+        '    "stage_terms": ["IN_CHANGE_MAP"],\n'
+        '    "log_message_terms": ["车辆执行状态不符合"],\n'
+        '    "term_priorities": [{"term": "CrossMapManager", "score": 18, "category": "core", "reason": "..."}],\n'
         '    "target_files": ["..."]\n'
         "  },\n"
         '  "confidence": "low|medium|high"\n'
@@ -168,6 +225,30 @@ def write_summary(output_path: Path, rerank_results: dict[str, Any]) -> None:
     else:
         lines.append("- none")
 
+    execution_chain_summary = list(rerank_results.get("execution_chain_summary") or [])
+    if execution_chain_summary:
+        lines.extend(["", "## Execution Chain Summary", ""])
+        for item in execution_chain_summary:
+            lines.append(f"- {item}")
+
+    execution_chain_gaps = list(rerank_results.get("execution_chain_gaps") or [])
+    if execution_chain_gaps:
+        lines.extend(["", "## Execution Chain Gaps", ""])
+        for item in execution_chain_gaps:
+            lines.append(f"- {item}")
+
+    timeline_summary = list(rerank_results.get("timeline_summary") or [])
+    if timeline_summary:
+        lines.extend(["", "## Timeline Summary", ""])
+        for item in timeline_summary:
+            lines.append(f"- {item}")
+
+    temporal_gaps = list(rerank_results.get("temporal_gaps") or [])
+    if temporal_gaps:
+        lines.extend(["", "## Temporal Gaps", ""])
+        for item in temporal_gaps:
+            lines.append(f"- {item}")
+
     noise_patterns = list(rerank_results.get("noise_patterns") or [])
     if noise_patterns:
         lines.extend(["", "## Noise Patterns", ""])
@@ -177,7 +258,7 @@ def write_summary(output_path: Path, rerank_results: dict[str, Any]) -> None:
     keyword_adjustments = dict(rerank_results.get("next_keyword_adjustments") or {})
     if keyword_adjustments:
         lines.extend(["", "## Next Keyword Adjustments", ""])
-        for key in ("keep_terms", "drop_terms", "add_terms", "target_files"):
+        for key in ("keep_terms", "drop_terms", "add_terms", "core_terms", "exception_terms", "stage_terms", "log_message_terms", "target_files"):
             values = list(keyword_adjustments.get(key) or [])
             lines.append(f"- {key}: {', '.join(values) if values else 'none'}")
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -203,6 +284,10 @@ def update_state_after_rerank(*, state_path: Path, rerank_json: Path, rerank_md:
     if history:
         history[-1]["rerank"] = {
             "summary": rerank_results.get("summary", ""),
+            "execution_chain_summary": list(rerank_results.get("execution_chain_summary") or []),
+            "execution_chain_gaps": list(rerank_results.get("execution_chain_gaps") or []),
+            "timeline_summary": list(rerank_results.get("timeline_summary") or []),
+            "temporal_gaps": list(rerank_results.get("temporal_gaps") or []),
             "confidence": rerank_results.get("confidence", ""),
             "relevant_hit_ids": list(rerank_results.get("relevant_hit_ids") or []),
             "noise_hit_ids": list(rerank_results.get("noise_hit_ids") or []),
@@ -228,6 +313,10 @@ async def rerank_search_results(*, search_results_path: Path, state_path: Path, 
     noise_ids = [hit_id for hit_id in decision.get("noise_hit_ids", []) if hit_id in hit_map]
     rerank_results = {
         "summary": str(decision.get("summary") or "").strip(),
+        "execution_chain_summary": [str(item).strip() for item in decision.get("execution_chain_summary", []) if str(item).strip()],
+        "execution_chain_gaps": [str(item).strip() for item in decision.get("execution_chain_gaps", []) if str(item).strip()],
+        "timeline_summary": [str(item).strip() for item in decision.get("timeline_summary", []) if str(item).strip()],
+        "temporal_gaps": [str(item).strip() for item in decision.get("temporal_gaps", []) if str(item).strip()],
         "confidence": str(decision.get("confidence") or "").strip(),
         "suspected_process_stage": str(decision.get("suspected_process_stage") or "").strip(),
         "candidate_order_ids": [str(item).strip() for item in decision.get("candidate_order_ids", []) if str(item).strip()],

@@ -71,6 +71,112 @@ def build_dsl(*, anchor_terms: list[str], keep_terms: list[str], add_terms: list
     return query.strip()
 
 
+def normalize_term_priorities(raw: Any) -> list[dict[str, Any]]:
+    priorities: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for term, meta in raw.items():
+            term_text = str(term or "").strip()
+            if not term_text:
+                continue
+            if isinstance(meta, dict):
+                score_raw = meta.get("score", meta.get("weight", 0))
+                category = str(meta.get("category") or "").strip()
+                reason = str(meta.get("reason") or "").strip()
+            else:
+                score_raw = meta
+                category = ""
+                reason = ""
+            try:
+                score = int(score_raw)
+            except (TypeError, ValueError):
+                score = 0
+            priorities.append({"term": term_text, "score": score, "category": category, "reason": reason})
+        return priorities
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                term_text = str(item or "").strip()
+                if term_text:
+                    priorities.append({"term": term_text, "score": 0, "category": "", "reason": ""})
+                continue
+            term_text = str(item.get("term") or item.get("name") or "").strip()
+            if not term_text:
+                continue
+            try:
+                score = int(item.get("score", item.get("weight", 0)))
+            except (TypeError, ValueError):
+                score = 0
+            priorities.append({
+                "term": term_text,
+                "score": score,
+                "category": str(item.get("category") or "").strip(),
+                "reason": str(item.get("reason") or "").strip(),
+            })
+    return priorities
+
+
+def infer_code_terms(terms: list[str]) -> tuple[list[str], list[str]]:
+    core_terms: list[str] = []
+    exception_terms: list[str] = []
+    core_suffixes = (
+        "Manager",
+        "Service",
+        "Listener",
+        "Controller",
+        "Request",
+        "Response",
+        "Action",
+        "Actuator",
+        "Handler",
+        "Processor",
+        "Executor",
+        "Builder",
+        "Factory",
+        "Resolver",
+        "Strategy",
+    )
+    for term in terms:
+        if term.endswith(("Exception", "Error")):
+            exception_terms.append(term)
+            continue
+        if term.endswith(core_suffixes) or "." in term:
+            core_terms.append(term)
+    return dedupe(core_terms), dedupe(exception_terms)
+
+
+def default_term_priorities(*, core_terms: list[str], exception_terms: list[str], log_message_terms: list[str], stage_terms: list[str]) -> list[dict[str, Any]]:
+    priorities: list[dict[str, Any]] = []
+    for term in core_terms:
+        priorities.append({
+            "term": term,
+            "score": 14,
+            "category": "core",
+            "reason": "代码关键类/方法词",
+        })
+    for term in exception_terms:
+        priorities.append({
+            "term": term,
+            "score": 20,
+            "category": "exception",
+            "reason": "代码异常/错误词",
+        })
+    for term in log_message_terms:
+        priorities.append({
+            "term": term,
+            "score": 12,
+            "category": "log_message",
+            "reason": "代码关键日志文案",
+        })
+    for term in stage_terms:
+        priorities.append({
+            "term": term,
+            "score": 10,
+            "category": "stage",
+            "reason": "执行链路状态/阶段/门禁词",
+        })
+    return priorities
+
+
 def build_next_package(*, state: dict[str, Any], rerank_results: dict[str, Any]) -> dict[str, Any]:
     evidence_anchor = dict(state.get("evidence_anchor") or {})
     current_history = list(dict(state.get("narrowing_round") or {}).get("history") or [])
@@ -88,33 +194,83 @@ def build_next_package(*, state: dict[str, Any], rerank_results: dict[str, Any])
     keep_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("keep_terms") or []])
     add_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("add_terms") or []])
     drop_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("drop_terms") or []])
+    log_message_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("log_message_terms") or []])
+    stage_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("stage_terms") or []])
+    explicit_core_terms = dedupe([
+        *[str(item).strip() for item in keyword_adjustments.get("core_terms") or []],
+        *[str(item).strip() for item in keyword_adjustments.get("class_terms") or []],
+        *[str(item).strip() for item in keyword_adjustments.get("method_terms") or []],
+    ])
+    explicit_exception_terms = dedupe([str(item).strip() for item in keyword_adjustments.get("exception_terms") or []])
+    inferred_core_terms, inferred_exception_terms = infer_code_terms([*keep_terms, *add_terms])
+    core_terms = dedupe([*explicit_core_terms, *inferred_core_terms])
+    exception_terms = dedupe([*explicit_exception_terms, *inferred_exception_terms])
+    term_priorities = dedupe_term_priorities([
+        *normalize_term_priorities(keyword_adjustments.get("term_priorities") or []),
+        *default_term_priorities(
+            core_terms=core_terms,
+            exception_terms=exception_terms,
+            log_message_terms=log_message_terms,
+            stage_terms=stage_terms,
+        ),
+    ])
     target_files = dedupe([str(item).strip() for item in keyword_adjustments.get("target_files") or []]) or previous_target_files
     preferred_files = dedupe(target_files[:1] if target_files else [])
 
     gate_terms = dedupe([
         *[term for term in keep_terms if term not in anchor_terms],
         *[term for term in add_terms if term not in anchor_terms],
+        *[term for term in log_message_terms if term not in anchor_terms],
+        *[term for term in stage_terms if term not in anchor_terms],
     ])
+    positive_terms = dedupe([*gate_terms, *core_terms, *exception_terms])
     package = {
         "anchor_terms": anchor_terms,
         "gate_terms": gate_terms,
+        "log_message_terms": log_message_terms,
+        "stage_terms": stage_terms,
+        "core_terms": core_terms,
+        "exception_terms": exception_terms,
         "generic_terms": [],
-        "include_terms": dedupe([*anchor_terms, *gate_terms]),
+        "include_terms": dedupe([*anchor_terms, *positive_terms]),
         "exclude_terms": [],
         "target_files": target_files,
         "preferred_files": preferred_files,
         "excluded_files": drop_terms,
+        "term_priorities": term_priorities,
         "hypotheses": [],
         "require_anchor": True,
         "time_window": previous_window,
         "dsl_query": build_dsl(
             anchor_terms=anchor_terms,
-            keep_terms=keep_terms,
+            keep_terms=dedupe([*keep_terms, *core_terms, *exception_terms]),
             add_terms=add_terms,
             drop_terms=drop_terms,
         ),
     }
     return package
+
+
+def dedupe_term_priorities(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_term: dict[str, dict[str, Any]] = {}
+    for item in values:
+        term = str(item.get("term") or "").strip()
+        if not term:
+            continue
+        try:
+            score = int(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        normalized = {
+            "term": term,
+            "score": score,
+            "category": str(item.get("category") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+        }
+        current = by_term.get(term)
+        if current is None or score > int(current.get("score") or 0):
+            by_term[term] = normalized
+    return sorted(by_term.values(), key=lambda item: int(item.get("score") or 0), reverse=True)
 
 
 def update_state_after_next_round(*, state_path: Path, package_json: Path, dsl_txt: Path, rerank_results: dict[str, Any], package: dict[str, Any], round_no: int) -> None:
@@ -135,6 +291,11 @@ def update_state_after_next_round(*, state_path: Path, package_json: Path, dsl_t
             "dsl_query": package.get("dsl_query", ""),
             "target_files": list(package.get("target_files") or []),
             "drop_terms": list(package.get("excluded_files") or []),
+            "log_message_terms": list(package.get("log_message_terms") or []),
+            "stage_terms": list(package.get("stage_terms") or []),
+            "core_terms": list(package.get("core_terms") or []),
+            "exception_terms": list(package.get("exception_terms") or []),
+            "term_priorities": list(package.get("term_priorities") or []),
         }
         state["narrowing_round"]["history"] = history
     save_state(state_path, state)
