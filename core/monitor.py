@@ -13,6 +13,9 @@ from models.db import AgentRun, AgentRunStatus, Message, PipelineStatus, Session
 
 # Time to wait before first "thinking" notification.
 THINKING_NOTIFY_MINUTES = 5
+# Messages left in an in-flight pipeline state beyond this are considered
+# orphaned by a previous worker/API restart. The default Codex timeout is 20min.
+STALE_INFLIGHT_FAIL_MINUTES = 30
 # Maximum number of "thinking" notifications per message.
 MAX_THINKING_NOTIFICATIONS = 3
 
@@ -29,28 +32,14 @@ async def check_running_tasks() -> dict:
     async with async_session_factory() as db:
         counts = {"running": 0, "stuck": 0, "notified": 0, "inflight": []}
 
-        # 1. Check slow/stuck pipelines — only notify, no auto-retry
-        thinking_cutoff = datetime.now() - timedelta(minutes=THINKING_NOTIFY_MINUTES)
-
-        # Messages still in classifying/routing after THINKING_NOTIFY_MINUTES
-        stmt = select(Message).where(and_(
-            Message.pipeline_status.in_([
-                PipelineStatus.classifying, PipelineStatus.routing,
-            ]),
-            Message.received_at < thinking_cutoff,
-        ))
-        slow_msgs = (await db.execute(stmt)).scalars().all()
-        for msg in slow_msgs:
-            count = _thinking_counts.get(msg.id, 0)
-            if count < MAX_THINKING_NOTIFICATIONS:
-                await _notify_thinking(msg)
-                _thinking_counts[msg.id] = count + 1
-                counts["notified"] += 1
-
-        # 2. Collect all running agent_runs (observability, no auto-action)
+        # 1. Collect running agent_runs first, so stale pipeline rows can be
+        # distinguished from genuinely active work.
         stmt = select(AgentRun).where(AgentRun.status == AgentRunStatus.running)
         running_runs = (await db.execute(stmt)).scalars().all()
         now = datetime.now()
+        active_message_ids = {r.message_id for r in running_runs if r.message_id}
+        active_session_ids = {r.session_id for r in running_runs if r.session_id}
+
         for run in running_runs:
             counts["running"] += 1
             elapsed = (now - run.started_at).total_seconds() if run.started_at else 0
@@ -61,6 +50,53 @@ async def check_running_tasks() -> dict:
                 "session_id": run.session_id,
                 "elapsed_seconds": round(elapsed, 1),
             })
+
+        # 2. Check slow/stuck pipelines. Very old in-flight rows are orphaned
+        # state from a prior process and must not keep notifying Feishu.
+        thinking_cutoff = datetime.now() - timedelta(minutes=THINKING_NOTIFY_MINUTES)
+        stale_cutoff = datetime.now() - timedelta(minutes=STALE_INFLIGHT_FAIL_MINUTES)
+
+        # Messages still in classifying/routing after THINKING_NOTIFY_MINUTES
+        stmt = select(Message).where(and_(
+            Message.pipeline_status.in_([
+                PipelineStatus.classifying, PipelineStatus.routing,
+            ]),
+            Message.received_at < thinking_cutoff,
+        ))
+        slow_msgs = (await db.execute(stmt)).scalars().all()
+        stale_changed = False
+        for msg in slow_msgs:
+            has_active_run = (
+                msg.id in active_message_ids
+                or (msg.session_id is not None and msg.session_id in active_session_ids)
+            )
+            if msg.received_at < stale_cutoff and not has_active_run:
+                msg.pipeline_status = PipelineStatus.failed
+                msg.pipeline_error = (
+                    f"stale in-flight pipeline state after "
+                    f"{STALE_INFLIGHT_FAIL_MINUTES} minutes; likely orphaned by service restart"
+                )
+                msg.processed_at = now
+                db.add(msg)
+                _thinking_counts.pop(msg.id, None)
+                counts["stuck"] += 1
+                stale_changed = True
+                logger.warning(
+                    "Monitor: marked stale message {} as failed (status={}, received_at={})",
+                    msg.id,
+                    msg.pipeline_status,
+                    msg.received_at,
+                )
+                continue
+
+            count = _thinking_counts.get(msg.id, 0)
+            if count < MAX_THINKING_NOTIFICATIONS:
+                await _notify_thinking(msg)
+                _thinking_counts[msg.id] = count + 1
+                counts["notified"] += 1
+
+        if stale_changed:
+            await db.commit()
 
         # 3. Report recently completed tasks (last check interval)
         interval = datetime.now() - timedelta(minutes=2)
