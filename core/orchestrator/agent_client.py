@@ -649,13 +649,10 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
     project_prompt += (
         "\n\n请在项目上下文中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
-        "如果需要回顾项目历史决策、里程碑、已知问题或个人偏好，优先用 search_memory_entries 检索结构化记忆；"
-        "当你确认本轮产生了长期有效的项目信息或偏好信息时，可用 upsert_memory_entry 进行沉淀。"
     )
 
     project_system = (
         f"你运行在项目 {project.name} 的工作目录中（{project.path}）。使用项目级 skills 完成任务。"
-        "优先复用结构化长期记忆，不要重复发明已经记录的项目结论。"
         f"{runtime_block}"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
@@ -743,23 +740,30 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
 # ==================== MCP Server ====================
 
-# All tools registered in MCP (project agents get full set)
-CUSTOM_TOOLS = [query_db, write_audit_log, send_feishu_message, reply_to_message,
-                save_bot_reply,
-                read_memory, write_memory, search_memory_entries, upsert_memory_entry,
-                update_session, link_task_context,
-                list_projects_tool, dispatch_to_project]
+# Tools registered in MCP. Memory tools are opt-in to keep code analysis grounded
+# in repository files and current case artifacts by default.
+CUSTOM_TOOLS = [
+    query_db,
+    write_audit_log,
+    send_feishu_message,
+    reply_to_message,
+    save_bot_reply,
+    update_session,
+    link_task_context,
+    list_projects_tool,
+    dispatch_to_project,
+]
+if settings.enable_memory_tools:
+    CUSTOM_TOOLS.extend([read_memory, write_memory, search_memory_entries, upsert_memory_entry])
 
 PROJECT_TOOLS = [
     query_db,
     write_audit_log,
-    read_memory,
-    write_memory,
-    search_memory_entries,
-    upsert_memory_entry,
     update_session,
     link_task_context,
 ]
+if settings.enable_memory_tools:
+    PROJECT_TOOLS.extend([read_memory, write_memory, search_memory_entries, upsert_memory_entry])
 
 CUSTOM_MCP_SERVER = create_sdk_mcp_server(
     name="work-agent-tools",
@@ -772,9 +776,9 @@ PROJECT_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in PROJECT_TOOLS]
 
 PROJECT_AGENT_RESPONSE_RULES = """
 处理原则：
-1. 默认先尽可能搜索代码、配置、脚本、注释、日志线索和结构化记忆，再给用户结论。
+1. 默认先尽可能搜索代码、配置、脚本、注释和日志线索，再给用户结论。
 2. 只有在你已经搜索过仍然缺少“会直接影响结论”的关键上下文时，才允许向用户追问。
-3. 在没有至少完成一次仓库内检索（Read/Grep/Glob/Bash/结构化记忆检索）之前，不允许直接向用户追问。
+3. 在没有至少完成一次仓库内检索（Read/Grep/Glob/Bash）之前，不允许直接向用户追问。
 4. 如果必须追问，先简短说明你已经检查过什么，再只问最少必要的问题，通常 1 个，而且必须先给出已确认的部分结论。
 5. 如果问题存在多层实现或多个可能口径，优先先给出你已经能确认的部分结论，再说明还缺哪一个关键信息。
 6. 对 ONES / 现场问题，先做证据完整性检查。若缺少问题时间、相关日志/异常堆栈、业务 ID、配置截图/配置片段等关键证据，先要求最小补料，不要直接分析根因。
@@ -793,7 +797,9 @@ PROJECT_AGENT_RESPONSE_RULES = """
 # Orchestrator: separate MCP server with limited tools only.
 # allowedTools does not restrict MCP tools, so we must register a
 # dedicated server that only exposes the tools the orchestrator needs.
-ORCHESTRATOR_TOOLS = [query_db, read_memory, search_memory_entries, dispatch_to_project]
+ORCHESTRATOR_TOOLS = [query_db, dispatch_to_project]
+if settings.enable_memory_tools:
+    ORCHESTRATOR_TOOLS.extend([read_memory, search_memory_entries])
 
 ORCHESTRATOR_MCP_SERVER = create_sdk_mcp_server(
     name="work-agent-tools",
@@ -1111,7 +1117,7 @@ class AgentClient:
             sections.append(
                 "## Runtime Notes\n"
                 "你运行在 Codex CLI 中，仓库内置本地 MCP 工具。"
-                "涉及项目路由、数据库读取或记忆读取时优先使用 MCP 工具。"
+                "涉及项目路由或数据库读取时优先使用 MCP 工具。"
             )
 
         sections.append(f"## User Task\n{prompt}")

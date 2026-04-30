@@ -435,6 +435,15 @@ async def test_fetch_ones_task_artifacts_uses_existing_task_dir(tmp_path, monkey
     assert payload["task"]["uuid"] == "jHLdrkhKn19k2SMU"
     assert payload["paths"]["task_dir"] == str(ones_root)
 
+    rich_url_payload = await pipeline_mod._fetch_ones_task_artifacts({
+        "content": (
+            "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/"
+            "project/UEjcYfJhPshGIUnd/component/OORdUJMu/view/H5TRzRtB/task/jHLdrkhKn19k2SMU"
+        )
+    })
+    assert rich_url_payload is not None
+    assert rich_url_payload["task"]["uuid"] == "jHLdrkhKn19k2SMU"
+
 
 def test_ones_cli_script_path_prefers_repo_skill(tmp_path, monkeypatch):
     import core.pipeline as pipeline_mod
@@ -538,6 +547,46 @@ def test_evaluate_ones_artifact_completeness_accepts_complete_minimum_evidence(t
 
     assert check["status"] == "complete"
     assert check["missing_items"] == []
+
+
+def test_evaluate_ones_artifact_completeness_does_not_treat_environment_as_env_config():
+    import core.pipeline as pipeline_mod
+
+    ones_result = {
+        "task": {
+            "uuid": "NbJXtiyGP7R4vYnF",
+            "summary": "【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑",
+            "description": (
+                "问题发生环境：10.10.21.75:12000\n"
+                "回放时间：2026.4.28 18:01 ~ 2026.4.29 09:14\n"
+                "小车10008上的订单1777271159592已被取消成功，但是还显示绑定小车。"
+            ),
+        },
+        "summary_snapshot": {
+            "status": "ready",
+            "summary_text": "environment order_id vehicle 方格-10008 订单1777271159592取消成功后仍绑定。",
+            "problem_time": "2026.4.28 18:01 ~ 2026.4.29 09:14",
+            "version_normalized": "3.52.0",
+            "business_identifiers": ["environment", "order_id", "vehicle"],
+            "downloaded_files": [
+                {
+                    "label": "allspark-log_20260429102832658.tar",
+                    "path": "D:/tmp/allspark-log_20260429102832658.tar",
+                    "uuid": "B3Sqbpv5",
+                }
+            ],
+        },
+    }
+
+    check = pipeline_mod._evaluate_ones_artifact_completeness(
+        {"content": "继续分析这个 ONES"},
+        ones_result,
+        analysis_dir=None,
+    )
+
+    assert check["status"] == "complete"
+    assert check["needs_config_evidence"] is False
+    assert "相关配置截图/配置片段" not in check["missing_items"]
 
 
 def test_collect_ones_text_fragments_prefers_summary_snapshot():

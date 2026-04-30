@@ -253,6 +253,17 @@ def _reply_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _iter_reply_text_values(content: Any):
+    if isinstance(content, str):
+        yield content
+    elif isinstance(content, dict):
+        for value in content.values():
+            yield from _iter_reply_text_values(value)
+    elif isinstance(content, (list, tuple)):
+        for value in content:
+            yield from _iter_reply_text_values(value)
+
+
 _INTERNAL_TOOL_ERROR_MARKERS = (
     "user cancelled mcp tool call",
     "cancelled mcp tool call",
@@ -264,11 +275,15 @@ _INTERNAL_TOOL_ERROR_MARKERS = (
 
 
 def _contains_internal_tool_error(content: Any) -> bool:
-    text = _reply_content_to_text(content).strip()
-    if not text:
-        return False
-    lowered = re.sub(r"\s+", " ", text.lower())
-    return any(marker in lowered for marker in _INTERNAL_TOOL_ERROR_MARKERS)
+    fragments = [_reply_content_to_text(content)]
+    fragments.extend(_iter_reply_text_values(content))
+    for text in fragments:
+        if not str(text or "").strip():
+            continue
+        lowered = re.sub(r"\s+", " ", str(text).lower())
+        if any(marker in lowered for marker in _INTERNAL_TOOL_ERROR_MARKERS):
+            return True
+    return False
 
 
 def _build_internal_tool_error_reply(
@@ -1363,7 +1378,7 @@ async def _process_message_locked(message_id: int, msg: dict,
         if _should_retry_project_response(parsed):
             logger.info("Pipeline: project reply for message {} looks like premature clarification, retrying once", message_id)
             retry_prompt = (
-                "不要先向用户澄清。你必须先搜索代码、配置、日志、注释和结构化记忆，"
+                "不要先向用户澄清。你必须先搜索代码、配置、日志和注释，"
                 "先给出你已经能确认的结论；只有在检索后仍然缺少会直接影响结论的关键上下文时，"
                 "最后才允许附带一个最小追问。\n\n"
                 f"用户本轮消息：{direct_project['prompt'] if direct_project else prompt}"

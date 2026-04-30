@@ -15,7 +15,7 @@ import requests
 FIELDS = {"status": "field005", "project": "field006", "issue_type": "field007", "sprint": "field011"}
 BUGLIKE = ("bug", "问题", "缺陷", "故障", "异常")
 PROJECT_NAME_FIELDS = ("项目名称", "客户项目", "所属项目名称")
-TASK_RE = re.compile(r"/team/(?P<team>[^/]+)/task/(?P<ref>[^/?#]+)")
+TASK_RE = re.compile(r"/team/(?P<team>[^/?#]+)(?:/[^?#]*)?/task/(?P<ref>[^/?#]+)")
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
 ATTR_RE = re.compile(r'([A-Za-z_:][A-Za-z0-9_:\-]*)\s*=\s*"([^"]*)"')
 

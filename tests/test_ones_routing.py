@@ -16,6 +16,17 @@ def test_extract_ones_task_link_parses_team_and_ref():
     assert url.endswith("/task/1FmsdpJjHT3JPyWL")
 
 
+def test_extract_ones_task_link_normalizes_component_view_url():
+    team, ref, url = extract_ones_task_link(
+        "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/"
+        "project/UEjcYfJhPshGIUnd/component/OORdUJMu/view/H5TRzRtB/task/NbJXtiyGP7R4vYnF"
+    )
+
+    assert team == "UNrQ5Ny5"
+    assert ref == "NbJXtiyGP7R4vYnF"
+    assert url == "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/NbJXtiyGP7R4vYnF"
+
+
 def test_choose_project_route_uses_version_major_as_hint():
     project_name, confidence, score, reasons = choose_project_route(
         user_message="帮我看这个工单",
@@ -29,6 +40,26 @@ def test_choose_project_route_uses_version_major_as_hint():
     assert confidence in {"medium", "high"}
     assert score >= 4
     assert any("3.51.0" in reason for reason in reasons)
+
+
+def test_choose_project_route_uses_title_version_for_riot3_order_issue():
+    project_name, confidence, score, reasons = choose_project_route(
+        user_message=(
+            "#150552 【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑\n"
+            "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/"
+            "project/UEjcYfJhPshGIUnd/component/OORdUJMu/view/H5TRzRtB/task/NbJXtiyGP7R4vYnF"
+        ),
+        task_summary="【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑",
+        task_description="小车10008上的订单1777271159592已被取消成功，但是还显示绑定小车。",
+        ones_project_name="软件部-基础迭代组",
+        business_project_name="3.52.0",
+        key_fields={},
+    )
+
+    assert project_name == "allspark"
+    assert confidence in {"medium", "high"}
+    assert score >= 4
+    assert any("3.52.0" in reason for reason in reasons)
 
 
 def test_choose_project_route_prefers_version_hint_over_generic_charge_keywords():

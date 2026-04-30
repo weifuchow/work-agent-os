@@ -91,6 +91,8 @@ ANTHROPIC_AUTH_TOKEN    — Claude Auth Token（替代 API Key）
 ANTHROPIC_BASE_URL      — API 代理地址（可选）
 OPENAI_API_KEY          — OpenAI API Key（可选，多 provider）
 OPENAI_BASE_URL         — OpenAI API 代理地址（可选）
+ENABLE_MEMORY_TOOLS     — 是否暴露长期记忆工具（默认 false）
+ENABLE_MEMORY_CONSOLIDATION — 是否开启定时记忆提取（默认 false）
 DATABASE_URL            — 数据库连接串
 GITLAB_TOKEN            — GitLab Token（review / MR 评论脚本）
 GITLAB_PROJECT_URL      — GitLab 项目地址

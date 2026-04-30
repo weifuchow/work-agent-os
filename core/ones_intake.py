@@ -500,8 +500,21 @@ def _contains_business_identifier(text: str) -> bool:
 
 
 def _needs_config_evidence(text: str) -> bool:
-    lowered = text.lower()
-    return any(keyword in text or keyword in lowered for keyword in _CONFIG_EVIDENCE_KEYWORDS)
+    return _contains_config_keyword(text)
+
+
+def _contains_config_keyword(text: str) -> bool:
+    raw = str(text or "")
+    lowered = raw.lower()
+    for keyword in _CONFIG_EVIDENCE_KEYWORDS:
+        normalized = keyword.lower()
+        if re.search(r"[a-z0-9_.-]", normalized):
+            pattern = rf"(?<![a-z0-9_.-]){re.escape(normalized)}(?![a-z0-9_.-])"
+            if re.search(pattern, lowered):
+                return True
+        elif keyword in raw:
+            return True
+    return False
 
 
 def _looks_like_log_artifact(label: str, path: str) -> bool:
@@ -552,7 +565,7 @@ def evaluate_ones_artifact_completeness(
     has_config_evidence = any(
         _looks_like_config_artifact(str(item.get("label") or ""), str(item.get("path") or ""))
         for item in file_records
-    ) or any(token in issue_text.lower() for token in ("server.ssl", "jetty", "nginx", "配置", "参数"))
+    ) or _contains_config_keyword(issue_text)
 
     requirements = [
         {"key": "description", "label": "问题描述", "present": has_description},

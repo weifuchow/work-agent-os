@@ -3,7 +3,7 @@
 Jobs:
 - Task monitor: every 2 min — check stuck tasks, push Feishu alerts (NO LLM)
 - Session lifecycle: every 1 hour — auto-freeze/archive stale sessions (NO LLM)
-- Memory consolidation: every 6 hours — archive session knowledge (1 LLM call)
+- Memory consolidation: disabled by default, opt in with ENABLE_MEMORY_CONSOLIDATION=true
 - Daily report: every day at 8:00 — generate and push report (1 LLM call)
 """
 
@@ -91,17 +91,21 @@ def main():
     # NO LLM: session lifecycle check every hour
     scheduler.add_job(lifecycle_job, "interval", hours=1, id="lifecycle_check")
 
-    # 1 LLM call: memory consolidation every 6 hours
-    scheduler.add_job(consolidation_job, "interval", hours=6, id="memory_consolidation")
+    enabled_jobs = ["monitor(2m)", "lifecycle(1h)", "report(8:00)"]
+
+    # 1 LLM call: memory consolidation every 6 hours, disabled by default.
+    if settings.enable_memory_consolidation:
+        scheduler.add_job(consolidation_job, "interval", hours=6, id="memory_consolidation")
+        enabled_jobs.insert(2, "consolidation(6h)")
+    else:
+        logger.info("Memory consolidation disabled")
 
     # 1 LLM call: daily report at 8:00 AM
     scheduler.add_job(daily_report_job, "cron", hour=8, minute=0, id="daily_report")
 
     async def _run():
         scheduler.start()
-        logger.info(
-            "Scheduler started — monitor(2m), lifecycle(1h), consolidation(6h), report(8:00)"
-        )
+        logger.info("Scheduler started — {}", ", ".join(enabled_jobs))
         try:
             while True:
                 await asyncio.sleep(3600)

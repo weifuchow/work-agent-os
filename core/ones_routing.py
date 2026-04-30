@@ -16,7 +16,12 @@ from loguru import logger
 from core.config import settings
 
 
-ONES_TASK_RE = re.compile(r"https?://[^\s]+/project/#/team/(?P<team>[^/\s]+)/task/(?P<ref>[^?\s#]+)")
+ONES_TASK_RE = re.compile(
+    r"(?P<prefix>https?://[^\s]+?/project/#/team/)"
+    r"(?P<team>[^/\s?#]+)"
+    r"(?P<middle>(?:/[^?\s#]+)*)"
+    r"/task/(?P<ref>[^/?\s#]+)"
+)
 PROJECT_TEXT_FIELDS = (
     "项目名称",
     "客户项目",
@@ -27,11 +32,13 @@ VERSION_FIELDS = (
     "FMS/RIOT版本",
     "FMS版本",
     "RIOT版本",
+    "软件版本",
 )
 KEY_FIELDS = (
     "项目名称",
     "项目编号",
     "FMS/RIoT版本",
+    "软件版本",
     "SROS版本",
     "SRC/SRTOS版本",
     "一级问题根因分类",
@@ -173,7 +180,9 @@ def extract_ones_task_link(text: str) -> tuple[str, str, str] | None:
     match = ONES_TASK_RE.search(text or "")
     if not match:
         return None
-    return match.group("team"), match.group("ref"), match.group(0)
+    team = match.group("team")
+    ref = match.group("ref")
+    return team, ref, f"{match.group('prefix')}{team}/task/{ref}"
 
 
 @lru_cache(maxsize=1)
@@ -316,6 +325,27 @@ def _collect_version_project_hints(key_fields: dict[str, Any]) -> list[dict[str,
     return hints
 
 
+def _collect_text_version_project_hints(text_fields: list[tuple[str, str]]) -> list[dict[str, str]]:
+    hints: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for field_name, raw_value in text_fields:
+        rendered = _stringify_field_value(raw_value)
+        major = _major_version(rendered)
+        hinted_project = VERSION_MAJOR_TO_PROJECT.get(major)
+        if not hinted_project:
+            continue
+        key = (field_name, rendered, hinted_project)
+        if key in seen:
+            continue
+        seen.add(key)
+        hints.append({
+            "field": field_name,
+            "value": rendered,
+            "project": hinted_project,
+        })
+    return hints
+
+
 def _major_version(value: str | None) -> int | None:
     if not value:
         return None
@@ -390,6 +420,16 @@ def score_project_routes(
         scores[hint["project"]] += weight
         reasons[hint["project"]].append(
             f"{hint['field']} 命中 {hint['value']} -> {hint['project']}"
+        )
+
+    for hint in _collect_text_version_project_hints([
+        ("用户消息", user_message or ""),
+        ("工单标题", task_summary or ""),
+        ("业务项目", business_project_name or ""),
+    ]):
+        scores[hint["project"]] += 4
+        reasons[hint["project"]].append(
+            f"{hint['field']} 版本线索 {hint['value']} -> {hint['project']}"
         )
 
     return {

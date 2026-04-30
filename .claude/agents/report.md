@@ -5,8 +5,6 @@ tools:
   - Read
   - Write
   - mcp__work-agent-tools__query_db
-  - mcp__work-agent-tools__read_memory
-  - mcp__work-agent-tools__write_memory
   - mcp__work-agent-tools__write_audit_log
 maxTurns: 8
 ---

@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     openai_base_url: str = ""
     default_agent_runtime: str = "claude"
 
+    # Memory
+    enable_memory_tools: bool = False
+    enable_memory_consolidation: bool = False
+
     # Feishu
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
