@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,161 +8,17 @@ from unittest.mock import patch
 import pytest
 
 from core.connectors import message_service as message_service_mod
-from core.connectors.feishu import FeishuClient, _parse_message_content
-from core.pipeline import _build_agent_input, _collect_agent_image_paths
+from core.connectors.feishu import (
+    FeishuClient,
+    _feishu_reply_body,
+    _normalize_mermaid_flowchart_labels,
+    _parse_message_content,
+    _replace_mermaid_blocks_with_images,
+)
 from core.orchestrator.agent_client import AgentClient
+from core.orchestrator import codex_runtime
+from core.ports import ReplyPayload
 from models.db import Message
-
-
-@pytest.mark.asyncio
-async def test_build_agent_input_emits_image_block(tmp_path):
-    image_path = tmp_path / "evidence.png"
-    image_bytes = b"\x89PNG\r\n\x1a\nfake"
-    image_path.write_bytes(image_bytes)
-
-    msg = {
-        "content": "[图片]",
-        "message_type": "image",
-        "platform_message_id": "om_test_001",
-        "attachment_path": str(image_path),
-        "media_info_json": json.dumps({
-            "type": "image",
-            "local_path": str(image_path),
-            "mime_type": "image/png",
-        }, ensure_ascii=False),
-    }
-
-    prompt = _build_agent_input(msg, session=None, runtime="claude", prompt_text="请分析这张图片")
-    assert not isinstance(prompt, str)
-
-    collected = []
-    async for item in prompt:
-        collected.append(item)
-
-    assert len(collected) == 1
-    payload = collected[0]
-    assert payload["message"]["content"][0]["type"] == "text"
-    assert payload["message"]["content"][1]["type"] == "image"
-    assert payload["message"]["content"][1]["mimeType"] == "image/png"
-    assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
-
-
-@pytest.mark.asyncio
-async def test_build_agent_input_includes_ones_description_images(tmp_path):
-    image_path = tmp_path / "desc-1.png"
-    image_bytes = b"\x89PNG\r\n\x1a\nones-image"
-    image_path.write_bytes(image_bytes)
-
-    messages_json = tmp_path / "messages.json"
-    messages_json.write_text(json.dumps({
-        "description_images": [
-            {
-                "label": "description_image_01_demo",
-                "path": str(image_path),
-                "uuid": "demo-uuid",
-                "mime": "image/png",
-            }
-        ],
-        "attachment_downloads": [],
-    }, ensure_ascii=False), encoding="utf-8")
-
-    msg = {
-        "content": "帮我分析这个 ONES",
-        "message_type": "text",
-        "platform_message_id": "om_test_ones_001",
-        "media_info_json": json.dumps({}, ensure_ascii=False),
-    }
-    ones_result = {
-        "paths": {
-            "messages_json": str(messages_json),
-        }
-    }
-
-    prompt = _build_agent_input(
-        msg,
-        session=None,
-        runtime="claude",
-        prompt_text="请先阅读正文，再参考附图补充判断",
-        ones_result=ones_result,
-    )
-    assert not isinstance(prompt, str)
-
-    collected = []
-    async for item in prompt:
-        collected.append(item)
-
-    assert len(collected) == 1
-    payload = collected[0]
-    assert payload["message"]["content"][0]["type"] == "text"
-    assert payload["message"]["content"][1]["type"] == "image"
-    assert payload["message"]["content"][1]["mimeType"] == "image/png"
-    assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
-
-
-@pytest.mark.asyncio
-async def test_build_agent_input_includes_extra_session_image_paths(tmp_path):
-    image_path = tmp_path / "session-image.png"
-    image_bytes = b"\x89PNG\r\n\x1a\nsession-image"
-    image_path.write_bytes(image_bytes)
-
-    msg = {
-        "content": "图片内容是什么",
-        "message_type": "text",
-        "platform_message_id": "om_test_session_img_001",
-        "media_info_json": json.dumps({}, ensure_ascii=False),
-    }
-
-    prompt = _build_agent_input(
-        msg,
-        session=None,
-        runtime="claude",
-        prompt_text="请结合上下文图片回答",
-        extra_image_paths=[str(image_path.resolve())],
-    )
-    assert not isinstance(prompt, str)
-
-    collected = []
-    async for item in prompt:
-        collected.append(item)
-
-    assert len(collected) == 1
-    payload = collected[0]
-    assert payload["message"]["content"][0]["type"] == "text"
-    assert payload["message"]["content"][1]["type"] == "image"
-    assert base64.b64decode(payload["message"]["content"][1]["data"]) == image_bytes
-
-
-def test_collect_agent_image_paths_includes_ones_description_images(tmp_path):
-    image_path = tmp_path / "desc-1.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nones-image")
-    messages_json = tmp_path / "messages.json"
-    messages_json.write_text(json.dumps({
-        "description_images": [
-            {
-                "label": "description_image_01_demo",
-                "path": str(image_path),
-                "uuid": "demo-uuid",
-                "mime": "image/png",
-            }
-        ],
-        "attachment_downloads": [],
-    }, ensure_ascii=False), encoding="utf-8")
-
-    msg = {
-        "content": "帮我分析这个 ONES",
-        "message_type": "text",
-        "platform_message_id": "om_test_ones_paths_001",
-        "media_info_json": json.dumps({}, ensure_ascii=False),
-    }
-    ones_result = {
-        "paths": {
-            "messages_json": str(messages_json),
-        }
-    }
-
-    image_paths = _collect_agent_image_paths(msg, ones_result)
-
-    assert image_paths == [str(image_path.resolve())]
 
 
 def test_build_codex_command_includes_image_flags(tmp_path):
@@ -182,26 +37,42 @@ def test_build_codex_command_includes_image_flags(tmp_path):
     assert str(image_path.resolve()) in cmd
 
 
-def test_build_agent_input_keeps_file_message_as_text_prompt(tmp_path):
-    file_path = tmp_path / "evidence.log"
-    file_path.write_text("2026-04-15 10:23:10 ERROR order-123 failed\n", encoding="utf-8")
+def test_resolve_codex_cli_uses_cmd_wrapper_when_requested(monkeypatch, tmp_path):
+    vendor_exe = tmp_path / "vendor" / "codex.exe"
+    vendor_exe.parent.mkdir()
+    vendor_exe.write_text("", encoding="utf-8")
+    wrapper_cmd = tmp_path / "codex.cmd"
+    wrapper_cmd.write_text("@echo off\n", encoding="utf-8")
+    ps1 = tmp_path / "codex.ps1"
+    ps1.write_text("", encoding="utf-8")
 
-    msg = {
-        "content": "[文件: evidence.log]",
-        "message_type": "file",
-        "platform_message_id": "om_test_file_001",
-        "attachment_path": str(file_path),
-        "media_info_json": json.dumps({
-            "type": "file",
-            "local_path": str(file_path),
-            "mime_type": "text/plain",
-            "file_name": "evidence.log",
-        }, ensure_ascii=False),
-    }
+    def fake_which(name: str) -> str | None:
+        return {
+            "codex": str(ps1),
+            "codex.cmd": str(wrapper_cmd),
+            "codex.exe": None,
+        }.get(name)
 
-    prompt = _build_agent_input(msg, session=None, runtime="claude", prompt_text="请分析这条消息")
-    assert isinstance(prompt, str)
-    assert prompt == "请分析这条消息"
+    monkeypatch.setattr(codex_runtime, "_NPM_CODEX_EXE", vendor_exe)
+    monkeypatch.setattr(codex_runtime.os, "name", "nt")
+    monkeypatch.setattr(codex_runtime.shutil, "which", fake_which)
+
+    assert codex_runtime._resolve_codex_cli_path(prefer_wrapper=False) == str(wrapper_cmd)
+    assert codex_runtime._resolve_codex_cli_path(prefer_wrapper=True) == str(wrapper_cmd)
+
+
+def test_should_retry_codex_start_for_windows_access_denied(monkeypatch, tmp_path):
+    vendor_exe = str(tmp_path / "vendor" / "codex.exe")
+    wrapper_cmd = str(tmp_path / "codex.cmd")
+    exc = OSError("access denied")
+    exc.winerror = 5
+
+    monkeypatch.setattr(codex_runtime.os, "name", "nt")
+
+    assert codex_runtime._should_retry_codex_start(exc, [vendor_exe], [wrapper_cmd])
+    assert not codex_runtime._should_retry_codex_start(exc, [vendor_exe], [vendor_exe])
+    assert codex_runtime._should_retry_codex_start_via_shell(exc, [wrapper_cmd])
+    assert str(wrapper_cmd) in codex_runtime._windows_shell_command([wrapper_cmd, "exec", "-"])
 
 
 class _FakeSession:
@@ -229,6 +100,7 @@ async def test_download_media_if_needed_persists_image_attachment(tmp_path):
         message_type="image",
         content="[图片]",
         raw_payload="",
+        session_id=12,
     )
 
     fake_client = SimpleNamespace(
@@ -236,7 +108,7 @@ async def test_download_media_if_needed_persists_image_attachment(tmp_path):
         get_file_bytes=lambda file_key: None,
     )
 
-    with patch.object(message_service_mod, "settings", SimpleNamespace(attachments_dir=tmp_path)), \
+    with patch.object(message_service_mod, "settings", SimpleNamespace(sessions_dir=tmp_path)), \
          patch("core.connectors.feishu.FeishuClient", return_value=fake_client):
         await message_service_mod._download_media_if_needed(
             fake_session,
@@ -246,6 +118,8 @@ async def test_download_media_if_needed_persists_image_attachment(tmp_path):
 
     attachment_path = Path(msg.attachment_path)
     assert attachment_path.exists()
+    assert attachment_path.parent == tmp_path / "session-12" / "uploads"
+    assert attachment_path.name.startswith("message-7_")
     assert attachment_path.read_bytes() == b"\x89PNGtest-image"
 
     media_info = json.loads(msg.media_info_json)
@@ -254,7 +128,7 @@ async def test_download_media_if_needed_persists_image_attachment(tmp_path):
     assert media_info["proxy_url"] == "/api/messages/7/attachment"
     assert media_info["local_path"] == str(attachment_path.resolve())
 
-    manifest_path = attachment_path.parent.parent / "manifest.json"
+    manifest_path = attachment_path.parent / "manifest_message-7.json"
     assert manifest_path.exists()
     assert fake_session.commit_count == 1
 
@@ -276,6 +150,93 @@ def test_parse_post_message_extracts_text_and_image_keys():
     assert media_info["type"] == "post"
     assert media_info["has_image"] is True
     assert media_info["image_keys"] == ["img_v3_001"]
+
+
+def test_feishu_card_reply_body_strips_agent_metadata():
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="fallback",
+        payload={
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {"title": {"tag": "plain_text", "content": "Triage"}},
+            "body": {"elements": [{"tag": "markdown", "content": "结论"}]},
+            "structured_summary": {"title": "Triage"},
+            "artifact_path": "workspace/output/reply_contract.json",
+        },
+    )
+
+    msg_type, content = _feishu_reply_body(reply)
+    card = json.loads(content)
+
+    assert msg_type == "interactive"
+    assert card["schema"] == "2.0"
+    assert card["body"]["elements"][0]["content"] == "结论"
+    assert "structured_summary" not in card
+    assert "artifact_path" not in card
+
+
+def test_feishu_card_reply_body_uses_text_fallback_for_invalid_card():
+    reply = ReplyPayload(type="feishu_card", content="fallback", payload={"structured_summary": {}})
+
+    assert _feishu_reply_body(reply) == ("text", "fallback")
+
+
+def test_feishu_card_reply_body_uses_safe_text_for_empty_invalid_card():
+    reply = ReplyPayload(type="feishu_card", content="", payload={"structured_summary": {}})
+
+    assert _feishu_reply_body(reply) == ("text", "回复卡片格式异常，已改用文本兜底。")
+
+
+def test_feishu_card_reply_body_never_sends_raw_contract_json_as_text():
+    broken = (
+        '{"action":"reply","reply":{"channel":"feishu","type":"feishu_card",'
+        '"content":"安全摘要：卡片格式异常时应发送兜底摘要。","payload":{"schema":"2.0"'
+    )
+    reply = ReplyPayload(type="text", content=broken)
+
+    assert _feishu_reply_body(reply) == ("text", "安全摘要：卡片格式异常时应发送兜底摘要。")
+
+
+def test_mermaid_markdown_block_is_replaced_with_uploaded_image(monkeypatch, tmp_path):
+    image = tmp_path / "flow.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr("core.connectors.feishu._render_mermaid_png", lambda source: image)
+
+    client = SimpleNamespace(upload_image=lambda path: "img_v3_flow")
+    payload = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "**关键流程图**\n```mermaid\nflowchart TD\nA-->B\n```",
+                }
+            ]
+        },
+    }
+
+    card = _replace_mermaid_blocks_with_images(payload, client=client)
+
+    elements = card["body"]["elements"]
+    assert elements[0]["tag"] == "markdown"
+    assert "关键流程图" in elements[0]["content"]
+    assert "```mermaid" not in json.dumps(elements, ensure_ascii=False)
+    assert elements[1]["tag"] == "img"
+    assert elements[1]["img_key"] == "img_v3_flow"
+
+
+def test_normalize_mermaid_flowchart_labels_quotes_problematic_text():
+    source = "\n".join([
+        "flowchart TD",
+        "  N --> O[actuator存在 -> nextStage(Cancel)]",
+        "  O --> P[FSM currentState=FAILED]",
+    ])
+
+    normalized = _normalize_mermaid_flowchart_labels(source)
+
+    assert 'O["actuator存在 -> nextStage(Cancel)"]' in normalized
+    assert 'P["FSM currentState=FAILED"]' in normalized
 
 
 def test_get_file_bytes_falls_back_to_message_resource():

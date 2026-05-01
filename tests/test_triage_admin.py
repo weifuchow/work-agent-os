@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from apps.api.routers import admin as admin_mod
 
@@ -105,3 +106,43 @@ def test_validate_triage_run_path_blocks_traversal(monkeypatch, tmp_path):
         assert getattr(exc, "status_code", None) == 400
     else:
         raise AssertionError("expected traversal validation to fail")
+
+
+def test_triage_run_to_dict_uses_session_scoped_slug(monkeypatch, tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    run_dir = sessions_dir / "session-132" / ".triage" / "order-freeze"
+    _write_json(run_dir / "00-state.json", {
+        "project": "allspark",
+        "problem_summary": "订单取消后小车未解绑",
+        "phase": "search_delegated",
+        "mode": "structured",
+        "confidence": "medium",
+        "updated_at": "2026-04-30T13:40:00+08:00",
+        "created_at": "2026-04-30T13:30:00+08:00",
+    })
+    monkeypatch.setattr(admin_mod, "settings", SimpleNamespace(sessions_dir=sessions_dir))
+
+    payload = admin_mod._triage_run_to_dict(run_dir, include_detail=False)
+
+    assert payload["slug"] == "sessions/session-132/order-freeze"
+    assert admin_mod._validate_triage_run_path(payload["slug"]) == run_dir.resolve()
+
+
+def test_list_triage_runs_reads_session_scoped_roots(monkeypatch, tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    run_dir = sessions_dir / "session-132" / ".triage" / "order-freeze"
+    _write_json(run_dir / "00-state.json", {
+        "project": "allspark",
+        "problem_summary": "订单取消后小车未解绑",
+        "phase": "search_delegated",
+        "mode": "structured",
+        "confidence": "medium",
+        "updated_at": "2026-04-30T13:40:00+08:00",
+        "created_at": "2026-04-30T13:30:00+08:00",
+    })
+    monkeypatch.setattr(admin_mod, "settings", SimpleNamespace(sessions_dir=sessions_dir))
+    monkeypatch.setattr(admin_mod, "_triage_base_dir", lambda: tmp_path / ".triage")
+
+    bases = admin_mod._triage_base_dirs()
+
+    assert bases == [run_dir.parent]

@@ -88,11 +88,19 @@ def main() -> int:
         process_stage=args.process_stage,
     )
     state["work_dir"] = str(triage_dir)
+    state["workflow_dirs"] = {
+        "intake_dir": str(triage_dir / "01-intake"),
+        "intake_messages_dir": str(triage_dir / "01-intake" / "messages"),
+        "intake_attachments_dir": str(triage_dir / "01-intake" / "attachments"),
+        "process_dir": str(triage_dir / "02-process"),
+        "search_runs_dir": str(triage_dir / "search-runs"),
+    }
     save_state(state_path, state)
 
     result = {
         "triage_dir": str(triage_dir),
         "state_path": str(state_path),
+        "workflow_dirs": state["workflow_dirs"],
         "project": state["project"],
         "phase": state["phase"],
         "mode": state["mode"],

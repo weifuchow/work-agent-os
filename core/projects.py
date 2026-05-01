@@ -53,6 +53,10 @@ class ProjectRuntimeContext:
     target_tag: str = ""
     checkout_ref: str = ""
     recommended_worktree: Path | None = None
+    execution_branch: str = ""
+    execution_commit_sha: str = ""
+    execution_describe: str = ""
+    execution_version: str = ""
     notes: list[str] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
@@ -62,15 +66,21 @@ class ProjectRuntimeContext:
             "project_path": str(self.project_path),
             "execution_path": str(self.execution_path),
             "current_branch": self.current_branch,
+            "current_commit_sha": self.current_commit_sha,
             "current_version": self.current_version,
             "current_describe": self.current_describe,
             "version_source_field": self.version_source_field,
             "version_source_value": self.version_source_value,
             "normalized_version": self.normalized_version,
             "target_branch": self.target_branch,
+            "target_branch_ref": self.target_branch_ref,
             "target_tag": self.target_tag,
             "checkout_ref": self.checkout_ref,
             "recommended_worktree": str(self.recommended_worktree) if self.recommended_worktree else "",
+            "execution_branch": self.execution_branch,
+            "execution_commit_sha": self.execution_commit_sha,
+            "execution_describe": self.execution_describe,
+            "execution_version": self.execution_version,
             "notes": list(self.notes),
         }
 
@@ -201,7 +211,7 @@ def infer_version_from_git(
 def _git_capture(project_path: Path, *args: str) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(project_path), *args],
+            ["git", "-c", "core.longpaths=true", "-C", str(project_path), *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -224,7 +234,7 @@ def _git_capture_lines(project_path: Path, *args: str) -> tuple[str, ...]:
 
 def _git_run(project_path: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "-C", str(project_path), *args],
+        ["git", "-c", "core.longpaths=true", "-C", str(project_path), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -291,12 +301,21 @@ def _extract_business_project_name(ones_result: dict[str, Any] | None) -> str:
 
 
 def _extract_ones_version_hint(ones_result: dict[str, Any] | None) -> tuple[str, str, str]:
+    snapshot = (ones_result or {}).get("summary_snapshot") or {}
+    if isinstance(snapshot, dict):
+        for key in ("version_normalized", "version_hint", "version_text"):
+            raw_value = _stringify_field_value(snapshot.get(key))
+            normalized = _extract_semver_like(raw_value)
+            if normalized:
+                return f"summary_snapshot.{key}", raw_value, normalized
+
     named_fields = (ones_result or {}).get("named_fields") or {}
     if not isinstance(named_fields, dict):
         return "", "", ""
 
     candidate_fields = (
         "软件解决版本号",
+        "软件版本",
         "FMS/RIoT版本",
         "FMS/RIOT版本",
         "FMS版本",
@@ -406,6 +425,7 @@ def _recommended_worktree_path(
     *,
     ones_result: dict[str, Any] | None,
     normalized_version: str,
+    worktree_root: Path | None = None,
 ) -> Path | None:
     if not ones_result:
         return None
@@ -419,7 +439,8 @@ def _recommended_worktree_path(
     version_token = normalized_version or "master"
     safe_version = re.sub(r"[^A-Za-z0-9._-]+", "-", version_token).strip("-") or "master"
     safe_task = re.sub(r"[^A-Za-z0-9._-]+", "-", task_token).strip("-") or "ones"
-    return settings.project_root / ".worktrees" / project_name / f"{safe_task}-{safe_version}"
+    root = Path(worktree_root) if worktree_root else settings.project_root / ".worktrees"
+    return root / project_name / f"{safe_task}-{safe_version}"
 
 
 def _legacy_worktree_paths(
@@ -686,13 +707,19 @@ def _ensure_project_worktree(
         return context.project_path, notes
 
     candidate_paths = [worktree_path]
-    for legacy_path in _legacy_worktree_paths(
-        context.running_project,
-        ones_result=ones_result,
-        normalized_version=context.normalized_version,
-    ):
-        if legacy_path not in candidate_paths:
-            candidate_paths.append(legacy_path)
+    default_worktree_root = (settings.project_root / ".worktrees").resolve()
+    try:
+        allow_legacy_reuse = worktree_path.resolve().is_relative_to(default_worktree_root)
+    except ValueError:
+        allow_legacy_reuse = False
+    if allow_legacy_reuse:
+        for legacy_path in _legacy_worktree_paths(
+            context.running_project,
+            ones_result=ones_result,
+            normalized_version=context.normalized_version,
+        ):
+            if legacy_path not in candidate_paths:
+                candidate_paths.append(legacy_path)
 
     preferred_path = worktree_path
     for candidate_path in candidate_paths:
@@ -737,6 +764,7 @@ def resolve_project_runtime_context(
     project_name: str,
     *,
     ones_result: dict[str, Any] | None = None,
+    worktree_root: Path | None = None,
 ) -> ProjectRuntimeContext | None:
     project = get_project(project_name)
     if not project:
@@ -770,6 +798,7 @@ def resolve_project_runtime_context(
         project_name,
         ones_result=ones_result,
         normalized_version=normalized_version,
+        worktree_root=worktree_root,
     )
 
     return ProjectRuntimeContext(
@@ -789,6 +818,10 @@ def resolve_project_runtime_context(
         target_tag=target_tag,
         checkout_ref=checkout_ref,
         recommended_worktree=recommended_worktree,
+        execution_branch=git_meta.branch,
+        execution_commit_sha=git_meta.commit_sha,
+        execution_describe=git_meta.describe,
+        execution_version=current_version,
         notes=notes,
     )
 
@@ -797,8 +830,13 @@ def prepare_project_runtime_context(
     project_name: str,
     *,
     ones_result: dict[str, Any] | None = None,
+    worktree_root: Path | None = None,
 ) -> ProjectRuntimeContext | None:
-    context = resolve_project_runtime_context(project_name, ones_result=ones_result)
+    context = resolve_project_runtime_context(
+        project_name,
+        ones_result=ones_result,
+        worktree_root=worktree_root,
+    )
     if not context:
         return None
     if not ones_result:
@@ -806,10 +844,20 @@ def prepare_project_runtime_context(
 
     execution_path, worktree_notes = _ensure_project_worktree(context, ones_result=ones_result)
     updated_notes = [*context.notes, *worktree_notes]
+    execution_meta = get_project_git_meta(path=execution_path)
     return replace(
         context,
         execution_path=execution_path,
         recommended_worktree=execution_path if execution_path != context.project_path else context.recommended_worktree,
+        execution_branch=execution_meta.branch,
+        execution_commit_sha=execution_meta.commit_sha,
+        execution_describe=execution_meta.describe,
+        execution_version=(
+            execution_meta.version_hint
+            or execution_meta.describe
+            or execution_meta.branch
+            or execution_meta.commit_sha[:8]
+        ),
         notes=updated_notes,
     )
 
@@ -837,7 +885,7 @@ def merge_skills(
     Scans {project_path}/.claude/agents/*.md and {project_path}/.claude/skills/*/SKILL.md.
     Returns a new dict; does not mutate global_skills.
     """
-    from skills import discover_skills
+    from core.skill_registry import discover_skills
 
     agents_dir = project_path / ".claude" / "agents"
     skills_dir = project_path / ".claude" / "skills"

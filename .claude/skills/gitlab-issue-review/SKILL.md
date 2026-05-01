@@ -7,6 +7,22 @@ description: 分析 GitLab issue review 场景里的 issue、关联 merge reques
 
 对 GitLab issue 类问题执行“先 glab 取上下文、再明确问题调用逻辑、再 MR 归并、再 ONES 补证、最后代码 review”的工作流。先把 issue、notes、关联 MR 和 ONES 链接拉齐，再确认当前问题到底落在哪条调用链和入口模块；只有调用逻辑和补丁分组都基本清楚后，才进入代表分支分析。
 
+## Workspace / Artifact Rule
+
+- 先读取 `workspace/input/message.json`、`session.json`、`media_manifest.json` 和
+  `artifact_roots.json`；如需目录导航，再读取
+  `artifact_roots.session_dir/session_workspace.json`。把当前
+  `data/sessions/session-<id>` 视为唯一上下文容器。
+- 复杂 review 状态、issue/MR 抓取结果、patch fingerprint、最终 review JSON 都必须写入
+  `artifact_roots.review_dir`，不要写到项目根目录 `.review/`。
+- 如果 issue 或 MR 中发现 ONES 链接，调用 `ones` skill，并让 ONES 产物写入
+  `artifact_roots.ones_dir`；用户上传的原始附件和截图从 `artifact_roots.uploads_dir` /
+  `media_manifest.json` 读取，截图导出、解压材料或整理后的附件写入
+  `artifact_roots.attachments_dir`。
+- 最终给 core 投递的结构化摘要、`reply_contract` 或卡片输入，写入当前
+  `workspace/output`。临时草稿、缓存和中间 scratch 文件写入 `artifact_roots.scratch_dir`。
+- 不要在项目根目录创建新的 `.ones/`、`.triage/`、`.review/` 或 `.session/` 目录。
+
 ## Use GitLab Through glab First
 
 - GitLab 数据入口默认走 `glab` 插件或 `glab api`，不要先手写 HTTP 请求。
@@ -68,6 +84,7 @@ description: 分析 GitLab issue review 场景里的 issue、关联 merge reques
 
 ```bash
 python .claude/skills/gitlab-issue-review/scripts/init_review.py \
+  --base-dir "<artifact_roots.review_dir>" \
   --project allspark \
   --issue-url http://git.standard-robots.com/cybertron/allspark/-/issues/1078 \
   --topic "issue-1078 review"
@@ -78,16 +95,16 @@ python .claude/skills/gitlab-issue-review/scripts/init_review.py \
 ```bash
 python .claude/skills/gitlab-issue-review/scripts/collect_issue_context.py \
   --issue-url http://git.standard-robots.com/cybertron/allspark/-/issues/1078 \
-  --state .review/issue-1078-review/00-state.json
+  --state "<artifact_roots.review_dir>/issue-1078-review/00-state.json"
 ```
 
 - 用户明确确认后，发布正式 MR 行评论：
 
 ```bash
 python .claude/skills/gitlab-issue-review/scripts/publish_review_comments.py \
-  --state .review/issue-1078-review/00-state.json \
+  --state "<artifact_roots.review_dir>/issue-1078-review/00-state.json" \
   --mr-iid 201 \
-  --review-json .review/issue-1078-review/final-review.json \
+  --review-json "<artifact_roots.review_dir>/issue-1078-review/final-review.json" \
   --confirmed
 ```
 

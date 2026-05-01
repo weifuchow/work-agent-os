@@ -67,7 +67,11 @@ def test_init_state_script_creates_triage_state(tmp_path):
     assert state["module_hypothesis"] == ["reservation"]
     assert state["missing_items"] == ["订单号缺失"]
     assert state["order_candidates"][0]["order_id"] == "order-123"
+    assert (state_path.parent / "01-intake" / "messages").is_dir()
+    assert (state_path.parent / "01-intake" / "attachments").is_dir()
+    assert (state_path.parent / "02-process").is_dir()
     assert (state_path.parent / "search-runs").is_dir()
+    assert Path(result["workflow_dirs"]["process_dir"]) == state_path.parent / "02-process"
 
 
 def test_search_worker_summarizes_hits_and_updates_state(tmp_path):
@@ -130,6 +134,11 @@ def test_search_worker_summarizes_hits_and_updates_state(tmp_path):
     payload = json.loads(result_json.read_text(encoding="utf-8"))
     assert payload["round_no"] == 1
     assert payload["hits_total"] == 2
+    assert payload["dsl_query_file"]
+    dsl_path = Path(payload["dsl_query_file"])
+    assert dsl_path.exists()
+    assert dsl_path.name == "query.round1.dsl.txt"
+    assert '"order-123"' in dsl_path.read_text(encoding="utf-8")
     assert "order-123" in payload["matched_terms"]
     assert "heartbeat" not in json.dumps(payload["evidence_hits"], ensure_ascii=False)
     assert any(item["path"].endswith("reservation.log") for item in payload["top_files"])
@@ -140,6 +149,7 @@ def test_search_worker_summarizes_hits_and_updates_state(tmp_path):
     assert updated_state["phase"] == "evidence_reviewed"
     assert updated_state["search_artifacts"]["keyword_package_round1"] == str(tmp_path / "keyword_package.round1.json")
     assert updated_state["search_artifacts"]["last_result_json"] == str(result_json)
+    assert updated_state["search_artifacts"]["dsl_round1"] == str(dsl_path)
     assert updated_state["evidence_chain_status"] == "partial"
     assert updated_state["target_log_files"] == ["reservation.log", "notify.log.gz"]
     assert updated_state["time_alignment"]["normalized_window"]["start"] == "2026-04-15 10:20:00"
@@ -148,6 +158,140 @@ def test_search_worker_summarizes_hits_and_updates_state(tmp_path):
     assert updated_state["narrowing_round"]["current"] == 1
     assert len(updated_state["narrowing_round"]["history"]) == 1
     assert updated_state["narrowing_round"]["history"][0]["hits_total"] == 2
+    assert updated_state["narrowing_round"]["history"][0]["dsl_query_file"] == str(dsl_path)
+
+
+def test_search_worker_materializes_dsl_and_filters_placeholder_terms(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-28 10:24:01.000 [main] INFO 88962 AMR-41-1200E-316549 MoveRequest waiting\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.round1.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["88962", "??????", "AMR-41-1200E-316549", "agv??", "MoveRequest"],
+        "anchor_terms": ["88962", "????"],
+        "gate_terms": ["????", "MoveRequest"],
+        "generic_terms": ["ERROR", "??"],
+        "hypotheses": ["?????????????????", "是否车辆提前上报完成？"],
+        "target_files": ["bootstrap"],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    normalized_package = payload["keyword_package"]
+    assert payload["hits_total"] == 1
+    assert payload["dsl_query_file"].endswith("query.round1.dsl.txt")
+    assert "????" not in json.dumps(normalized_package, ensure_ascii=False)
+    assert "agv??" not in json.dumps(normalized_package, ensure_ascii=False)
+    assert normalized_package["include_terms"] == ["88962", "AMR-41-1200E-316549", "MoveRequest"]
+    assert normalized_package["hypotheses"] == ["是否车辆提前上报完成？"]
+
+    dsl_text = Path(payload["dsl_query_file"]).read_text(encoding="utf-8")
+    assert "round: 1" in dsl_text
+    assert "anchors:" in dsl_text
+    assert "gates:" in dsl_text
+    assert '"88962"' in dsl_text
+    assert '"MoveRequest"' in dsl_text
+    assert "????" not in dsl_text
+
+    persisted_package = json.loads(package_path.read_text(encoding="utf-8"))
+    assert persisted_package["_normalized_by_search_worker"] is True
+    assert "????" not in json.dumps(persisted_package, ensure_ascii=False)
+
+
+def test_search_worker_regenerates_mojibake_dsl_query(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-28 10:24:01.000 [main] INFO 1777271159592 方格-10008 CMD_ORDER_CANCEL\n",
+        encoding="utf-8",
+    )
+    package_path = tmp_path / "keyword_package.round2.json"
+    package_path.write_text(json.dumps({
+        "round_no": 2,
+        "focus_question": "为什么订单取消后仍绑定车辆",
+        "anchor_terms": ["1777271159592", "方格-10008"],
+        "anchor_match_mode": "prefer",
+        "require_anchor": False,
+        "gate_terms": ["CMD_ORDER_CANCEL", "绑定"],
+        "target_files": ["bootstrap"],
+        "time_window": {
+            "start": "2026-04-28 10:00:00",
+            "end": "2026-04-28 11:00:00",
+            "source_timezone": "UTC+0",
+            "display_timezone": "UTC+8",
+        },
+        "dsl_query": "round: 2\nquestion: ????? 1777271159592 ??-10008",
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--max-hits", "10",
+    )
+
+    payload = json.loads(Path(result["result_json"]).read_text(encoding="utf-8"))
+    dsl_text = Path(payload["dsl_query_file"]).read_text(encoding="utf-8")
+    persisted_package = json.loads(package_path.read_text(encoding="utf-8"))
+
+    assert payload["hits_total"] == 1
+    assert "????" not in dsl_text
+    assert "??-10008" not in dsl_text
+    assert "round: 2" in dsl_text
+    assert "mode: verification/wide-recall" in dsl_text
+    assert '"1777271159592" OR "方格-10008"' in dsl_text
+    assert "CMD_ORDER_CANCEL" in dsl_text
+    assert persisted_package["dsl_query"] == dsl_text.strip()
+
+
+def test_search_worker_keeps_state_output_under_search_runs(tmp_path):
+    triage_result = _run_script(
+        INIT_STATE,
+        "--project", "allspark",
+        "--topic", "订单输出目录",
+        "--base-dir", str(tmp_path / ".triage"),
+    )
+    state_path = Path(triage_result["state_path"])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["phase"] = "keywords_ready"
+    state["keyword_package_status"] = "ready"
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "bootstrap.log").write_text(
+        "2026-04-28 10:24:01.000 [main] INFO AG0019 MoveRequest waiting\n",
+        encoding="utf-8",
+    )
+    package_path = state_path.parent / "keyword_package.round1.json"
+    package_path.write_text(json.dumps({
+        "include_terms": ["AG0019", "MoveRequest"],
+        "target_files": ["bootstrap"],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    wrong_output_dir = state_path.parent / "search-round1"
+
+    result = _run_script(
+        SEARCH_WORKER,
+        "--state", str(state_path),
+        "--search-root", str(log_root),
+        "--keyword-package-file", str(package_path),
+        "--output-dir", str(wrong_output_dir),
+        "--max-hits", "10",
+    )
+
+    result_json = Path(result["result_json"])
+    assert result_json.parent == state_path.parent / "search-runs" / "search-round1"
+    assert result_json.exists()
+    assert not wrong_output_dir.exists()
 
 
 def test_search_worker_honors_excluded_files(tmp_path):

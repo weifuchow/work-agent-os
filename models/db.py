@@ -22,6 +22,7 @@ class MessageClassifiedType(str, enum.Enum):
 
 class PipelineStatus(str, enum.Enum):
     pending = "pending"
+    processing = "processing"
     classifying = "classifying"
     routing = "routing"
     completed = "completed"

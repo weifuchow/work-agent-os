@@ -21,6 +21,11 @@ MAX_THINKING_NOTIFICATIONS = 3
 
 # Track notification counts per message (in-memory, reset on restart)
 _thinking_counts: dict[int, int] = {}
+INFLIGHT_PIPELINE_STATUSES = (
+    PipelineStatus.processing,
+    PipelineStatus.classifying,
+    PipelineStatus.routing,
+)
 
 
 async def check_running_tasks() -> dict:
@@ -56,11 +61,9 @@ async def check_running_tasks() -> dict:
         thinking_cutoff = datetime.now() - timedelta(minutes=THINKING_NOTIFY_MINUTES)
         stale_cutoff = datetime.now() - timedelta(minutes=STALE_INFLIGHT_FAIL_MINUTES)
 
-        # Messages still in classifying/routing after THINKING_NOTIFY_MINUTES
+        # Messages still in an active pipeline stage after THINKING_NOTIFY_MINUTES.
         stmt = select(Message).where(and_(
-            Message.pipeline_status.in_([
-                PipelineStatus.classifying, PipelineStatus.routing,
-            ]),
+            Message.pipeline_status.in_(INFLIGHT_PIPELINE_STATUSES),
             Message.received_at < thinking_cutoff,
         ))
         slow_msgs = (await db.execute(stmt)).scalars().all()
@@ -177,7 +180,7 @@ async def get_task_status_text(session_id: int) -> str:
             for m in messages:
                 status_icon = {
                     "completed": "✅", "failed": "❌", "skipped": "⏭️",
-                    "classifying": "🔄", "routing": "🔄", "pending": "⏳",
+                    "processing": "🔄", "classifying": "🔄", "routing": "🔄", "pending": "⏳",
                 }.get(m.pipeline_status, "❓")
                 lines.append(f"  {status_icon} #{m.id} {m.pipeline_status} - {m.content[:40]}")
 
@@ -209,9 +212,7 @@ async def _notify_thinking(msg: Message) -> None:
         # Re-check status from DB — message may have completed since query
         async with async_session_factory() as db:
             fresh = await db.get(Message, msg.id)
-            if not fresh or fresh.pipeline_status not in (
-                PipelineStatus.classifying, PipelineStatus.routing,
-            ):
+            if not fresh or fresh.pipeline_status not in INFLIGHT_PIPELINE_STATUSES:
                 return
 
         client = FeishuClient()

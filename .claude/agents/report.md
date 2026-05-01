@@ -5,7 +5,6 @@ tools:
   - Read
   - Write
   - mcp__work-agent-tools__query_db
-  - mcp__work-agent-tools__write_audit_log
 maxTurns: 8
 ---
 
@@ -49,4 +48,4 @@ maxTurns: 8
 2. 逐个读取 session 的摘要和关联消息
 3. 汇总生成日报
 4. `Write` 保存日报文件到 data/reports/daily/{date}.md
-5. `write_audit_log` 记录日报生成事件
+5. 只输出/保存日报内容；审计记录由 core 处理

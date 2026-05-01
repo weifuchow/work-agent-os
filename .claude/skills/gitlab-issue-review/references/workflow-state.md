@@ -10,7 +10,10 @@
 
 ## Lightweight State Contract
 
-复杂问题建议维护一个轻量状态对象。可以保存在会话记忆里，或写到 `.review/<topic>/00-state.json`。
+复杂问题建议维护一个轻量状态对象。可以保存在会话记忆里，或写到
+`artifact_roots.review_dir/<topic>/00-state.json`。`artifact_roots` 来自当前
+`workspace/input/artifact_roots.json`；session 级目录导航在
+`artifact_roots.session_dir/session_workspace.json`，不要写到项目根目录 `.review/`。
 
 建议字段：
 

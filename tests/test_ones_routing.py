@@ -1,10 +1,33 @@
 from types import SimpleNamespace
+import importlib.util
+from pathlib import Path
 import shutil
 import subprocess
+import sys
 
-import core.ones_routing as ones_routing_mod
 import core.projects as projects_mod
-from core.ones_routing import choose_project_route, extract_ones_task_link, score_project_routes
+
+
+def _load_ones_routing_module():
+    path = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "ones" / "scripts" / "routing.py"
+    spec = importlib.util.spec_from_file_location("ones_skill_routing", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ones_routing_mod = _load_ones_routing_module()
+choose_project_route = ones_routing_mod.choose_project_route
+extract_ones_task_link = ones_routing_mod.extract_ones_task_link
+score_project_routes = ones_routing_mod.score_project_routes
+
+ONES_150552_DIRECT_MESSAGE = (
+    "#150552 【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑"
+    "（现象，小车挂着订单，同时在执行其他订单）\n"
+    "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/NbJXtiyGP7R4vYnF"
+)
 
 
 def test_extract_ones_task_link_parses_team_and_ref():
@@ -42,24 +65,26 @@ def test_choose_project_route_uses_version_major_as_hint():
     assert any("3.51.0" in reason for reason in reasons)
 
 
-def test_choose_project_route_uses_title_version_for_riot3_order_issue():
+def test_direct_title_and_link_triggers_ones_and_routes_riot3_order_issue():
+    team, ref, url = extract_ones_task_link(ONES_150552_DIRECT_MESSAGE)
+    assert team == "UNrQ5Ny5"
+    assert ref == "NbJXtiyGP7R4vYnF"
+    assert url == "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/NbJXtiyGP7R4vYnF"
+
     project_name, confidence, score, reasons = choose_project_route(
-        user_message=(
-            "#150552 【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑\n"
-            "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/"
-            "project/UEjcYfJhPshGIUnd/component/OORdUJMu/view/H5TRzRtB/task/NbJXtiyGP7R4vYnF"
-        ),
-        task_summary="【3.52.0】【订单】：订单取消成功，但是订单未与小车解绑",
-        task_description="小车10008上的订单1777271159592已被取消成功，但是还显示绑定小车。",
-        ones_project_name="软件部-基础迭代组",
-        business_project_name="3.52.0",
+        user_message=ONES_150552_DIRECT_MESSAGE,
+        task_summary="",
+        task_description="",
+        ones_project_name="",
+        business_project_name="",
         key_fields={},
     )
 
     assert project_name == "allspark"
-    assert confidence in {"medium", "high"}
+    assert confidence == "medium"
     assert score >= 4
-    assert any("3.52.0" in reason for reason in reasons)
+    assert reasons
+    assert all("3.52.0" in reason and reason.endswith("-> allspark") for reason in reasons)
 
 
 def test_choose_project_route_prefers_version_hint_over_generic_charge_keywords():

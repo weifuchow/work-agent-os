@@ -200,7 +200,11 @@ async def request_rerank_decision(prompt: str) -> dict[str, Any]:
 
     result = await agent_client.run(
         prompt=prompt,
-        skill="analysis",
+        system_prompt=(
+            "你是 RIOT 日志排障 rerank agent。"
+            "你的任务是根据输入 JSON 做二次去噪、时序复盘和证据缺口判断。"
+            "只返回调用方要求的严格 JSON，不输出 Markdown，不调用旧的 analysis/context/intake skill。"
+        ),
         max_turns=3,
     )
     return extract_json_payload(result.get("text", ""))

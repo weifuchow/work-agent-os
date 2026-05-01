@@ -585,7 +585,7 @@ class AgentRunRequest(BaseModel):
 @router.get("/agent/skills")
 async def list_skills():
     """List available agent skills."""
-    from skills import SKILL_DESCRIPTIONS
+    from core.skill_registry import SKILL_DESCRIPTIONS
     return {"skills": [{"name": k, "description": v} for k, v in SKILL_DESCRIPTIONS.items()]}
 
 
@@ -1004,7 +1004,7 @@ async def update_task_context(
 async def list_projects_endpoint():
     """List all registered projects from data/projects.yaml."""
     from core.projects import get_projects, merge_skills
-    from skills import SKILL_REGISTRY
+    from core.skill_registry import SKILL_REGISTRY
 
     projects = get_projects()
     result = []
@@ -1034,17 +1034,18 @@ async def refresh_projects_endpoint():
 
 @router.get("/triage/runs")
 async def list_triage_runs():
-    base = _triage_base_dir()
-    if not base.exists():
+    bases = _triage_base_dirs()
+    if not bases:
         return {"items": [], "total": 0}
 
     runs: list[dict[str, Any]] = []
-    for state_path in base.rglob("00-state.json"):
-        run_dir = state_path.parent
-        try:
-            runs.append(_triage_run_to_dict(run_dir, include_detail=False))
-        except Exception as e:
-            logger.warning("Failed to load triage run {}: {}", run_dir, e)
+    for base in bases:
+        for state_path in base.rglob("00-state.json"):
+            run_dir = state_path.parent
+            try:
+                runs.append(_triage_run_to_dict(run_dir, include_detail=False))
+            except Exception as e:
+                logger.warning("Failed to load triage run {}: {}", run_dir, e)
 
     runs.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
     return {"items": runs, "total": len(runs)}
@@ -1183,9 +1184,37 @@ def _triage_base_dir() -> Path:
     return _repo_root() / ".triage"
 
 
+def _triage_base_dirs() -> list[Path]:
+    bases: list[Path] = []
+    legacy = _triage_base_dir()
+    if legacy.exists():
+        bases.append(legacy)
+
+    sessions_root = Path(settings.sessions_dir)
+    if sessions_root.exists():
+        for child in sorted(sessions_root.glob("session-*")):
+            triage_root = child / ".triage"
+            if triage_root.exists():
+                bases.append(triage_root)
+    return bases
+
+
 def _validate_triage_run_path(run_slug: str) -> Path:
-    base = _triage_base_dir().resolve()
-    target = (base / run_slug).resolve()
+    normalized = str(run_slug or "").replace("\\", "/").strip("/")
+    if normalized.startswith("sessions/"):
+        parts = normalized.split("/", 2)
+        if len(parts) < 3:
+            raise HTTPException(status_code=400, detail="invalid triage path")
+        session_name = parts[1]
+        rel = parts[2]
+        if not session_name.startswith("session-"):
+            raise HTTPException(status_code=400, detail="invalid triage path")
+        base = (Path(settings.sessions_dir) / session_name / ".triage").resolve()
+    else:
+        base = _triage_base_dir().resolve()
+        rel = normalized
+
+    target = (base / rel).resolve()
     if not str(target).startswith(str(base)):
         raise HTTPException(status_code=400, detail="invalid triage path")
     return target
@@ -1219,13 +1248,36 @@ def _triage_slug_from_workspace(workspace: str) -> str:
     if not value:
         return ""
     try:
-        base = _triage_base_dir().resolve()
         target = Path(value).resolve()
+        base = _triage_base_dir().resolve()
         if str(target).startswith(str(base)):
             return str(target.relative_to(base)).replace("\\", "/")
+        sessions_root = Path(settings.sessions_dir).resolve()
+        if str(target).startswith(str(sessions_root)):
+            for parent in [target, *target.parents]:
+                if parent.name == ".triage" and parent.parent.name.startswith("session-"):
+                    rel = target.relative_to(parent)
+                    rel_text = str(rel).replace("\\", "/")
+                    return f"sessions/{parent.parent.name}/{rel_text}"
     except Exception:
         return ""
     return ""
+
+
+def _triage_slug_for_run_dir(run_dir: Path) -> str:
+    target = run_dir.resolve()
+    base = _triage_base_dir().resolve()
+    if str(target).startswith(str(base)):
+        return str(target.relative_to(base)).replace("\\", "/")
+
+    sessions_root = Path(settings.sessions_dir).resolve()
+    if str(target).startswith(str(sessions_root)):
+        for parent in [target, *target.parents]:
+            if parent.name == ".triage" and parent.parent.name.startswith("session-"):
+                rel = target.relative_to(parent)
+                rel_text = str(rel).replace("\\", "/")
+                return f"sessions/{parent.parent.name}/{rel_text}"
+    return target.name
 
 
 def _search_run_to_dict(search_dir: Path, *, include_content: bool) -> dict[str, Any]:
@@ -1309,8 +1361,7 @@ def _triage_run_to_dict(run_dir: Path, *, include_detail: bool) -> dict[str, Any
     if not state:
         raise FileNotFoundError(state_path)
 
-    base = _triage_base_dir().resolve()
-    slug = str(run_dir.resolve().relative_to(base)).replace("\\", "/")
+    slug = _triage_slug_for_run_dir(run_dir)
     search_runs = _collect_search_runs(run_dir, include_content=include_detail)
     latest_search = search_runs[0] if search_runs else None
     routing_decision = _read_decision_artifact(run_dir / "02-process" / "routing_decision.json")

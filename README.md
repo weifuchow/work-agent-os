@@ -1,6 +1,6 @@
 # Personal Work Agent OS
 
-Local-first 个人工作助理系统。接入飞书，由 Pipeline + Agent runtime 自主处理每条消息：分类、路由、分析、回复。当前同时支持 `claude` 与 `codex` 两种运行时，并通过本地 MCP 工具访问数据库、飞书、项目派发和 GitLab review 工作流。
+Local-first 个人工作助理系统。接入飞书，由 Pipeline + Agent runtime 自主处理每条消息：分类、路由、分析、回复。当前同时支持 `claude` 与 `codex` 两种运行时，并通过本地 MCP 工具读取数据库、派发项目 Agent 和执行 GitLab review 工作流；飞书投递与 DB 写入由 core adapter 统一处理。
 
 ## 系统流程
 
@@ -26,23 +26,33 @@ flowchart TB
         subgraph WorkFlow["工作消息处理链"]
             direction TB
             Route["route_to_session<br/>查找/创建会话"]
-            Link["link_task_context<br/>关联任务上下文"]
+            Link["task context link<br/>关联任务上下文"]
             FastProject["explicit project switch<br/>首轮项目名快速直达"]
             KnownProject["known project route<br/>已绑定项目补料直达"]
             Dispatch["dispatch_to_project<br/>项目派发 / resume"]
             Route --> Link --> FastProject --> KnownProject --> Dispatch
         end
 
-        subgraph Skills["按需调用 Skills (子 Agent)"]
+        subgraph BuiltIn["内置处理流程 (system prompt)"]
             direction LR
-            Intake["intake<br/>结构化分类"]
-            Context["context<br/>上下文检索"]
-            Analysis["analysis<br/>深度分析"]
-            Reply["reply<br/>生成回复+策略"]
+            Intake["消息分类"]
+            Context["最小上下文"]
+            Analysis["结构化分析"]
+            Presentation["输出契约"]
         end
 
-        WorkFlow --> Skills
-        Intake --> Context --> Analysis --> Reply
+        subgraph Skills["按需调用业务 Skills"]
+            direction LR
+            Ones["ones"]
+            Triage["riot-log-triage"]
+            Review["gitlab-issue-review"]
+            Card["feishu_card_builder"]
+        end
+
+        WorkFlow --> BuiltIn
+        Intake --> Context --> Analysis --> Presentation
+        Analysis --> Skills
+        Skills --> Presentation
     end
 
     subgraph Output["输出"]
@@ -68,7 +78,7 @@ flowchart TB
     end
 
     Feishu --> Save --> Orchestrator
-    Reply --> Output
+    Presentation --> Output
     UrgentFlow --> Output
     DirectReply --> Output
 
@@ -76,6 +86,7 @@ flowchart TB
     AdminUI --> DB
 
     style Orchestrator fill:#e8f4fd,stroke:#2196F3,stroke-width:2px
+    style BuiltIn fill:#eef7ed,stroke:#4CAF50,stroke-width:1px
     style Skills fill:#fff3e0,stroke:#FF9800,stroke-width:1px
     style WorkFlow fill:#f3e5f5,stroke:#9C27B0,stroke-width:1px
 ```
@@ -90,8 +101,8 @@ flowchart TB
 |------|----------|------|
 | 飞书消息接入 | WebSocket 长连接 + 去重入库 | ✅ |
 | Orchestrator Agent | 单入口，模型自主决策处理路径 | ✅ |
-| 5 个子 Agent | intake/context/analysis/reply/report | ✅ |
-| MCP 工具 | 12 个 tool（DB查询、飞书发送、会话路由等） | ✅ |
+| 内置消息流程 | intake/context/analysis 已进入 system prompt；workflow skills 按业务场景触发 | ✅ |
+| MCP 工具 | 只暴露 DB 只读查询、项目派发和可选只读记忆检索；平台副作用由 core 处理 | ✅ |
 | 管理后台 | React + Vite（消息/会话/审计/记忆/模型测试） | ✅ |
 | 数据库模型 | 8 张表（messages, sessions, task_contexts 等） | ✅ |
 | API 服务 | FastAPI，20+ 端点 | ✅ |
@@ -140,7 +151,7 @@ flowchart TB
 - [x] 解析飞书消息中的 `thread_id` / `root_id` / `parent_id` 字段，入库存储
 - [x] Bot 回复使用 `reply_in_thread=true` 自动创建话题，`thread_id` 回写到 Session
 - [x] Session 路由：有 `thread_id` 精确匹配，无 `thread_id` 新建
-- [x] `reply_to_message` MCP tool，替代 `send_feishu_message` 用于回复
+- [x] 飞书回复由 channel adapter 统一处理，并自动创建/续接话题
 - [x] Session 路由完全由 pipeline 代码层处理（移除 `route_to_session` tool）
 - [x] SDK session resume：有 `agent_session_id` 时传入 `session_id` 恢复上下文
 - [x] 精简 prompt：resume 时只传新消息 + 必要 ID
@@ -163,12 +174,8 @@ flowchart TB
 ## 架构
 
 ```
-.claude/agents/          子 Agent 定义（唯一定义源）
-├── intake.md            消息分类
-├── context.md           上下文检索
-├── analysis.md          深度分析
-├── reply.md             回复生成
-└── report.md            日报生成
+.claude/agents/          子 Agent 定义
+.claude/skills/          业务 workflow skills（唯一业务 skill 根目录）
 
 apps/
 ├── api/                 FastAPI 服务 + 管理 API
@@ -178,22 +185,31 @@ apps/
 └── admin-ui/            React + Vite 管理后台
 
 core/
-├── pipeline.py          Orchestrator Agent 入口
-├── ones_intake.py       ONES intake：工单抓取、图片/正文联合摘要、snapshot 持久化
+├── pipeline.py          public facade：process_message / reprocess_message
+├── app/                 消息处理 use case 编排
+├── agents/              Agent runtime adapter
+├── artifacts/           workspace / media manifest
+├── repositories.py      DB 读写
 ├── projects.py          项目注册与发现
 ├── monitor.py           任务进度监控（纯 DB 查询）
 ├── connectors/
 │   ├── feishu.py        飞书 SDK 封装
 │   └── message_service  消息入库 + 触发 pipeline
 ├── orchestrator/
-│   ├── agent_client.py  Agent SDK 客户端 + 12 个 MCP 工具
+│   ├── agent_client.py  Agent runtime 客户端（Claude / Codex）
+│   ├── codex_runtime.py Codex CLI exec / stream adapter
+│   ├── tools.py         MCP 工具定义与工具作用域
+│   ├── hooks.py         Claude SDK hook
 │   └── claude_client.py 多 provider 模型路由
 ├── sessions/            路由/摘要/生命周期
 ├── reports/             日报生成
 └── memory/              长期记忆归档
 
 .claude/skills/
-├── ones/                ONES intake workflow（含本地 ones_cli.py）
+├── ones/                ONES intake workflow（含 routing/intake/ones_cli 脚本）
+├── riot-log-triage/     RIOT 日志/现场问题分析 workflow
+├── feishu_card_builder/ 结构化摘要输出 + Markdown / Feishu card payload 渲染
+├── daily-report/        每日工作会话汇总与日报生成
 └── gitlab-issue-review/ GitLab review workflow
 
 data/
@@ -202,7 +218,7 @@ data/
 .review/                 GitLab issue/MR review 工作目录（运行时生成）
 .triage/                 日志/现场问题分析工作目录（运行时生成）
 tests/
-├── test_multiturn_session.py  单元测试 — pipeline 逻辑（10项，mock agent，秒级）
+├── baseline/                  公共 pipeline contract 测试
 ├── test_e2e_routing.py        核心能力集成测试 — 真实 API，路由一致性验证（约5分钟）
 ├── test_gitlab_issue_review_scripts.py
 └── test_gitlab_review_publish_script.py
@@ -231,19 +247,24 @@ python .claude/skills/gitlab-issue-review/scripts/publish_review_comments.py --s
 
 ## 当前重点 Workflow Skills
 
-当前项目已经形成两个重点工作流型 skill：
+当前项目已经形成几个重点工作流型 skill：
 
 - `ones` 问题分析
   - 用于 ONES 工单下载、评论/附件补齐、现场证据收集、版本线索识别与问题分析
-  - 当前已经抽为独立 intake：`.claude/skills/ones/` + `core/ones_intake.py`
-  - 本地脚本已随仓库维护：`.claude/skills/ones/scripts/ones_cli.py`
+  - 当前已经整合到 `.claude/skills/ones/`
+  - 本地脚本已随仓库维护：`.claude/skills/ones/scripts/ones_cli.py`、`routing.py`、`intake.py`
   - 标准产物落在 `.ones/<task-number>_<task-uuid>/`，核心包括 `task.json`、`messages.json`、`desc_local.md`、`summary_snapshot.json`
   - 适合日志类、现场类、工单类问题
+- `feishu_card_builder`
+  - 只负责把结构化业务结论整理成结构化摘要，并渲染成 Markdown 或 `feishu_card` payload
+  - 不直接发送飞书、不写 DB；发送仍由 core channel adapter 统一处理
+- `daily-report`
+  - 汇总前一日工作会话、摘要、待办与风险，生成结构化日报
 - `gitlab-issue-review`
   - 用于 GitLab issue / MR 上下文抓取、代码 review、风险判断、正式 MR 评论发布
   - 适合问题修复 review、新功能 review、多分支 cherry-pick 归并
 
-这两个 workflow skill 已经是当前项目的主要工作面，后续会继续扩展更多工作流能力，例如：
+这些 workflow skill 已经是当前项目的主要工作面，后续会继续扩展更多工作流能力，例如：
 
 - 记忆系统深度集成
 - review / triage 结果自动沉淀到结构化记忆
@@ -273,8 +294,8 @@ cd apps/admin-ui && npm install && npm run dev  # 管理后台
 cmd /c scripts\\restart_all_windows.bat
 
 # 5. 运行测试
-pytest tests/test_multiturn_session.py -v
-pytest tests/test_analysis_workspace.py tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py tests/test_ones_desc_local.py tests/test_service_runtime.py -q
+pytest tests/baseline -q
+pytest tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py tests/test_ones_desc_local.py tests/test_service_runtime.py -q
 pytest tests/test_e2e_routing.py -v -s -m e2e
 ```
 
@@ -319,12 +340,12 @@ pytest tests/test_e2e_routing.py -v -s -m e2e
 pytest tests/test_e2e_routing.py -v -s -m e2e
 ```
 
-### Pipeline 逻辑单元测试（`tests/test_multiturn_session.py`）
+### Pipeline 合同测试（`tests/baseline/`）
 
-10 项 mock 测试，无 API 调用，秒级完成：
+只通过 `process_message` / `reprocess_message` 公共 API 进入，使用 fake ports 断言 DB 状态、workspace artifact、agent call 和 channel payload：
 
 ```bash
-pytest tests/test_multiturn_session.py -v
+pytest tests/baseline -q
 ```
 
 ---
@@ -336,7 +357,7 @@ pytest tests/test_multiturn_session.py -v
 ### 飞书体验增强（可选增强）
 
 - [ ] 图片消息回复：Agent 生成的图片/截图通过飞书发送
-- [ ] 飞书卡片消息回复：正文、分析过程、风险提示分块展示
+- [x] 结构化摘要 / 飞书卡片 payload 渲染：由 `.claude/skills/feishu_card_builder/` 生成
 - [ ] 草稿消息飞书卡片确认按钮（一键确认/修改）
 - [ ] 管理后台按话题维度展示会话
 

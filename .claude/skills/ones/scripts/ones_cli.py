@@ -3,8 +3,10 @@ import argparse
 import html
 from html.parser import HTMLParser
 import json
+import mimetypes
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -503,16 +505,352 @@ def fetch_task(args):
             "messages_json": str(task_dir / "messages.json"),
             "report_md": str(task_dir / "report.md"),
             "desc_local_md": str(task_dir / "desc_local.md"),
+            "summary_snapshot_json": str(task_dir / "summary_snapshot.json"),
         },
     }
+    summary_snapshot = build_summary_snapshot_bound_to_download(
+        result,
+        desc_files=desc_files,
+        att_files=att_files,
+        mode=getattr(args, "summary_mode", "deterministic"),
+    )
+    result["summary_snapshot"] = summary_snapshot
     raw_task = dict(task)
     raw_task["desc_local"] = desc_local
     (task_dir / "task.raw.json").write_text(dump(raw_task), encoding="utf-8")
     (task_dir / "messages.json").write_text(dump({"comments": comments, "attachments": attachments, "description_images": desc_files, "attachment_downloads": att_files}), encoding="utf-8")
+    (task_dir / "summary_snapshot.json").write_text(dump(summary_snapshot), encoding="utf-8")
     (task_dir / "task.json").write_text(dump(result), encoding="utf-8")
     (task_dir / "desc_local.md").write_text(desc_local.rstrip() + "\n", encoding="utf-8")
     write_report(task_dir / "report.md", raw_task, project, result["task"]["issue_type_name"], result["task"]["status_name"], comments, desc_files, att_files, desc_local)
     return result
+
+
+def build_summary_snapshot(result, desc_files, att_files):
+    task = result.get("task") or {}
+    named = result.get("named_fields") or {}
+    description = task.get("description_local") or task.get("description") or ""
+    summary = task.get("summary") or ""
+    text = "\n".join([str(summary), str(description)])
+
+    problem_time = extract_problem_time(text)
+    version_fields = []
+    if isinstance(named, dict):
+        for key in ("FMS/RIoT版本", "FMS/RIOT版本", "RIOT版本", "FMS版本", "SROS版本", "SRC/SRTOS版本"):
+            value = str(named.get(key) or "").strip()
+            if value and value not in {"/", "无", "\\", "\\ "} and value not in version_fields:
+                version_fields.append(value)
+    version_texts = extract_version_hints(text)
+    version_normalized = first_non_empty([*version_texts, *version_fields])
+    downloaded_files = [
+        {
+            "label": str(item.get("label") or "").strip() or Path(str(item.get("path") or "")).name,
+            "path": str(item.get("path") or "").strip(),
+            "uuid": str(item.get("uuid") or "").strip(),
+        }
+        for item in [*(desc_files or []), *(att_files or [])]
+        if str(item.get("path") or "").strip()
+    ]
+    observations = []
+    if task.get("status_name"):
+        observations.append(f"ONES 状态: {task.get('status_name')}")
+    if task.get("issue_type_name"):
+        observations.append(f"ONES 类型: {task.get('issue_type_name')}")
+    if problem_time:
+        observations.append(f"问题发生时间: {problem_time}")
+    if version_normalized:
+        observations.append(f"版本线索: {version_normalized}")
+
+    missing_items = []
+    if not problem_time:
+        missing_items.append("问题发生时间")
+    if not downloaded_files:
+        missing_items.append("现场附件或截图")
+
+    return {
+        "status": "ready",
+        "summary_text": compact_summary(summary, description),
+        "problem_time": problem_time,
+        "problem_time_confidence": "high" if problem_time else "low",
+        "version_text": version_texts[0] if version_texts else "",
+        "version_fields": version_fields,
+        "version_from_images": [],
+        "version_normalized": version_normalized,
+        "version_evidence": [item for item, enabled in (
+            ("text", bool(version_texts)),
+            ("fields", bool(version_fields)),
+        ) if enabled],
+        "version_hint": version_normalized,
+        "business_identifiers": extract_business_identifiers(text),
+        "observations": observations,
+        "image_findings": [],
+        "missing_items": missing_items,
+        "downloaded_files": downloaded_files,
+        "source": {
+            "text_first": True,
+            "images_available": bool(summary_image_paths(desc_files, att_files)),
+            "images_consumed": False,
+            "runtime": "ones_cli",
+        },
+    }
+
+
+def build_summary_snapshot_bound_to_download(result, desc_files, att_files, mode="deterministic"):
+    base_snapshot = build_summary_snapshot(result, desc_files=desc_files, att_files=att_files)
+    selected_mode = str(mode or os.getenv("ONES_SUMMARY_MODE") or "deterministic").strip().lower()
+    if selected_mode in {"none", "off", "false"}:
+        base_snapshot["source"]["subagent_status"] = "disabled"
+        return base_snapshot
+    if selected_mode not in {"subagent", "agent", "llm"}:
+        return base_snapshot
+
+    try:
+        agent_summary = asyncio_run_summary_subagent(result, desc_files=desc_files, att_files=att_files)
+    except Exception as exc:
+        base_snapshot["source"]["subagent"] = "ones-summary"
+        base_snapshot["source"]["subagent_status"] = "fallback"
+        base_snapshot["source"]["subagent_error"] = str(exc)[:300]
+        base_snapshot["source"]["images_consumed"] = False
+        return base_snapshot
+
+    if not agent_summary:
+        base_snapshot["source"]["subagent"] = "ones-summary"
+        base_snapshot["source"]["subagent_status"] = "fallback"
+        base_snapshot["source"]["images_consumed"] = False
+        return base_snapshot
+    return merge_subagent_summary_snapshot(base_snapshot, agent_summary)
+
+
+def asyncio_run_summary_subagent(result, desc_files, att_files):
+    import asyncio
+
+    try:
+        return asyncio.run(run_summary_subagent(result, desc_files=desc_files, att_files=att_files))
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" not in str(exc):
+            raise
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(run_summary_subagent(result, desc_files=desc_files, att_files=att_files))
+        finally:
+            loop.close()
+
+
+async def run_summary_subagent(result, desc_files, att_files):
+    ensure_project_root_on_path()
+    from core.config import get_agent_runtime_override, settings
+    from core.orchestrator.agent_client import agent_client
+    from core.orchestrator.agent_runtime import DEFAULT_AGENT_RUNTIME, normalize_agent_runtime
+
+    runtime = normalize_agent_runtime(
+        os.getenv("ONES_SUMMARY_RUNTIME")
+        or get_agent_runtime_override()
+        or settings.default_agent_runtime
+        or DEFAULT_AGENT_RUNTIME
+    )
+    response = await agent_client.run(
+        prompt=build_summary_subagent_prompt(result, desc_files=desc_files, att_files=att_files),
+        system_prompt=(
+            "你是 ONES summary_snapshot 子 agent。只输出一个 JSON 对象。"
+            "不要下载 ONES，不要写文件，不要发送消息，不要分析最终根因。"
+        ),
+        max_turns=8,
+        runtime=runtime,
+        skill="ones-summary",
+        image_paths=summary_image_paths(desc_files, att_files),
+    )
+    parsed = extract_json_object(str(response.get("text") or ""))
+    if not isinstance(parsed, dict):
+        return None
+    parsed.setdefault("_subagent_meta", {})
+    parsed["_subagent_meta"].update({
+        "runtime": runtime,
+        "model": response.get("model"),
+        "session_id": response.get("session_id"),
+    })
+    return parsed
+
+
+def ensure_project_root_on_path():
+    root = Path(__file__).resolve().parents[4]
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+
+
+def build_summary_subagent_prompt(result, desc_files, att_files):
+    task = result.get("task") or {}
+    payload = {
+        "task": {
+            "number": task.get("number"),
+            "uuid": task.get("uuid"),
+            "summary": task.get("summary"),
+            "description_local": task.get("description_local"),
+            "status_name": task.get("status_name"),
+            "issue_type_name": task.get("issue_type_name"),
+            "url": task.get("url"),
+        },
+        "project": result.get("project") or {},
+        "named_fields": result.get("named_fields") or {},
+        "counts": result.get("counts") or {},
+        "paths": result.get("paths") or {},
+        "downloaded_files": [
+            {
+                "label": str(item.get("label") or "").strip(),
+                "path": str(item.get("path") or "").strip(),
+                "uuid": str(item.get("uuid") or "").strip(),
+            }
+            for item in [*(desc_files or []), *(att_files or [])]
+        ],
+    }
+    return (
+        "请基于以下 ONES 下载产物生成 summary_snapshot JSON。\n"
+        "只输出 JSON 对象，不要 Markdown，不要解释。\n\n"
+        "image_findings 必须保留截图证据的可检索实体：同一条截图事实里尽量同时写出"
+        "订单号、车辆名、状态、页面/日志类型、操作结果和时间。"
+        "如果任务正文已给出订单号或车辆名，而截图事实就是该订单/车辆的证据，"
+        "不要把这些标识拆到其他 finding 里。\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def summary_image_paths(desc_files, att_files, limit=6):
+    paths = []
+    for item in [*(desc_files or []), *(att_files or [])]:
+        path = Path(str(item.get("path") or ""))
+        if not path.exists() or not path.is_file():
+            continue
+        mime = mimetypes.guess_type(path.name)[0] or ""
+        if mime.startswith("image/") or path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            paths.append(str(path.resolve()))
+        if len(paths) >= limit:
+            break
+    return paths
+
+
+def extract_json_object(text):
+    value = str(text or "").strip()
+    if not value:
+        return None
+    candidates = [value]
+    if "```" in value:
+        for block in value.split("```"):
+            block = block.strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            if block:
+                candidates.append(block)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def merge_subagent_summary_snapshot(base_snapshot, agent_summary):
+    snapshot = dict(base_snapshot)
+    for key in (
+        "summary_text",
+        "problem_time",
+        "problem_time_confidence",
+        "version_text",
+        "version_normalized",
+        "version_hint",
+    ):
+        value = str(agent_summary.get(key) or "").strip()
+        if value:
+            snapshot[key] = value
+    for key in (
+        "version_fields",
+        "version_from_images",
+        "version_evidence",
+        "business_identifiers",
+        "observations",
+        "image_findings",
+        "missing_items",
+    ):
+        values = [
+            str(item).strip()
+            for item in (agent_summary.get(key) or [])
+            if str(item).strip()
+        ]
+        if values:
+            snapshot[key] = values
+    if not snapshot.get("version_hint"):
+        snapshot["version_hint"] = snapshot.get("version_normalized") or ""
+    meta = agent_summary.get("_subagent_meta") if isinstance(agent_summary.get("_subagent_meta"), dict) else {}
+    snapshot.setdefault("source", {})
+    images_available = bool(snapshot.get("source", {}).get("images_available"))
+    snapshot["source"].update({
+        "text_first": True,
+        "images_available": images_available,
+        "images_consumed": bool(snapshot.get("version_from_images") or snapshot.get("image_findings")),
+        "runtime": str(meta.get("runtime") or "subagent"),
+        "model": meta.get("model"),
+        "agent_session_id": meta.get("session_id"),
+        "subagent": "ones-summary",
+        "subagent_status": "success",
+    })
+    return snapshot
+
+
+def compact_summary(summary, description, limit=900):
+    parts = [str(summary or "").strip(), str(description or "").strip()]
+    text = "\n\n".join(item for item in parts if item)
+    return text[: limit - 3].rstrip() + "..." if len(text) > limit else text
+
+
+def first_non_empty(values):
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in {"/", "无", "\\"}:
+            return text
+    return ""
+
+
+def extract_problem_time(text):
+    value = str(text or "")
+    patterns = [
+        r"(?:问题发生时间|发生问题时间|故障时间|问题时间|发生时间)[:：\s]*([0-9]{4}[-/.年][0-9]{1,2}[-/.月][0-9]{1,2}[^\n，,；;]*)",
+        r"([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)",
+        r"([0-9]{1,2}月[0-9]{1,2}日\s*[0-9]{1,2}[:：][0-9]{2})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.I)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def extract_version_hints(text):
+    value = str(text or "")
+    results = []
+    for pattern in (
+        r"\b(?:RIOT|FMS|SROS|SRC|SRTOS)[^\n，,；;]{0,12}(?:v)?\d+(?:\.\d+){1,4}[^\n，,；;]*",
+        r"\b\d+(?:\.\d+){2,4}\b",
+    ):
+        for match in re.finditer(pattern, value, flags=re.I):
+            item = match.group(0).strip()
+            if item and item not in results:
+                results.append(item)
+    return results[:8]
+
+
+def extract_business_identifiers(text):
+    value = str(text or "")
+    results = []
+    for pattern in (
+        r"(?:订单|订单号|任务号|任务id|task id|order id)[^\n，,；;:：]{0,8}[:：#]?\s*([A-Za-z0-9_-]{4,})",
+        r"(?:车|车辆|机器人|小车|AGV)[^\n，,；;:：]{0,8}[:：#]?\s*([A-Za-z0-9_-]{2,})",
+    ):
+        for match in re.finditer(pattern, value, flags=re.I):
+            item = match.group(0).strip()
+            if item and item not in results:
+                results.append(item)
+    return results[:12]
 
 
 def resolve_project(client, raw):
@@ -664,6 +1002,12 @@ def parser():
     fetch = subs.add_parser("fetch-task")
     fetch.add_argument("reference")
     fetch.add_argument("--output-base-dir", default=".ones")
+    fetch.add_argument(
+        "--summary-mode",
+        choices=("subagent", "deterministic", "none"),
+        default=os.getenv("ONES_SUMMARY_MODE", "deterministic"),
+        help="How to generate summary_snapshot.json after download. Default: deterministic.",
+    )
     fetch.set_defaults(handler=fetch_task)
 
     count = subs.add_parser("current-iteration-issues")

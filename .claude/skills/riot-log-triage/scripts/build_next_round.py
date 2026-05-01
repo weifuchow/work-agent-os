@@ -50,25 +50,109 @@ def dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def build_dsl(*, anchor_terms: list[str], keep_terms: list[str], add_terms: list[str], drop_terms: list[str]) -> str:
-    anchor_parts = [f'"{term}"' for term in anchor_terms]
-    positive_terms = dedupe([*keep_terms, *add_terms])
-    positive_parts = [f'"{term}"' for term in positive_terms if term not in anchor_terms]
-    negative_parts = [f'"{term}"' for term in drop_terms]
+def quote_dsl_term(term: str) -> str:
+    return '"' + term.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
+
+def join_dsl_terms(terms: list[str], *, operator: str = ", ", quote: bool = False) -> str:
+    values = dedupe([str(item or "").strip() for item in terms])
+    if quote:
+        values = [quote_dsl_term(item) for item in values]
+    return operator.join(values)
+
+
+def build_boolean_query(*, anchor_terms: list[str], positive_terms: list[str], drop_terms: list[str]) -> str:
+    anchors = [quote_dsl_term(term) for term in anchor_terms]
+    positives = [quote_dsl_term(term) for term in dedupe(positive_terms) if term not in anchor_terms]
+    drops = [quote_dsl_term(term) for term in drop_terms]
     sections: list[str] = []
-    if anchor_parts:
-        if len(anchor_parts) == 1:
-            sections.append(anchor_parts[0])
-        else:
-            sections.append("(" + " OR ".join(anchor_parts) + ")")
-    if positive_parts:
-        sections.append("(" + " OR ".join(positive_parts) + ")")
-
-    query = " AND ".join(section for section in sections if section)
-    if negative_parts:
-        query = query + (" AND " if query else "") + " AND ".join(f"NOT {part}" for part in negative_parts)
+    if anchors:
+        sections.append(anchors[0] if len(anchors) == 1 else "(" + " OR ".join(anchors) + ")")
+    if positives:
+        sections.append("(" + " OR ".join(positives) + ")")
+    query = " AND ".join(sections)
+    if drops:
+        query = query + (" AND " if query else "") + " AND ".join(f"NOT {item}" for item in drops)
     return query.strip()
+
+
+def build_structured_dsl(
+    *,
+    state: dict[str, Any],
+    package: dict[str, Any],
+    round_no: int,
+) -> str:
+    time_window = dict(package.get("time_window") or {})
+    evidence_anchor = dict(state.get("evidence_anchor") or {})
+    anchor_terms = list(package.get("anchor_terms") or [])
+    business_terms = dedupe([
+        *list(package.get("gate_terms") or []),
+        *list(package.get("core_terms") or []),
+        *list(package.get("exception_terms") or []),
+        *list(package.get("generic_terms") or []),
+    ])
+    business_terms = [term for term in business_terms if term not in anchor_terms]
+    preferred_files = list(package.get("preferred_files") or [])
+    target_files = list(package.get("target_files") or [])
+    excluded_files = list(package.get("excluded_files") or [])
+    focus_question = str(
+        package.get("focus_question")
+        or state.get("current_question")
+        or state.get("primary_question")
+        or ""
+    ).strip()
+    start = str(time_window.get("start") or "").strip()
+    end = str(time_window.get("end") or "").strip()
+    source_timezone = str(time_window.get("source_timezone") or "").strip()
+    display_timezone = str(time_window.get("display_timezone") or "").strip()
+    reported_time = str(evidence_anchor.get("key_time") or state.get("time_alignment", {}).get("problem_time") or "").strip()
+    anchor_mode = str(package.get("anchor_match_mode") or "").strip().lower()
+    require_anchor = bool(package.get("require_anchor"))
+    mode = "verification/wide-recall" if anchor_mode == "prefer" and not require_anchor else "verification"
+    anchor_label = "prefer" if anchor_mode == "prefer" and not require_anchor else "require"
+
+    lines = [
+        f"round: {round_no}",
+        f"mode: {mode}",
+    ]
+    if focus_question:
+        lines.append(f"question: {focus_question}")
+    lines.append("time_window:")
+    if reported_time:
+        lines.append(f"  reported_local_utc8: {reported_time}")
+    label = "search"
+    if source_timezone:
+        label = "log_" + source_timezone.lower().replace("+", "").replace(":", "").replace(" ", "_") + "_search"
+    lines.append(f"  {label}: {start or '?'} ~ {end or '?'}")
+    if display_timezone and display_timezone != source_timezone:
+        lines.append(f"  display_timezone: {display_timezone}")
+    lines.append("anchors:")
+    lines.append(f"  {anchor_label}: {join_dsl_terms(anchor_terms, operator=' OR ', quote=True) or 'none'}")
+    lines.append("gates:")
+    lines.append(f"  {join_dsl_terms(business_terms) or 'none'}")
+    lines.append("files:")
+    if target_files:
+        lines.append(f"  target: {join_dsl_terms(target_files)}")
+    if preferred_files:
+        lines.append(f"  prefer: {join_dsl_terms(preferred_files)}")
+    if excluded_files:
+        lines.append(f"  exclude: {join_dsl_terms(excluded_files)}")
+    if not any([target_files, preferred_files, excluded_files]):
+        lines.append("  scan: all supported log/archive files")
+    boolean_query = build_boolean_query(
+        anchor_terms=anchor_terms,
+        positive_terms=business_terms,
+        drop_terms=excluded_files,
+    )
+    if boolean_query:
+        lines.append("query:")
+        lines.append(f"  {boolean_query}")
+    lines.append("notes:")
+    if source_timezone == "UTC+0" and display_timezone == "UTC+8":
+        lines.append("  allspark logs use UTC+0; display/report times should be converted to UTC+8.")
+    else:
+        lines.append("  keep order, vehicle, and time window closed before final conclusion.")
+    return "\n".join(lines).rstrip()
 
 
 def normalize_term_priorities(raw: Any) -> list[dict[str, Any]]:
@@ -241,13 +325,8 @@ def build_next_package(*, state: dict[str, Any], rerank_results: dict[str, Any])
         "hypotheses": [],
         "require_anchor": True,
         "time_window": previous_window,
-        "dsl_query": build_dsl(
-            anchor_terms=anchor_terms,
-            keep_terms=dedupe([*keep_terms, *core_terms, *exception_terms]),
-            add_terms=add_terms,
-            drop_terms=drop_terms,
-        ),
     }
+    package["dsl_query"] = build_structured_dsl(state=state, package=package, round_no=2)
     return package
 
 
@@ -305,6 +384,8 @@ def build_next_round(*, rerank_results_path: Path, state_path: Path, output_dir:
     rerank_results = load_json(rerank_results_path)
     state = load_state(state_path)
     package = build_next_package(state=state, rerank_results=rerank_results)
+    package["round_no"] = round_no
+    package["dsl_query"] = build_structured_dsl(state=state, package=package, round_no=round_no)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     package_json = output_dir / f"keyword_package.round{round_no}.json"

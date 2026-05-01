@@ -117,7 +117,7 @@ def _ensure_message_media_columns() -> None:
 async def init_db() -> None:
     """Create all tables and ensure data directories exist."""
     for d in [settings.db_dir, settings.memory_dir, settings.reports_dir,
-              settings.audit_dir, settings.sessions_dir, settings.attachments_dir]:
+              settings.audit_dir, settings.sessions_dir]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
     async with engine.begin() as conn:

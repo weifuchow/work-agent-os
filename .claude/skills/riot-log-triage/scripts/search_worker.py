@@ -135,30 +135,58 @@ def load_keyword_package(args: argparse.Namespace) -> dict[str, Any]:
     raise SystemExit("Provide --keyword-package-file or --keyword-package-json.")
 
 
+def clean_terms(raw: Any, *, allow_sentence_question: bool = False) -> list[str]:
+    values = raw if isinstance(raw, list) else []
+    return dedupe_terms([
+        str(item).strip()
+        for item in values
+        if is_usable_term(str(item).strip(), allow_sentence_question=allow_sentence_question)
+    ])
+
+
+def is_usable_term(term: str, *, allow_sentence_question: bool = False) -> bool:
+    if not term:
+        return False
+    compact = re.sub(r"\s+", "", term)
+    if not compact:
+        return False
+    if not re.search(r"[A-Za-z0-9_\-\u4e00-\u9fff]", compact):
+        return False
+
+    placeholder_count = sum(1 for char in compact if char in {"?", "？", "\ufffd"})
+    if placeholder_count == 0:
+        return True
+    if allow_sentence_question and placeholder_count == 1 and compact[-1] in {"?", "？"}:
+        return True
+    if placeholder_count >= 2 or placeholder_count / max(len(compact), 1) > 0.2:
+        return False
+    return False
+
+
 def normalize_package(raw: dict[str, Any]) -> dict[str, Any]:
-    anchor_terms = [str(item).strip() for item in raw.get("anchor_terms", []) if str(item).strip()]
-    gate_terms = [str(item).strip() for item in raw.get("gate_terms", []) if str(item).strip()]
-    log_message_terms = [str(item).strip() for item in raw.get("log_message_terms", []) if str(item).strip()]
-    stage_terms = [str(item).strip() for item in raw.get("stage_terms", []) if str(item).strip()]
+    anchor_terms = clean_terms(raw.get("anchor_terms", []))
+    gate_terms = clean_terms(raw.get("gate_terms", []))
+    log_message_terms = clean_terms(raw.get("log_message_terms", []))
+    stage_terms = clean_terms(raw.get("stage_terms", []))
     gate_terms = dedupe_terms([*gate_terms, *log_message_terms, *stage_terms])
-    class_terms = [str(item).strip() for item in raw.get("class_terms", []) if str(item).strip()]
-    method_terms = [str(item).strip() for item in raw.get("method_terms", []) if str(item).strip()]
-    explicit_core_terms = [str(item).strip() for item in raw.get("core_terms", []) if str(item).strip()]
+    class_terms = clean_terms(raw.get("class_terms", []))
+    method_terms = clean_terms(raw.get("method_terms", []))
+    explicit_core_terms = clean_terms(raw.get("core_terms", []))
     core_terms = dedupe_terms([*explicit_core_terms, *class_terms, *method_terms])
-    exception_terms = [str(item).strip() for item in raw.get("exception_terms", []) if str(item).strip()]
-    generic_terms = [str(item).strip() for item in raw.get("generic_terms", []) if str(item).strip()]
-    include_terms = [str(item).strip() for item in raw.get("include_terms", []) if str(item).strip()]
+    exception_terms = clean_terms(raw.get("exception_terms", []))
+    generic_terms = clean_terms(raw.get("generic_terms", []))
+    include_terms = clean_terms(raw.get("include_terms", []))
     require_all_terms = bool(raw.get("require_all_terms", False))
     categorized_include_terms = [*anchor_terms, *gate_terms, *core_terms, *exception_terms, *generic_terms]
     if not include_terms and categorized_include_terms:
         include_terms = categorized_include_terms
     elif not require_all_terms:
         include_terms = dedupe_terms([*include_terms, *core_terms, *exception_terms])
-    exclude_terms = [str(item).strip() for item in raw.get("exclude_terms", []) if str(item).strip()]
+    exclude_terms = clean_terms(raw.get("exclude_terms", []))
     target_files = [str(item).strip() for item in raw.get("target_files", []) if str(item).strip()]
     preferred_files = [str(item).strip() for item in raw.get("preferred_files", []) if str(item).strip()]
     excluded_files = [str(item).strip() for item in raw.get("excluded_files", []) if str(item).strip()]
-    hypotheses = [str(item).strip() for item in raw.get("hypotheses", []) if str(item).strip()]
+    hypotheses = clean_terms(raw.get("hypotheses", []), allow_sentence_question=True)
     file_priorities = normalize_file_priorities(raw.get("file_priorities", raw.get("file_priority", [])))
     term_priorities = normalize_term_priorities(raw.get("term_priorities", raw.get("term_priority", [])))
     require_anchor = bool(raw.get("require_anchor", False))
@@ -195,6 +223,7 @@ def normalize_package(raw: dict[str, Any]) -> dict[str, Any]:
         ),
         "min_template_merge_hits": min_template_merge_hits,
         "time_window": normalize_time_window(raw.get("time_window") or {}),
+        "dsl_query": str(raw.get("dsl_query") or "").strip(),
     }
     return normalized
 
@@ -236,7 +265,7 @@ def normalize_term_priorities(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, dict):
         for term, meta in raw.items():
             term_text = str(term or "").strip()
-            if not term_text:
+            if not is_usable_term(term_text):
                 continue
             if isinstance(meta, dict):
                 score_raw = meta.get("score", meta.get("weight", 0))
@@ -261,7 +290,7 @@ def normalize_term_priorities(raw: Any) -> list[dict[str, Any]]:
         for item in raw:
             if isinstance(item, dict):
                 term_text = str(item.get("term") or item.get("name") or "").strip()
-                if not term_text:
+                if not is_usable_term(term_text):
                     continue
                 try:
                     score_value = int(item.get("score", item.get("weight", 0)))
@@ -275,7 +304,7 @@ def normalize_term_priorities(raw: Any) -> list[dict[str, Any]]:
                 })
                 continue
             term_text = str(item or "").strip()
-            if term_text:
+            if is_usable_term(term_text):
                 priorities.append({"term": term_text, "score": 0, "category": "", "reason": ""})
     return priorities
 
@@ -319,9 +348,227 @@ def normalize_time_window(raw: dict[str, Any]) -> dict[str, str]:
     return {"start": start, "end": end}
 
 
+def infer_round_from_package_path(path: str) -> int:
+    if not path:
+        return 0
+    match = re.search(r"round(\d+)", Path(path).name, re.IGNORECASE)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return 0
+
+
+def quote_dsl_term(term: str) -> str:
+    return '"' + term.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def dsl_group(terms: list[str], *, operator: str) -> str:
+    parts = [quote_dsl_term(term) for term in terms if term]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + f" {operator} ".join(parts) + ")"
+
+
+def has_placeholder_mojibake(text: str) -> bool:
+    compact = str(text or "")
+    return "\ufffd" in compact or "??" in compact or "？？" in compact
+
+
+def build_boolean_dsl_query(package: dict[str, Any]) -> str:
+    anchor_terms = dedupe_terms(list(package.get("anchor_terms") or []))
+    positive_terms = dedupe_terms([
+        *list(package.get("gate_terms") or []),
+        *list(package.get("core_terms") or []),
+        *list(package.get("exception_terms") or []),
+        *list(package.get("generic_terms") or []),
+        *list(package.get("include_terms") or []),
+    ])
+    positive_terms = [term for term in positive_terms if term not in anchor_terms]
+    exclude_terms = dedupe_terms([
+        *list(package.get("exclude_terms") or []),
+        *list(package.get("excluded_files") or []),
+    ])
+
+    sections: list[str] = []
+    anchor_section = dsl_group(anchor_terms, operator="OR")
+    if anchor_section:
+        sections.append(anchor_section)
+
+    positive_operator = "AND" if package.get("require_all_terms") else "OR"
+    positive_section = dsl_group(positive_terms, operator=positive_operator)
+    if positive_section:
+        sections.append(positive_section)
+
+    query = " AND ".join(sections)
+    negative_parts = [f"NOT {quote_dsl_term(term)}" for term in exclude_terms]
+    if negative_parts:
+        query = query + (" AND " if query else "") + " AND ".join(negative_parts)
+    return query.strip()
+
+
+def join_dsl_terms(terms: list[str], *, operator: str = ", ", quote: bool = False) -> str:
+    values = dedupe_terms([str(item or "").strip() for item in terms])
+    if quote:
+        values = [quote_dsl_term(item) for item in values]
+    return operator.join(values)
+
+
+def format_time_window_for_dsl(time_window: dict[str, Any]) -> list[str]:
+    start = str(time_window.get("start") or "").strip()
+    end = str(time_window.get("end") or "").strip()
+    source_timezone = str(time_window.get("source_timezone") or "").strip()
+    display_timezone = str(time_window.get("display_timezone") or "").strip()
+    lines: list[str] = []
+    if start or end:
+        label = "search"
+        if source_timezone:
+            label = "log_" + source_timezone.lower().replace("+", "").replace(":", "").replace(" ", "_") + "_search"
+        lines.append(f"  {label}: {start or '?'} ~ {end or '?'}")
+    reported = str(time_window.get("reported_local_utc8") or time_window.get("reported") or "").strip()
+    if reported:
+        lines.insert(0, f"  reported_local_utc8: {reported}")
+    if display_timezone and display_timezone != source_timezone:
+        lines.append(f"  display_timezone: {display_timezone}")
+    return lines or ["  search: unknown"]
+
+
+def build_structured_dsl_query(package: dict[str, Any], *, round_no: int | None = None) -> str:
+    anchor_terms = dedupe_terms(list(package.get("anchor_terms") or []))
+    business_terms = dedupe_terms([
+        *list(package.get("gate_terms") or []),
+        *list(package.get("core_terms") or []),
+        *list(package.get("exception_terms") or []),
+        *list(package.get("generic_terms") or []),
+    ])
+    business_terms = [term for term in business_terms if term not in anchor_terms]
+    target_files = dedupe_terms(list(package.get("target_files") or []))
+    preferred_files = dedupe_terms(list(package.get("preferred_files") or []))
+    excluded_files = dedupe_terms(list(package.get("excluded_files") or []))
+    time_window = dict(package.get("time_window") or {})
+    focus_question = str(package.get("focus_question") or package.get("question") or "").strip()
+
+    anchor_mode = str(package.get("anchor_match_mode") or "").strip().lower()
+    require_anchor = bool(package.get("require_anchor"))
+    mode = "verification"
+    if anchor_mode == "prefer" and not require_anchor:
+        mode = "verification/wide-recall"
+    elif anchor_mode == "prefer":
+        mode = "verification/prefer-anchor"
+
+    anchor_label = "prefer" if anchor_mode == "prefer" and not require_anchor else "require"
+    lines = [
+        f"round: {round_no or package.get('round_no') or 1}",
+        f"mode: {mode}",
+    ]
+    if focus_question:
+        lines.append(f"question: {focus_question}")
+    lines.append("time_window:")
+    lines.extend(format_time_window_for_dsl(time_window))
+    lines.append("anchors:")
+    lines.append(f"  {anchor_label}: {join_dsl_terms(anchor_terms, operator=' OR ', quote=True) or 'none'}")
+    lines.append("gates:")
+    lines.append(f"  {join_dsl_terms(business_terms) or 'none'}")
+    lines.append("files:")
+    if target_files:
+        lines.append(f"  target: {join_dsl_terms(target_files)}")
+    if preferred_files:
+        lines.append(f"  prefer: {join_dsl_terms(preferred_files)}")
+    if excluded_files:
+        lines.append(f"  exclude: {join_dsl_terms(excluded_files)}")
+    if not any([target_files, preferred_files, excluded_files]):
+        lines.append("  scan: all supported log/archive files")
+    boolean_query = build_boolean_dsl_query(package)
+    if boolean_query:
+        lines.append("query:")
+        lines.append(f"  {boolean_query}")
+    lines.append("notes:")
+    if str(time_window.get("source_timezone") or "") == "UTC+0" and str(time_window.get("display_timezone") or "") == "UTC+8":
+        lines.append("  allspark logs use UTC+0; display/report times should be converted to UTC+8.")
+    else:
+        lines.append("  keep order, vehicle, and time window closed before final conclusion.")
+    return "\n".join(lines).rstrip()
+
+
+def build_dsl_query(package: dict[str, Any], *, round_no: int | None = None) -> str:
+    explicit = str(package.get("dsl_query") or "").strip()
+    if explicit and not has_placeholder_mojibake(explicit):
+        return explicit
+    return build_structured_dsl_query(package, round_no=round_no)
+
+
+def materialize_dsl_query(
+    *,
+    args: argparse.Namespace,
+    package: dict[str, Any],
+    state_path: Path | None,
+    output_dir: Path,
+    round_no: int,
+) -> tuple[dict[str, Any], Path | None]:
+    effective_round = round_no or infer_round_from_package_path(args.keyword_package_file) or 1
+    dsl_query = build_dsl_query(package, round_no=effective_round)
+    if not dsl_query:
+        return package, None
+
+    if state_path:
+        dsl_path = state_path.parent / f"query.round{effective_round}.dsl.txt"
+    elif args.keyword_package_file:
+        dsl_path = Path(args.keyword_package_file).resolve().parent / f"query.round{effective_round}.dsl.txt"
+    else:
+        dsl_path = output_dir / f"query.round{effective_round}.dsl.txt"
+
+    dsl_path.write_text(dsl_query.rstrip() + "\n", encoding="utf-8")
+    updated = dict(package)
+    updated["dsl_query"] = dsl_query
+    updated["dsl_query_file"] = str(dsl_path)
+    if args.keyword_package_file:
+        persist_normalized_keyword_package(Path(args.keyword_package_file).resolve(), updated, dsl_path)
+    return updated, dsl_path
+
+
+def persist_normalized_keyword_package(package_path: Path, package: dict[str, Any], dsl_path: Path) -> None:
+    try:
+        raw = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    for key in (
+        "anchor_terms",
+        "gate_terms",
+        "log_message_terms",
+        "stage_terms",
+        "core_terms",
+        "class_terms",
+        "method_terms",
+        "exception_terms",
+        "generic_terms",
+        "include_terms",
+        "exclude_terms",
+        "hypotheses",
+    ):
+        raw[key] = list(package.get(key) or [])
+    raw["term_priorities"] = list(package.get("term_priorities") or [])
+    raw["dsl_query"] = str(package.get("dsl_query") or "")
+    raw["dsl_query_file"] = str(dsl_path)
+    raw["_normalized_by_search_worker"] = True
+    package_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def make_output_dir(args: argparse.Namespace, state_path: Path | None, search_root: Path) -> Path:
     if args.output_dir:
         output_dir = Path(args.output_dir).resolve()
+        if state_path:
+            search_runs_dir = (state_path.parent / "search-runs").resolve()
+            try:
+                output_dir.relative_to(search_runs_dir)
+            except ValueError:
+                output_name = output_dir.name or utc_now_label()
+                output_dir = search_runs_dir / output_name
     elif state_path:
         output_dir = state_path.parent / "search-runs" / utc_now_label()
     else:
@@ -2119,6 +2366,9 @@ def update_state_after_search(
         "last_result_json": str(result_json),
         "last_result_md": str(summary_md),
     })
+    dsl_query_file = str(result.get("dsl_query_file") or "").strip()
+    if dsl_query_file and round_no:
+        search_artifacts[f"dsl_round{round_no}"] = dsl_query_file
     state["search_artifacts"] = search_artifacts
     state["order_candidates"] = list(result.get("order_candidates") or [])
     state["target_log_files"] = list(result.get("keyword_package", {}).get("target_files") or [])
@@ -2140,6 +2390,8 @@ def update_state_after_search(
         "hits_total": int(result.get("hits_total") or 0),
         "matched_terms": list(result.get("matched_terms") or []),
         "unmatched_terms": list(result.get("unmatched_terms") or []),
+        "dsl_query": str(result.get("dsl_query") or ""),
+        "dsl_query_file": dsl_query_file,
         "result_json": str(result_json),
         "summary_md": str(summary_md),
     })
@@ -2179,6 +2431,13 @@ def main() -> int:
     round_no = 0
     if state_path:
         round_no = mark_search_started(state_path, search_root=search_root)
+    package, dsl_path = materialize_dsl_query(
+        args=args,
+        package=package,
+        state_path=state_path,
+        output_dir=output_dir,
+        round_no=round_no,
+    )
 
     result = scan_documents(
         root=search_root,
@@ -2199,6 +2458,8 @@ def main() -> int:
     else:
         result["focus_question"] = ""
     result["round_no"] = round_no
+    result["dsl_query"] = str(package.get("dsl_query") or "")
+    result["dsl_query_file"] = str(dsl_path) if dsl_path else ""
 
     result_json = output_dir / "search_results.json"
     result_md = output_dir / "evidence_summary.md"
@@ -2213,6 +2474,7 @@ def main() -> int:
         "result_json": str(result_json),
         "summary_md": str(result_md),
         "round_no": round_no,
+        "dsl_query_file": str(dsl_path) if dsl_path else "",
         "hits_total": result["hits_total"],
         "top_files": result["top_files"],
         "unmatched_terms": result["unmatched_terms"],

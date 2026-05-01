@@ -27,6 +27,7 @@ ones.env
 
 # Data (runtime generated)
 data/db/
+data/app.db
 data/attachments/
 data/work_agent.db
 data/audit/*.log

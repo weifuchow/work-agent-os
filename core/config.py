@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = ""
     default_agent_runtime: str = "claude"
+    codex_exec_timeout_seconds: int = 2400
 
     # Memory
     enable_memory_tools: bool = False

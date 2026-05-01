@@ -74,6 +74,52 @@ async def test_monitor_marks_stale_inflight_message_failed(monkeypatch, tmp_path
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_monitor_notifies_slow_processing_message(monkeypatch, tmp_path):
+    import core.monitor as monitor_mod
+
+    db_file = tmp_path / "monitor.sqlite"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    old_time = datetime.now() - timedelta(minutes=monitor_mod.THINKING_NOTIFY_MINUTES + 1)
+    async with factory() as db:
+        msg = Message(
+            platform="feishu",
+            platform_message_id="om_processing_monitor_001",
+            chat_id="oc_processing",
+            sender_id="ou_processing",
+            sender_name="tester",
+            message_type="text",
+            content="slow task",
+            received_at=old_time,
+            created_at=old_time,
+            pipeline_status=PipelineStatus.processing,
+        )
+        db.add(msg)
+        await db.commit()
+        message_id = msg.id
+
+    monkeypatch.setattr(monitor_mod, "async_session_factory", factory)
+    monitor_mod._thinking_counts.clear()
+    notified: list[int] = []
+
+    async def fake_notify(candidate):
+        notified.append(candidate.id)
+
+    monkeypatch.setattr(monitor_mod, "_notify_thinking", fake_notify)
+
+    counts = await monitor_mod.check_running_tasks()
+
+    assert counts["stuck"] == 0
+    assert counts["notified"] == 1
+    assert notified == [message_id]
+
+    await engine.dispose()
+
+
 def test_feishu_start_ws_reconnects_when_connection_exits(monkeypatch):
     from core.connectors.feishu import FeishuClient
 

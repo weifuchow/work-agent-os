@@ -94,6 +94,17 @@ def _guess_suffix(file_name: str, media_type: str) -> str:
     return ".bin"
 
 
+def _upload_dir_for_message(msg: Message) -> Path:
+    session_id = getattr(msg, "session_id", None)
+    session_name = f"session-{session_id}" if session_id else "no-session"
+    return settings.sessions_dir / session_name / "uploads"
+
+
+def _message_file_scope(msg: Message) -> str:
+    value = getattr(msg, "id", None) or getattr(msg, "platform_message_id", "") or "unknown"
+    return _sanitize_filename(f"message-{value}", fallback="message")
+
+
 async def _download_media_if_needed(session: AsyncSession, msg: Message, event_data: dict) -> None:
     media_info = dict(event_data.get("media_info") or {})
     media_type = str(media_info.get("type") or "").strip()
@@ -140,11 +151,8 @@ async def _download_media_if_needed(session: AsyncSession, msg: Message, event_d
         return
 
     data, downloaded_name = payload
-    day = datetime.now().strftime("%Y%m%d")
-    target_dir = settings.attachments_dir / "feishu" / day / msg.platform_message_id
+    target_dir = _upload_dir_for_message(msg)
     target_dir.mkdir(parents=True, exist_ok=True)
-    original_dir = target_dir / "original"
-    original_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = _sanitize_filename(
         downloaded_name or str(media_info.get("file_name") or ""),
@@ -153,8 +161,9 @@ async def _download_media_if_needed(session: AsyncSession, msg: Message, event_d
     suffix = _guess_suffix(base_name, media_type)
     if not Path(base_name).suffix:
         base_name = f"{base_name}{suffix}"
+    base_name = _sanitize_filename(f"{_message_file_scope(msg)}_{base_name}", fallback=base_name)
 
-    local_path = original_dir / base_name
+    local_path = target_dir / base_name
     local_path.write_bytes(data)
 
     mime_type = mimetypes.guess_type(local_path.name)[0] or (
@@ -169,7 +178,7 @@ async def _download_media_if_needed(session: AsyncSession, msg: Message, event_d
         "proxy_url": f"/api/messages/{msg.id}/attachment",
     })
 
-    manifest_path = target_dir / "manifest.json"
+    manifest_path = target_dir / f"manifest_{_message_file_scope(msg)}.json"
     manifest_path.write_text(
         json.dumps({
             "message_id": msg.id,

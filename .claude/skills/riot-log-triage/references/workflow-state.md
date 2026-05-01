@@ -10,7 +10,20 @@
 
 ## Lightweight State Contract
 
-复杂问题不需要照搬 `fix-issue` 的完整工单状态机，但需要维护一个轻量状态对象。可以放在会话记忆里，或在复杂场景写到 `.triage/<topic>/00-state.json`。
+复杂问题不需要照搬 `fix-issue` 的完整工单状态机，但需要维护一个轻量状态对象。可以放在会话记忆里，或在复杂场景写到
+`artifact_roots.triage_dir/<topic>/00-state.json`。`artifact_roots` 来自当前
+`workspace/input/artifact_roots.json`；session 级目录导航在
+`artifact_roots.session_dir/session_workspace.json`，不要写到项目根目录 `.triage/`。
+
+`artifact_roots.triage_dir/<topic>` 必须保持下面的执行目录契约：
+
+- `01-intake/messages`：用户消息、历史消息、输入快照。
+- `01-intake/attachments`：本问题关联附件 manifest、下载/解压入口和附件索引。
+- `02-process`：路由决策、分析轨迹、最终决策和中间分析产物。
+- `search-runs/<run-id>`：每轮搜索的 `search_results.json` 和 `evidence_summary.md`。
+- 根目录：`00-state.json`、`keyword_package.roundN.json`、`query.roundN.dsl.txt`。
+
+不要创建同级 `search-round1`、`round1-output` 等目录；搜索输出统一进入 `search-runs`。
 
 建议字段；如果问题牵涉时间换算或订单执行链路，优先把时区与证据锚点显式写进状态：
 
@@ -83,6 +96,13 @@
   },
   "user_confirmation": {
     "formal_report": false
+  },
+  "workflow_dirs": {
+    "intake_dir": "",
+    "intake_messages_dir": "",
+    "intake_attachments_dir": "",
+    "process_dir": "",
+    "search_runs_dir": ""
   }
 }
 ```

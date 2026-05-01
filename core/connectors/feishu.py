@@ -2,13 +2,31 @@
 
 import json
 import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import uuid
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import lark_oapi as lark
 from loguru import logger
 
 from core.config import settings
+from core.ports import DeliveryResult, DownloadedFile, ReplyPayload
+
+
+_FEISHU_CARD_ROOT_KEYS = {
+    "schema",
+    "config",
+    "header",
+    "body",
+    "elements",
+    "i18n_header",
+    "i18n_elements",
+    "card_link",
+}
 
 
 class FeishuClient:
@@ -473,3 +491,334 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
         media_info = {"type": message_type}
 
     return content, media_info
+
+
+class FeishuChannelPort:
+    """Deliver already-rendered reply payloads to Feishu."""
+
+    def __init__(self, client: FeishuClient | None = None) -> None:
+        self.client = client or FeishuClient()
+
+    async def deliver_reply(
+        self,
+        *,
+        source_message: dict,
+        reply: ReplyPayload,
+    ) -> DeliveryResult:
+        try:
+            msg_type, content = _feishu_reply_body(reply, client=self.client)
+            result = self.client.reply_message(
+                message_id=str(source_message.get("platform_message_id") or ""),
+                content=content,
+                msg_type=msg_type,
+                reply_in_thread=True,
+            )
+        except Exception as exc:
+            return DeliveryResult(delivered=False, error=str(exc))
+
+        if not result:
+            return DeliveryResult(delivered=False, error="feishu reply returned no result")
+        return DeliveryResult(
+            delivered=True,
+            message_id=str(result.get("message_id") or ""),
+            thread_id=str(result.get("thread_id") or ""),
+            root_id=str(result.get("root_id") or ""),
+            raw=dict(result),
+        )
+
+
+class FeishuFilePort:
+    """Download message media resources through Feishu APIs."""
+
+    def __init__(self, client: FeishuClient | None = None) -> None:
+        self.client = client or FeishuClient()
+
+    async def download_message_media(
+        self,
+        *,
+        source_message: dict,
+        media_info: dict,
+    ) -> DownloadedFile | None:
+        media_type = str(media_info.get("type") or media_info.get("kind") or "").strip()
+        resource_key = (
+            media_info.get("image_key")
+            or media_info.get("file_key")
+            or media_info.get("video_key")
+            or media_info.get("resource_id")
+            or ""
+        )
+        if not resource_key:
+            return None
+
+        message_id = str(source_message.get("platform_message_id") or "")
+        try:
+            if media_type == "image":
+                payload = self.client.get_image_bytes(
+                    str(resource_key),
+                    message_id=message_id,
+                    resource_type="image",
+                )
+            else:
+                payload = self.client.get_file_bytes(
+                    str(resource_key),
+                    message_id=message_id,
+                    resource_type=media_type or "file",
+                )
+        except TypeError:
+            if media_type == "image":
+                payload = self.client.get_image_bytes(str(resource_key))
+            else:
+                payload = self.client.get_file_bytes(str(resource_key))
+
+        if not payload:
+            return None
+        data, file_name = payload
+        return DownloadedFile(
+            data=data,
+            file_name=file_name or str(media_info.get("file_name") or ""),
+            mime_type=str(media_info.get("mime_type") or media_info.get("mime") or ""),
+        )
+
+
+def _feishu_reply_body(reply: ReplyPayload, client: FeishuClient | None = None) -> tuple[str, str]:
+    reply_type = reply.type
+    if reply_type == "feishu_card":
+        payload = _sanitize_feishu_card_payload(reply.payload)
+        if payload and client is not None:
+            payload = _replace_mermaid_blocks_with_images(payload, client=client)
+        if not payload:
+            fallback = _safe_text_fallback(reply.content)
+            return "text", fallback or "回复卡片格式异常，已改用文本兜底。"
+        return "interactive", json.dumps(payload, ensure_ascii=False)
+    if reply_type == "file":
+        return "text", _safe_text_fallback(reply.content or str(reply.file_path or ""))
+    return "text", _safe_text_fallback(reply.content)
+
+
+def _sanitize_feishu_card_payload(payload: Any) -> dict[str, Any]:
+    """Keep reply.payload as a Feishu card only.
+
+    Agent outputs may carry machine-readable summaries next to the card. Feishu
+    rejects unknown root properties, so channel adapters must strip those before
+    delivery.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    candidate = payload
+    for key in ("card", "payload"):
+        nested = candidate.get(key)
+        if isinstance(nested, dict) and _looks_like_feishu_card(nested):
+            candidate = nested
+            break
+
+    if not _looks_like_feishu_card(candidate):
+        return {}
+
+    cleaned = {
+        key: value
+        for key, value in candidate.items()
+        if key in _FEISHU_CARD_ROOT_KEYS
+    }
+    removed = sorted(set(candidate) - set(cleaned))
+    if removed:
+        logger.warning("Stripped non-Feishu card root fields before delivery: {}", removed)
+    return cleaned
+
+
+_MERMAID_BLOCK_RE = re.compile(r"```mermaid\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+
+
+def _replace_mermaid_blocks_with_images(
+    payload: dict[str, Any],
+    *,
+    client: FeishuClient,
+) -> dict[str, Any]:
+    body = payload.get("body")
+    if not isinstance(body, dict):
+        return payload
+    elements = body.get("elements")
+    if not isinstance(elements, list):
+        return payload
+
+    changed = False
+    new_elements: list[dict[str, Any]] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        content = str(element.get("content") or "")
+        if element.get("tag") != "markdown" or "```mermaid" not in content.lower():
+            new_elements.append(element)
+            continue
+
+        changed = True
+        stripped = _MERMAID_BLOCK_RE.sub("", content).strip()
+        if stripped:
+            item = dict(element)
+            item["content"] = stripped
+            new_elements.append(item)
+
+        for index, match in enumerate(_MERMAID_BLOCK_RE.finditer(content), start=1):
+            mermaid_source = match.group(1).strip()
+            image_key = _render_and_upload_mermaid(mermaid_source, client=client)
+            if image_key:
+                new_elements.append({
+                    "tag": "img",
+                    "img_key": image_key,
+                    "alt": {
+                        "tag": "plain_text",
+                        "content": f"流程图 {index}",
+                    },
+                    "mode": "fit_horizontal",
+                })
+            else:
+                new_elements.append({
+                    "tag": "markdown",
+                    "content": "**流程图**\n流程图渲染失败，已拦截原始 Mermaid 代码；请查看 session 产物中的 `.md` 流程图文件。",
+                    "text_align": "left",
+                    "text_size": "normal",
+                })
+
+    if not changed:
+        return payload
+    updated = dict(payload)
+    updated_body = dict(body)
+    updated_body["elements"] = new_elements
+    updated["body"] = updated_body
+    return updated
+
+
+def _render_and_upload_mermaid(mermaid_source: str, *, client: FeishuClient) -> str:
+    if not mermaid_source.strip():
+        return ""
+    image_path = _render_mermaid_png(mermaid_source)
+    if not image_path:
+        return ""
+    try:
+        return str(client.upload_image(str(image_path)) or "")
+    except Exception as exc:
+        logger.warning("Failed to upload rendered Mermaid image {}: {}", image_path, exc)
+        return ""
+
+
+def _render_mermaid_png(mermaid_source: str) -> Path | None:
+    output_dir = settings.project_root / ".tmp" / "mermaid"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = uuid.uuid4().hex
+
+    commands: list[list[str]] = []
+    mmdc = shutil.which("mmdc") or shutil.which("mmdc.cmd")
+    if mmdc:
+        commands.append([mmdc, "-b", "transparent"])
+    npx = shutil.which("npx.cmd") or shutil.which("npx")
+    if npx:
+        commands.append([
+            npx,
+            "--yes",
+            "@mermaid-js/mermaid-cli",
+            "-b",
+            "transparent",
+        ])
+
+    failure_details: list[str] = []
+    for source_index, source in enumerate(_mermaid_render_sources(mermaid_source), start=1):
+        source_path = output_dir / f"{stem}_{source_index}.mmd"
+        output_path = output_dir / f"{stem}_{source_index}.png"
+        source_path.write_text(source.strip() + "\n", encoding="utf-8")
+
+        for base_command in commands:
+            command = [
+                *base_command,
+                "-i",
+                str(source_path),
+                "-o",
+                str(output_path),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=str(settings.project_root),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                    check=False,
+                )
+            except Exception as exc:
+                failure_details.append(str(exc))
+                continue
+            if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                return output_path
+            detail = (result.stderr or result.stdout or "").strip()
+            if detail:
+                failure_details.append(detail[:500])
+    if failure_details:
+        logger.warning("Mermaid render failed: {}", failure_details[-1])
+    return None
+
+
+def _mermaid_render_sources(mermaid_source: str) -> list[str]:
+    source = str(mermaid_source or "").strip()
+    if not source:
+        return []
+    normalized = _normalize_mermaid_flowchart_labels(source)
+    if normalized != source:
+        return [source, normalized]
+    return [source]
+
+
+_MERMAID_NODE_LABEL_RE = re.compile(
+    r"(?<!\[)\b([A-Za-z][A-Za-z0-9_]*)\[([^\[\]\r\n]+)\](?!\])"
+)
+
+
+def _normalize_mermaid_flowchart_labels(mermaid_source: str) -> str:
+    """Quote plain flowchart labels before rendering.
+
+    Mermaid's parser treats characters such as parentheses and arrows inside an
+    unquoted label as syntax. The agent often emits readable labels like
+    ``A[actuator存在 -> nextStage(Cancel)]``; converting them to quoted labels
+    keeps the diagram renderable without asking the model to repair it.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        label = match.group(2).strip()
+        if not label or label[0] in {'"', "'", "`", "("}:
+            return match.group(0)
+        safe_label = label.replace("\\", "/").replace('"', "'")
+        return f'{match.group(1)}["{safe_label}"]'
+
+    return _MERMAID_NODE_LABEL_RE.sub(replace, mermaid_source)
+
+
+def _safe_text_fallback(content: str) -> str:
+    text = str(content or "")
+    if _looks_like_contract_json_text(text):
+        recovered = _extract_json_string_field(text, "content")
+        if recovered:
+            return recovered
+        return "回复卡片格式异常，已拦截原始 JSON。请重试或查看审计日志定位 agent 输出。"
+    return text
+
+
+def _looks_like_contract_json_text(text: str) -> bool:
+    prefix = str(text or "").lstrip()[:2000]
+    return '"action"' in prefix and '"reply"' in prefix and ("feishu_card" in prefix or '"channel"' in prefix)
+
+
+def _extract_json_string_field(text: str, field_name: str) -> str:
+    pattern = re.compile(rf'"{re.escape(field_name)}"\s*:\s*')
+    decoder = json.JSONDecoder()
+    for match in pattern.finditer(text):
+        try:
+            value, _end = decoder.raw_decode(text[match.end():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _looks_like_feishu_card(value: dict[str, Any]) -> bool:
+    return any(key in value for key in ("schema", "body", "elements", "header"))

@@ -218,6 +218,9 @@ def ensure_triage_dir(base_dir: Path, topic: str, slug: str | None = None) -> Pa
     target_slug = slugify_topic(slug or topic)
     triage_dir = base_dir / target_slug
     triage_dir.mkdir(parents=True, exist_ok=True)
+    (triage_dir / "01-intake" / "messages").mkdir(parents=True, exist_ok=True)
+    (triage_dir / "01-intake" / "attachments").mkdir(parents=True, exist_ok=True)
+    (triage_dir / "02-process").mkdir(parents=True, exist_ok=True)
     (triage_dir / "search-runs").mkdir(parents=True, exist_ok=True)
     return triage_dir
 

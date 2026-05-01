@@ -7,6 +7,48 @@ description: 分析 RIOT 1.0 / 2.0 / 3.0 项目的日志问题、现场问题、
 
 对 RIOT 项目的日志类问题执行分阶段排障：先确认日志产物、时间口径和文件路由；再用首轮日志搜索建立订单/车辆/状态候选；然后读代码推导期望下一步和关键门禁；最后回日志验证为什么没有走到下一步。对车辆/订单执行问题，先建立可证伪的“问题时间点快照”；缺订单号时先找 `order_candidates`，不要停在追问，也不要把未闭合证据包装成高置信根因。
 
+## Trigger
+
+Use this skill when:
+- 用户描述 RIOT / FMS / allspark 现场问题、日志问题、异常堆栈、截图或附件分析。
+- 问题涉及订单、车辆任务、取消、派单、乘梯、卡死、状态流转、日志时间窗或多轮补料。
+- 其他 skill 已经产出 ONES intake 摘要，需要继续做日志排障或低置信分析。
+
+Do not use this skill when:
+- 用户只是闲聊，或只询问 work-agent-os 自身实现。
+- 当前问题不是 RIOT/FMS/allspark 相关，且没有日志、车辆、订单、现场排障线索。
+
+When uncertain:
+- 先读取 `workspace/input/message.json`、`media_manifest.json`、`artifact_roots.json`
+  和可用 skill registry；如需目录导航，再读取
+  `artifact_roots.session_dir/session_workspace.json`。
+- 如果无法判断是哪套 RIOT/FMS 项目，只问一个项目确认问题；不要在 core 层要求预路由。
+
+## Artifact Location
+
+- 所有日志排障状态、DSL、关键词包、搜索结果和中间证据都必须写入
+  `workspace/input/artifact_roots.json` 里的 `triage_dir`。
+- `triage_dir/<topic>` 内部必须沿用结构化工作流目录，不要扁平散落，也不要新建
+  `search-round1` 这类同级临时目录：
+  - `01-intake/messages`：当前消息、历史消息、用户输入快照
+  - `01-intake/attachments`：本问题关联附件清单、附件 manifest、解压/整理入口索引
+  - `02-process`：`routing_decision.json`、`analysis_trace.json/.md`、`final_decision.json`
+    以及手工/脚本产生的中间分析产物
+  - `search-runs/<run-id>`：每轮 `search_results.json` 和 `evidence_summary.md`
+  - 根目录：`00-state.json`、`keyword_package.roundN.json`、`query.roundN.dsl.txt`
+- `analysis_trace.json/.md` 必须记录可审计执行轨迹：每轮 intake 判断、状态初始化、
+  DSL/keyword package 构建、搜索执行、关键证据选择、最终决策和缺口。不要记录或伪造
+  隐式 chain-of-thought；只记录 workspace 中可复核的步骤、文件和结论。
+- 如果需要引用 ONES intake 结果，读取 `artifact_roots.ones_dir`；用户上传的原始图片、
+  文件或日志包从 `artifact_roots.uploads_dir` / `media_manifest.json` 读取；解压后的材料
+  或人工整理附件写入 `artifact_roots.attachments_dir`。
+- 如果当前消息的 `media_manifest.json` 为空，但 `history.json` 显示同 session 前面刚收到
+  文件、图片或附件占位消息，必须检查 `artifact_roots.uploads_dir` 并关联最近上传的材料；
+  不要因为本轮是纯文本就判断附件缺失。
+- 不要在项目根目录创建新的 `.triage/`、`.ones/`、`.review/` 或 `.session/` 目录。
+- 下面示例里的 `.triage/order-freeze` 只是占位；真实执行时必须替换为
+  `<artifact_roots.triage_dir>/order-freeze`。
+
 ## Select the Project
 
 先识别项目，再只读取对应 reference：
@@ -61,6 +103,7 @@ description: 分析 RIOT 1.0 / 2.0 / 3.0 项目的日志问题、现场问题、
 
 ```bash
 python .claude/skills/riot-log-triage/scripts/init_state.py \
+  --base-dir "<artifact_roots.triage_dir>" \
   --project allspark \
   --topic "订单卡死排查" \
   --primary-question "为什么 AG0019 在订单 358208 上没有继续下发下一段移动" \
@@ -80,15 +123,20 @@ python .claude/skills/riot-log-triage/scripts/init_state.py \
 
 ```bash
 python .claude/skills/riot-log-triage/scripts/search_worker.py \
-  --state .triage/order-freeze/00-state.json \
+  --state "<artifact_roots.triage_dir>/order-freeze/00-state.json" \
   --search-root D:/logs/order-freeze \
-  --keyword-package-file .triage/order-freeze/keyword_package.json
+  --keyword-package-file "<artifact_roots.triage_dir>/order-freeze/keyword_package.json"
 ```
 
 `search_worker.py` 只输出摘要证据，不返回整份原始 grep 结果。输出在 `search-runs/<timestamp>/`：
 
 - `search_results.json`
 - `evidence_summary.md`
+- `<triage-topic>/query.roundN.dsl.txt`：本轮实际使用的 DSL 检索意图；如果调用方没有先写，
+  `search_worker.py` 会从 keyword package 兜底生成，但执行前仍应先显式构建并检查 DSL。
+
+不要把搜索结果写成 `<triage-topic>/search-round1/`。如果要指定输出目录，必须指定为
+`<triage-topic>/search-runs/<run-id>/`；通常直接省略 `--output-dir`，让脚本自动创建。
 
 - 回放标准案例，准备冻结工单 / 日志附件 / worktree / state：
 
@@ -102,9 +150,9 @@ python .claude/skills/riot-log-triage/scripts/replay_case.py \
 
 ```bash
 python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
-  --state .triage/order-freeze/00-state.json \
+  --state "<artifact_roots.triage_dir>/order-freeze/00-state.json" \
   --code-root D:/standard/riot/allspark \
-  --keyword-package-file .triage/order-freeze/keyword_package.round2.json
+  --keyword-package-file "<artifact_roots.triage_dir>/order-freeze/keyword_package.round2.json"
 ```
 
 ## Run the Workflow
@@ -247,6 +295,12 @@ python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
   - `exclude_terms`：已知噪音、无关模块、误导性公共报错
   - `target_files`：预计命中的日志文件
   - `time_window`：按问题时间推导出的最小搜索窗口
+- 每个搜索轮次都必须同时生成 `query.roundN.dsl.txt`，再执行 `search_worker.py`。DSL 是本轮
+  检索意图的可读版本，必须能看出锚点、业务门禁词、排除词和时间窗口径；不要只落
+  `keyword_package.roundN.json`。
+- `keyword package` 必须是 UTF-8 JSON；不要把中文关键词、假设或门禁词写成 `?` / `??` /
+  `????` 占位符。如果中文不确定，宁可省略该词或改用可验证的英文类名、方法名、订单号、
+  车辆名、状态枚举。
 - 首轮 `keyword package` 的目标是探索，不是证明根因：
   - 有订单号：可以放入 `anchor_terms`，但仍要加入业务门禁词，避免只扫订单/车号。
   - 缺订单号：保留车辆锚点，同时加入从问题描述和轻量代码词提取出的 `gate_terms/core_terms/log_message_terms/stage_terms`；允许业务词 OR 召回，并用 `term_priorities` 排序。
@@ -266,7 +320,8 @@ python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
 ### 8. Delegate heavy search outside the main context
 
 - 多文件日志搜索、批量 grep/zgrep、滚动日志筛选、日志去噪，优先使用 `search_worker.py`。如果宿主系统明确提供项目本地 `log-analysis` skill、独立子 agent 或 Task 机制，也可以下沉给它们。
-- 如果已经进入复杂模式，优先先初始化 `.triage/.../00-state.json`，再让搜索 worker 基于 `keyword package` 执行。
+- 如果已经进入复杂模式，优先先在 `artifact_roots.triage_dir` 初始化
+  `.../00-state.json`，再让搜索 worker 基于 `keyword package` 执行。
 - 只要满足下面任一条件，就默认把搜索下沉到 `search_worker.py` 或宿主系统允许的批量搜索执行器：
   - 目标日志跨 3 个以上文件或跨多个滚动分片
   - 单轮命中结果明显超过主线程可直接消化的量
@@ -392,11 +447,13 @@ python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
 
 ### 15. Return the result
 
-对工作类问题，优先输出 `format=rich` 的结构化 JSON。
+对飞书工作消息，优先把阶段性结论、证据摘要和补料请求整理成结构化摘要，并使用
+`feishu_card_builder` 输出 `reply.type = feishu_card`。不要直接把工作类分析输出成普通
+Markdown，除非用户明确要求纯文本或目标 channel 不支持卡片。
 
-`format=rich` 可以用于中间结论、证据摘要和补料请求；它不等同于正式报告。用户未确认前，不要在 rich 输出里塞入完整 `5 why`、最终根因定稿或正式报告章节。
+结构化摘要可以用于中间结论、证据摘要和补料请求；它不等同于正式报告。用户未确认前，不要在卡片里塞入完整 `5 why`、最终根因定稿或正式报告章节。
 
-默认包含：
+卡片默认包含：
 
 - `summary`：一句话结论 + 置信度
 - `sections`：
@@ -412,6 +469,8 @@ python .claude/skills/riot-log-triage/scripts/code_keyword_analyzer.py \
 - 如果还要解释为什么命中，可额外增加 `匹配说明`，写明时间窗、目标文件或筛选条件
 - 可选 `table`：例如 `检查项 / 结果 / 证据 / 日志原文 / 日志文件 / 匹配关键词`
 - `fallback_text`：和结构化内容一致的纯文本兜底
+- 最终 contract 必须是 `action=reply`，`reply.channel=feishu`，`reply.type=feishu_card`，
+  `reply.payload.schema=2.0`。
 
 如果当前仍被证据阻塞，输出“部分结论 + 最小补料问题”，不要假装已经定位到根因。
 

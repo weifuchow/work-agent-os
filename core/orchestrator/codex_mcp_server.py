@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 os.chdir(PROJECT_ROOT)
 
-from core.orchestrator.agent_client import ORCHESTRATOR_TOOLS, PROJECT_TOOLS  # noqa: E402
+from core.orchestrator.tools import ORCHESTRATOR_TOOLS, PROJECT_TOOLS  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:

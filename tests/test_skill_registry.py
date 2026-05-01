@@ -3,7 +3,7 @@ from pathlib import Path
 from claude_agent_sdk import AgentDefinition
 
 from core.projects import merge_skills
-import skills as skills_mod
+import core.skill_registry as skills_mod
 
 
 def _write_skill(md_file: Path, name: str, description: str, body: str = "# Prompt\n\nUse this skill.") -> None:
