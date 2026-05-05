@@ -1,73 +1,79 @@
-# React + TypeScript + Vite
+# Work Agent OS 管理后台
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+`work-agent-os` 的 React/Vite 管理控制台。
 
-Currently, two official plugins are available:
+## 技术栈
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- React 19
+- TypeScript
+- Vite
+- React Router
+- TanStack Query
+- Tailwind CSS 4
+- lucide-react
+- axios
 
-## React Compiler
+## 页面
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+页面源码位于 `src/pages/`：
 
-## Expanding the ESLint configuration
+- `Dashboard.tsx`：系统概览和统计。
+- `Messages.tsx`：原始飞书消息。
+- `Conversations.tsx`：对话视图。
+- `Sessions.tsx`：工作会话列表。
+- `SessionDetail.tsx`：会话详情、消息和 artifacts。
+- `AuditLogs.tsx`：审计日志。
+- `Memory.tsx`：结构化记忆。
+- `Playground.tsx`：模型测试对话。
+- `Triage.tsx`：triage/review 产物浏览。
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+公共 UI 和 API helper：
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- `src/api/client.ts`
+- `src/components/Layout.tsx`
+- `src/components/ModelSwitcher.tsx`
+- `src/components/AgentRuntimeSwitcher.tsx`
+- `src/components/FeishuMessagePreview.tsx`
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## 本地开发
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+先启动后端：
+
+```bash
+python -m uvicorn apps.api.main:app --port 8000
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+再启动前端：
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd apps/admin-ui
+npm install
+npm run dev
 ```
+
+dev server 的 API 代理配置在 Vite 配置中维护。
+
+## 构建和检查
+
+```bash
+npm run build
+npm run lint
+npm run preview
+```
+
+## 后端 API
+
+前端调用 `/api` 下的接口，主要实现位于 `apps/api/routers/admin.py`。当前主要模块：
+
+- messages
+- conversations
+- sessions / task contexts
+- audit logs
+- agent runs / inflight status
+- model/runtime switching
+- memory entries
+- triage/review artifacts
+- project insights
+- playground chat
+
+页面行为应和后端实际 response shape 对齐，不要沿用 Vite 模板说明。

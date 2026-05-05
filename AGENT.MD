@@ -1,99 +1,112 @@
 # AGENT.MD
 
-项目操作速览，供人和自动化入口快速理解当前仓库的实际运行方式。
+供人和自动化入口快速理解 `work-agent-os` 当前运行方式的操作速览。
 
-## 当前运行方式
+## 先看这些
 
-- 主入口是 `core/pipeline.py`
-- 支持 `claude` 和 `codex` 两种 runtime
-- 会话命中项目后：
-  - 已绑定 `agent_session_id + project` 的会话直接 resume 项目 Agent
-  - 首轮短消息如 `allspark 项目` 可直接进入项目 Agent
-  - 已绑定 `project` 但尚未生成 `agent_session_id` 的补料消息也直接进入项目 Agent
-  - 其他情况走 orchestrator 判断后再分发
+- 主入口：`core/pipeline.py`
+- 主 use case：`core/app/message_processor.py`
+- runtime adapter：`core/orchestrator/agent_client.py`
+- tools 和项目 dispatch：`core/orchestrator/tools.py`
+- 项目/worktree runtime context：`core/projects.py`
+- 管理 API：`apps/api/routers/admin.py`
+- 前端：`apps/admin-ui/`
 
-## 当前关键行为
+Agent 只返回 contract。core 负责发送回复、更新 session、记录 audit 和保存 bot message。
 
-- 内部工具错误文本已做脱敏，不应再把 `user cancelled MCP tool call` 直接发给飞书
-- GitLab issue / MR review 过程默认写入 `.review/`
-- 日志/现场/附件分析过程默认写入 `.triage/`
-- 飞书图片、文件和 post 图片附件已支持下载到本地工作目录
-- Feishu WebSocket 断线后会自动重连
-- GitLab 正式 MR 行评论只有在用户明确确认后才允许发布
+## Workspace 规则
 
-## 当前重点 Workflow Skills
+所有运行产物都应使用这里准备好的 session artifact roots：
 
-- `ones`
-  - 处理 ONES 工单下载、评论/附件补齐、版本线索与问题分析
-  - 先做 intake，再输出 `summary_snapshot.json` 供后续链路直接消费
-- `gitlab-issue-review`
-  - 处理 GitLab issue / MR review、风险判断与正式评论发布
+```text
+data/sessions/session-<id>/workspace/input/artifact_roots.json
+```
 
-后续会继续扩展更多工作流能力，重点包括：
+重要 root：
 
-- 记忆系统集成
-- review / triage 结果沉淀
-- 更多项目专用 workflow skill
+```text
+.ones       -> session-scoped ONES 产物
+.triage     -> session-scoped 日志排障产物
+.review     -> session-scoped review 产物
+worktrees   -> session-scoped 项目 worktrees
+uploads     -> 飞书下载媒体
+attachments -> 解压/整理后的附件
+scratch     -> 临时文件
+```
 
-## 关键目录
+不要在仓库根目录新建运行时 `.ones`、`.triage`、`.review`、`.session` 目录。
 
-- `core/`：pipeline、runtime、项目路由、飞书接入
-- `core/ones_intake.py`：ONES 独立 intake 编排
-- `.claude/skills/ones/`：ONES intake workflow
-- `.claude/skills/ones/scripts/ones_cli.py`：ONES 本地 skill 脚本
-- `.claude/skills/gitlab-issue-review/`：GitLab review workflow
-- `.ones/`：ONES 工单本地缓存与结构化产物
-- `.review/`：review 工作目录（运行时生成）
-- `.triage/`：分析工作目录（运行时生成）
-- `.tmp/run-logs/`：本地服务启动日志
+## Project Worktree
 
-## 启动命令
+需要版本对齐的项目工作，使用 `prepare_project_runtime_context()`，并传入 session worktree root：
+
+```text
+data/sessions/session-<id>/worktrees/<project>/<task-version>
+```
+
+`project_runtime_context.json` 是主项目或活跃项目的兼容文件，保持单项目对象。多项目支持应新增每项目 runtime 文件和多项目索引，不要破坏这个旧结构。
+
+## Subagent Dispatch
+
+需要项目源码上下文时，使用 `dispatch_to_project`。
+
+正确责任划分：
+
+```text
+主 Agent 判断项目
+core 准备 runtime/worktree
+项目 subagent 在 execution_path 中运行
+主 Agent 汇总结果
+```
+
+不要让项目 subagent 自己猜或手动切换 worktree。
+
+## 常用命令
 
 ```bash
+python scripts/init_db.py
 python -m apps.worker.feishu_worker
 python -m uvicorn apps.api.main:app --port 8000
 python -m apps.worker.scheduler
-cd apps/admin-ui && npm run dev
-cmd /c scripts\\restart_all_windows.bat
+
+cd apps/admin-ui
+npm install
+npm run dev
+
+cmd /c scripts\restart_all_windows.bat
 ```
 
-## 常用测试
+## 测试
 
 ```bash
-pytest tests/test_multiturn_session.py -v
-pytest tests/test_analysis_workspace.py tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py tests/test_ones_desc_local.py tests/test_service_runtime.py -q
+pytest tests/baseline -q
+pytest tests/test_ones_routing.py tests/test_direct_project_context.py tests/test_dispatch_to_project.py -q
+pytest tests/test_reply_enrichment.py tests/test_service_runtime.py tests/test_multimodal_attachments.py -q
+pytest tests/test_gitlab_issue_review_scripts.py tests/test_gitlab_review_publish_script.py -q
+pytest tests/test_riot_log_triage_scripts.py tests/test_riot_log_triage_replay_case.py -q
 pytest tests/test_e2e_routing.py -v -s -m e2e
 ```
 
-## GitLab Review 脚本
+前端：
 
 ```bash
-python .claude/skills/gitlab-issue-review/scripts/init_review.py --project allspark --issue-url <issue-url>
-python .claude/skills/gitlab-issue-review/scripts/collect_issue_context.py --issue-url <issue-url> --state .review/<case>/00-state.json
-python .claude/skills/gitlab-issue-review/scripts/publish_review_comments.py --state .review/<case>/00-state.json --mr-iid <iid> --confirmed
+cd apps/admin-ui
+npm run build
+npm run lint
 ```
 
-## 注意事项
+## Runtime Skills
 
-- `agent_runs` 落库仍有一处已知问题：`NOT NULL constraint failed: agent_runs.input_tokens`
-- 如果首轮消息只是切换项目，不必再走慢速项目识别链路
-- ONES 补料消息如果 session 已经绑定项目，也不应再回退到 orchestrator
+- `ones`：ONES 工单 intake 和 summary snapshot。
+- `riot-log-triage`：RIOT/FMS/allspark 现场和日志排障。
+- `gitlab-issue-review`：GitLab issue/MR review workflow。
+- `feishu_card_builder`：结构化摘要和飞书卡片渲染。
+- `daily-report`：日报生成。
 
-## 环境变量
+## Guardrails
 
-```text
-FEISHU_APP_ID           — 飞书应用 ID
-FEISHU_APP_SECRET       — 飞书应用密钥
-FEISHU_BOT_NAME         — 机器人名称（默认 WorkAgent）
-FEISHU_REPORT_CHAT_ID   — 日报推送目标 chat_id（留空则不推送）
-ANTHROPIC_API_KEY       — Claude API Key
-ANTHROPIC_AUTH_TOKEN    — Claude Auth Token（替代 API Key）
-ANTHROPIC_BASE_URL      — API 代理地址（可选）
-OPENAI_API_KEY          — OpenAI API Key（可选，多 provider）
-OPENAI_BASE_URL         — OpenAI API 代理地址（可选）
-ENABLE_MEMORY_TOOLS     — 是否暴露长期记忆工具（默认 false）
-ENABLE_MEMORY_CONSOLIDATION — 是否开启定时记忆提取（默认 false）
-DATABASE_URL            — 数据库连接串
-GITLAB_TOKEN            — GitLab Token（review / MR 评论脚本）
-GITLAB_PROJECT_URL      — GitLab 项目地址
-```
+- 飞书消息只能由 channel adapter 发送。
+- bot reply 只能由 repository/result handler 保存。
+- GitLab MR 评论必须在用户明确确认后发布。
+- 内部 MCP/tool 错误必须脱敏后才能作为用户可见回复。
+- 大日志和中间证据写到 artifact 文件，不要塞进聊天输出。
