@@ -66,3 +66,9 @@ projects:
     description: >
       Claude Code 源码学习4项目。用于 Claude Code 源码阅读、行为分析、调用链追踪与实现细节研究。
       重点关注 CLI/Agent Runtime/工具调用/会话恢复/流式事件与相关调试验证。
+
+  - name: sros-core
+    path: D:/standard/riot/sros-core
+    description: >
+      单机本体系统（sros-core）。别名：单机系统、单机本体系统、单机本体、本体系统、SROS Core、sros。
+      用于单机本体相关代码、配置和问题排查。

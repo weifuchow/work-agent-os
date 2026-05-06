@@ -120,6 +120,43 @@ def test_prepare_direct_project_context_matches_description_alias(monkeypatch, t
     assert payload["running_project"] == "allspark"
 
 
+def test_prepare_direct_project_context_matches_sros_single_system_alias(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path / "workspace")
+    project_path = tmp_path / "repo" / "sros-core"
+    project_path.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "core.app.project_context.get_projects",
+        lambda: [
+            ProjectConfig(
+                name="sros-core",
+                path=project_path,
+                description="单机本体系统（sros-core）。别名：单机系统、单机本体系统、SROS Core、sros。",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "core.app.project_context.resolve_project_runtime_context",
+        lambda project_name, worktree_root=None: SimpleNamespace(
+            to_payload=lambda: {
+                "running_project": project_name,
+                "project_path": str(project_path),
+                "execution_path": str(project_path),
+            }
+        ),
+    )
+    ctx = MessageContext(
+        message={"id": 1, "content": "单机系统"},
+        session={"id": 1},
+        history=[],
+    )
+
+    payload = prepare_direct_project_context(ctx, workspace)
+
+    assert payload is not None
+    assert payload["running_project"] == "sros-core"
+
+
 def test_prepare_direct_project_context_uses_session_topic(monkeypatch, tmp_path):
     workspace = _workspace(tmp_path / "workspace")
     project_path = tmp_path / "repo" / "allspark"

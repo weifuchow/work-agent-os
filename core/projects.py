@@ -86,6 +86,15 @@ class ProjectRuntimeContext:
 
 
 _cache: list[ProjectConfig] | None = None
+_cache_signature: tuple[int, int] | None = None
+
+
+def _projects_file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def load_projects() -> list[ProjectConfig]:
@@ -127,9 +136,11 @@ def load_projects() -> list[ProjectConfig]:
 
 def get_projects() -> list[ProjectConfig]:
     """Get cached project list (lazy load on first call)."""
-    global _cache
-    if _cache is None:
+    global _cache, _cache_signature
+    signature = _projects_file_signature(settings.projects_file)
+    if _cache is None or signature != _cache_signature:
         _cache = load_projects()
+        _cache_signature = signature
     return _cache
 
 
@@ -143,8 +154,9 @@ def get_project(name: str) -> ProjectConfig | None:
 
 def refresh_projects() -> list[ProjectConfig]:
     """Clear cache and reload from disk."""
-    global _cache
+    global _cache, _cache_signature
     _cache = None
+    _cache_signature = None
     return get_projects()
 
 
