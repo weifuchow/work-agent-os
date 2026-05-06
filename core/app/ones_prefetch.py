@@ -82,13 +82,11 @@ async def prepare_ones_intake(
     if not snapshot:
         snapshot = _load_snapshot_from_result(ones_result) or {}
 
-    runtime_context = _prepare_project_runtime_context(
+    runtime_context = _prepare_project_workspace_context(
         ctx=ctx,
         workspace=workspace,
         ones_result=ones_result,
     )
-    if runtime_context:
-        _persist_project_runtime_context(workspace, runtime_context)
 
     return _result_from_snapshot(reference, snapshot, fetched=True)
 
@@ -219,7 +217,7 @@ def _load_ones_routing_module():
     return module
 
 
-def _prepare_project_runtime_context(
+def _prepare_project_workspace_context(
     *,
     ctx: MessageContext,
     workspace: PreparedWorkspace,
@@ -229,33 +227,28 @@ def _prepare_project_runtime_context(
     if not project_name:
         return None
     try:
-        from core.projects import prepare_project_runtime_context
+        from core.app.project_workspace import prepare_project_in_workspace
 
-        worktree_root = Path(
-            workspace.artifact_roots.get("worktrees_dir")
-            or (Path(workspace.artifact_roots["session_dir"]) / "worktrees")
-        )
-        runtime_context = prepare_project_runtime_context(
+        entry = prepare_project_in_workspace(
+            workspace,
             project_name,
             ones_result=ones_result,
-            worktree_root=worktree_root,
+            reason="ones_intake",
+            active=True,
         )
     except Exception as exc:
-        logger.warning("ONES prefetch failed to prepare project runtime context: {}", exc)
+        logger.warning("ONES prefetch failed to prepare project workspace context: {}", exc)
         return {
             "running_project": project_name,
             "status": "failed",
             "error": str(exc)[:500],
         }
-    if not runtime_context:
+    if not entry:
         return {
             "running_project": project_name,
             "status": "unavailable",
         }
-    payload = runtime_context.to_payload()
-    payload["status"] = "ready"
-    payload["workspace_scope"] = "session"
-    return payload
+    return entry
 
 
 def _infer_project_name(*, ctx: MessageContext, ones_result: dict[str, Any]) -> str:
@@ -285,29 +278,6 @@ def _infer_project_name(*, ctx: MessageContext, ones_result: dict[str, Any]) -> 
     if version.startswith("4."):
         return "fms-java"
     return ""
-
-
-def _persist_project_runtime_context(workspace: PreparedWorkspace, runtime_context: dict[str, Any]) -> None:
-    context_path = workspace.input_dir / "project_context.json"
-    try:
-        project_context = json.loads(context_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        project_context = {"artifact_roots": workspace.artifact_roots}
-    if not isinstance(project_context, dict):
-        project_context = {"artifact_roots": workspace.artifact_roots}
-    project_context["project_runtime"] = runtime_context
-    project_context["project_runtime_context_path"] = str(
-        (workspace.input_dir / "project_runtime_context.json").resolve()
-    )
-    context_path.write_text(json.dumps(project_context, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (workspace.input_dir / "project_runtime_context.json").write_text(
-        json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (workspace.output_dir / "project_runtime_context.json").write_text(
-        json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
 
 def _load_messages_from_result(ones_result: dict[str, Any]) -> dict[str, Any]:

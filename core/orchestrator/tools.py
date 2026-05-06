@@ -457,6 +457,60 @@ async def list_projects_tool(input: dict) -> dict[str, Any]:
 
 
 @tool(
+    "prepare_project_worktree",
+    "按需把已注册项目加载为当前 session 下的 worktree，并写入 project_workspace 注册表。"
+    "必须提供 project_name；优先提供 workspace/input/project_context.json 中的 session_workspace_path。",
+    {"type": "object", "properties": {
+        "project_name": {"type": "string", "description": "projects.yaml 中注册的项目名称"},
+        "session_workspace_path": {"type": "string", "description": "session_workspace.json 的绝对路径"},
+        "db_session_id": {"type": "integer", "description": "DB 会话 ID；没有 session_workspace_path 时用于推导 session 路径"},
+        "reason": {"type": "string", "description": "加载原因，例如涉及单机本体/前端/部署包"},
+        "active": {"type": "boolean", "description": "是否设为 active_project，默认 true"},
+    }, "required": ["project_name"]},
+)
+async def prepare_project_worktree_tool(input: dict) -> dict[str, Any]:
+    from core.app.project_workspace import prepare_project_from_session_workspace_path
+
+    project_name = str(input.get("project_name") or "").strip()
+    if not project_name:
+        return {"error": "project_name is required"}
+
+    session_workspace_text = str(input.get("session_workspace_path") or "").strip()
+    session_workspace_path = Path(session_workspace_text) if session_workspace_text else None
+    if not session_workspace_path and input.get("db_session_id"):
+        session_workspace_path = (
+            _project_root()
+            / "data"
+            / "sessions"
+            / f"session-{int(input['db_session_id'])}"
+            / "session_workspace.json"
+        )
+    if not session_workspace_path:
+        return {"error": "session_workspace_path or db_session_id is required"}
+    if not session_workspace_path.exists():
+        return {"error": f"session workspace not found: {session_workspace_path}"}
+
+    entry = prepare_project_from_session_workspace_path(
+        project_name,
+        session_workspace_path=session_workspace_path,
+        reason=str(input.get("reason") or "on_demand"),
+        active=bool(input.get("active", True)),
+    )
+    if not entry:
+        return {"error": f"failed to prepare project worktree: {project_name}"}
+    return {
+        "status": "ready",
+        "project": project_name,
+        "worktree_path": entry.get("worktree_path") or entry.get("execution_path") or "",
+        "checkout_ref": entry.get("checkout_ref") or "",
+        "execution_version": entry.get("execution_version") or "",
+        "execution_commit_sha": entry.get("execution_commit_sha") or "",
+        "project_workspace_path": str(session_workspace_path.parent / "project_workspace.json"),
+        "entry": entry,
+    }
+
+
+@tool(
     "dispatch_to_project",
     "将任务派发到指定项目的 Agent，在该项目目录下执行，使用该项目的 skills。"
     "如果提供 session_id（会话上下文中的 agent_session_id），则恢复之前的对话上下文，实现多轮交互。"
@@ -471,12 +525,11 @@ async def list_projects_tool(input: dict) -> dict[str, Any]:
 )
 async def dispatch_to_project(input: dict) -> dict[str, Any]:
     from core.orchestrator.agent_client import agent_client
-    from core.projects import (
-        build_project_runtime_prompt_block,
-        get_project,
-        merge_skills,
-        prepare_project_runtime_context,
+    from core.app.project_workspace import (
+        build_project_workspace_prompt_block,
+        prepare_project_from_session_workspace_path,
     )
+    from core.projects import get_project, merge_skills, prepare_project_runtime_context
     from core.skill_registry import SKILL_REGISTRY
 
     runtime = agent_client.get_active_runtime()
@@ -528,8 +581,44 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
     # Merge skills: project overrides global while inheriting shared workflow skills
     merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
-    runtime_context = prepare_project_runtime_context(project_name)
-    runtime_block = build_project_runtime_prompt_block(runtime_context)
+    runtime_context = None
+    project_workspace: dict[str, Any] | None = None
+    project_cwd = project.path
+    session_workspace_path = None
+    if db_session_id:
+        session_workspace_path = (
+            _project_root()
+            / "data"
+            / "sessions"
+            / f"session-{int(db_session_id)}"
+            / "session_workspace.json"
+        )
+        if session_workspace_path.exists():
+            entry = prepare_project_from_session_workspace_path(
+                project_name,
+                session_workspace_path=session_workspace_path,
+                reason="dispatch_to_project",
+                active=True,
+            )
+            if entry:
+                project_cwd = Path(str(entry.get("worktree_path") or entry.get("execution_path") or project.path))
+                try:
+                    project_workspace = json.loads((session_workspace_path.parent / "project_workspace.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    project_workspace = None
+
+    if not project_workspace:
+        runtime_context = prepare_project_runtime_context(project_name)
+        if runtime_context:
+            project_cwd = Path(runtime_context.execution_path)
+            project_workspace = {
+                "workspace_scope": "fallback",
+                "active_project": project_name,
+                "projects": {
+                    project_name: runtime_context.to_payload(),
+                },
+            }
+    runtime_block = build_project_workspace_prompt_block(project_workspace)
     selected_skill = None
     selected_session_id = resume_session_id
     triage_state_path = None
@@ -570,7 +659,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     # Build prompts for the project sub-agent
     project_prompt = f"""你是项目 "{project.name}" 的工作 Agent。
 
-项目目录: {project.path}
+源仓库目录: {project.path}
+执行/分析目录: {project_cwd}
 项目说明: {project.description}{skills_line}{runtime_block}
 
 ## 回复规则
@@ -583,11 +673,13 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         project_prompt += f"\n\n## 消息背景\n{context}"
 
     project_prompt += (
-        "\n\n请在项目上下文中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
+        "\n\n请在执行/分析目录中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
+        "不要把源仓库目录作为工作目录；跨项目时用 prepare_project_worktree 按需加载相关项目。"
     )
 
     project_system = (
-        f"你运行在项目 {project.name} 的工作目录中（{project.path}）。使用项目级 skills 完成任务。"
+        f"你运行在项目 {project.name} 的 session worktree 中（{project_cwd}）。"
+        f"源仓库目录仅供识别：{project.path}。使用项目级 skills 完成任务。"
         f"{runtime_block}"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
@@ -596,7 +688,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         result = await agent_client.run_for_project(
             prompt=project_prompt,
             system_prompt=project_system,
-            project_cwd=str(getattr(runtime_context, "execution_path", project.path)),
+            project_cwd=str(project_cwd),
             project_agents=merged_agents,
             max_turns=20,
             session_id=selected_session_id,
@@ -686,6 +778,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 CUSTOM_TOOLS = [
     query_db,
     list_projects_tool,
+    prepare_project_worktree_tool,
     dispatch_to_project,
 ]
 if settings.enable_memory_tools:
@@ -693,6 +786,7 @@ if settings.enable_memory_tools:
 
 PROJECT_TOOLS = [
     query_db,
+    prepare_project_worktree_tool,
 ]
 if settings.enable_memory_tools:
     PROJECT_TOOLS.extend([read_memory, search_memory_entries])
@@ -717,11 +811,12 @@ PROJECT_AGENT_RESPONSE_RULES = """
 7. 对 ONES / 现场问题，现场证据只能来自当前工单、当前会话补料和仓库内能确认的代码/配置事实。不要把本机或仓库里其他无关历史日志当作现场证据；若引用，只能标注为实现参考。
 8. 默认按纯静态分析处理：只读代码、配置、日志、历史记录和状态文件。除非用户明确要求“运行/构建/编译/测试/复现/启动服务”，禁止执行任何会启动项目、解析依赖或产生构建副作用的命令，例如 gradle/gradlew/mvn/npm/yarn/pnpm、docker compose、java -jar、pytest 等。需要验证时优先用已有日志和代码推理。
 9. Bash 仅用于只读检索与轻量文件盘点，例如 rg、Get-Content、Get-ChildItem、git status/show/describe、压缩包目录查看；不要为了“顺手验证”运行项目构建、依赖解析、测试或服务启动。
-10. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序优先用 `format=flow`。
+10. 对工作类问题，优先输出一个“纯 JSON 对象”作为结构化回复，且不要包在代码块里。普通说明/分析优先用 `format=rich`；流程、步骤、链路、时序、状态流转、跨项目协作优先用 `format=flow`。
 11. `format=rich` 示例：
    {"format":"rich","title":"标题","summary":"一句话总结","sections":[{"title":"结论","content":"核心结论"},{"title":"说明","content":"补充说明"}],"table":{"columns":[{"key":"item","label":"检查项","type":"text"}],"rows":[{"item":"配置"}]},"fallback_text":"纯文本兜底"}
 12. `format=flow` 示例：
-   {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[开始]-->B[结束]","fallback_text":"纯文本兜底"}
+   {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[\\\"开始\\\"]-->B[\\\"结束\\\"]","fallback_text":"纯文本兜底"}
+   流程图必须优先给 `mermaid` 或 `flowcharts[].source`，节点标签包含中文、空格、箭头、括号、斜杠、冒号或等号时必须加双引号，且不要把 Mermaid 放进 `code_blocks`。
 13. 闲聊、问候、极短确认可以继续输出自然语言正文。
 14. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
 """.strip()
@@ -729,7 +824,7 @@ PROJECT_AGENT_RESPONSE_RULES = """
 # Orchestrator: separate MCP server with limited tools only.
 # allowedTools does not restrict MCP tools, so we must register a
 # dedicated server that only exposes the tools the orchestrator needs.
-ORCHESTRATOR_TOOLS = [query_db, dispatch_to_project]
+ORCHESTRATOR_TOOLS = [query_db, prepare_project_worktree_tool, dispatch_to_project]
 if settings.enable_memory_tools:
     ORCHESTRATOR_TOOLS.extend([read_memory, search_memory_entries])
 

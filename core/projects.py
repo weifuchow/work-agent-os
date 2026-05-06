@@ -437,16 +437,14 @@ def _recommended_worktree_path(
     *,
     ones_result: dict[str, Any] | None,
     normalized_version: str,
+    worktree_token: str = "",
     worktree_root: Path | None = None,
 ) -> Path | None:
-    if not ones_result:
-        return None
-
     task = (ones_result or {}).get("task") or {}
     task_number = str(task.get("number") or "").strip()
     task_uuid = str(task.get("uuid") or "").strip()
     task_parts = [part for part in (task_number, task_uuid) if part]
-    task_token = "-".join(task_parts) if task_parts else "ones"
+    task_token = worktree_token or ("-".join(task_parts) if task_parts else "current")
 
     version_token = normalized_version or "master"
     safe_version = re.sub(r"[^A-Za-z0-9._-]+", "-", version_token).strip("-") or "master"
@@ -777,6 +775,7 @@ def resolve_project_runtime_context(
     *,
     ones_result: dict[str, Any] | None = None,
     worktree_root: Path | None = None,
+    worktree_token: str = "",
 ) -> ProjectRuntimeContext | None:
     project = get_project(project_name)
     if not project:
@@ -785,14 +784,27 @@ def resolve_project_runtime_context(
     git_meta = get_project_git_meta(path=project.path)
     inventory = _git_ref_inventory(str(project.path.resolve()))
     version_field, version_value, normalized_version = _extract_ones_version_hint(ones_result)
-    target_branch, target_branch_ref, branch_notes = _select_matching_branch(
-        normalized_version,
-        local_branches=inventory["local_branches"],
-        remote_branches=inventory["remote_branches"],
-        current_branch=git_meta.branch,
-    )
-    target_tag = _select_matching_tag(normalized_version, tags=inventory["tags"])
     current_version = git_meta.version_hint or git_meta.describe or git_meta.branch or git_meta.commit_sha[:8]
+    if ones_result or normalized_version:
+        target_branch, target_branch_ref, branch_notes = _select_matching_branch(
+            normalized_version,
+            local_branches=inventory["local_branches"],
+            remote_branches=inventory["remote_branches"],
+            current_branch=git_meta.branch,
+        )
+        target_tag = _select_matching_tag(normalized_version, tags=inventory["tags"])
+    else:
+        target_branch, target_branch_ref, branch_notes = _select_matching_branch(
+            "",
+            local_branches=inventory["local_branches"],
+            remote_branches=inventory["remote_branches"],
+            current_branch=git_meta.branch,
+        )
+        target_tag = ""
+        if target_branch_ref in {"master", "origin/master"}:
+            branch_notes = ["未提供版本线索，默认按 master 准备 session worktree。"]
+        elif target_branch_ref in {"main", "origin/main"}:
+            branch_notes = ["未提供版本线索，master 不存在，默认按 main 准备 session worktree。", *branch_notes]
 
     notes = list(branch_notes)
     if version_field and version_value:
@@ -809,7 +821,14 @@ def resolve_project_runtime_context(
     recommended_worktree = _recommended_worktree_path(
         project_name,
         ones_result=ones_result,
-        normalized_version=normalized_version,
+        normalized_version=(
+            normalized_version
+            or (target_branch if not ones_result else "")
+            or current_version
+            or git_meta.branch
+            or git_meta.commit_sha[:8]
+        ),
+        worktree_token=worktree_token,
         worktree_root=worktree_root,
     )
 
@@ -843,17 +862,16 @@ def prepare_project_runtime_context(
     *,
     ones_result: dict[str, Any] | None = None,
     worktree_root: Path | None = None,
+    worktree_token: str = "",
 ) -> ProjectRuntimeContext | None:
     context = resolve_project_runtime_context(
         project_name,
         ones_result=ones_result,
         worktree_root=worktree_root,
+        worktree_token=worktree_token,
     )
     if not context:
         return None
-    if not ones_result:
-        return context
-
     execution_path, worktree_notes = _ensure_project_worktree(context, ones_result=ones_result)
     updated_notes = [*context.notes, *worktree_notes]
     execution_meta = get_project_git_meta(path=execution_path)
@@ -872,19 +890,6 @@ def prepare_project_runtime_context(
         ),
         notes=updated_notes,
     )
-
-
-def build_project_runtime_prompt_block(context: ProjectRuntimeContext | None) -> str:
-    if not context:
-        return ""
-
-    payload = context.to_payload()
-    guidance = (
-        "\n处理项目问题时，回复里必须显式带上“运行的项目、项目名称、目录、分支/Tag/版本信息”。"
-        "\n如果这是 ONES / 现场问题且需要对齐版本，优先使用 worktree，在 recommended_worktree 目录检出 checkout_ref；"
-        "若没有精确 Tag，就使用 target_branch；如果版本分支也没匹配上，则回退到 master。"
-    )
-    return "\n\n[项目运行上下文]\n" + json.dumps(payload, ensure_ascii=False, indent=2) + guidance
 
 
 def merge_skills(

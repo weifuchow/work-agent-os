@@ -140,7 +140,7 @@ class MessageProcessor:
                             session_id,
                             {
                                 "project": str(direct_project_context.get("running_project") or ""),
-                                "analysis_workspace": str(direct_project_context.get("execution_path") or ""),
+                                "analysis_workspace": str(workspace.artifact_roots.get("session_dir") or workspace.path.parent),
                             },
                             now=self.deps.clock.now_iso(),
                         )
@@ -172,7 +172,7 @@ class MessageProcessor:
                         )
                         return
                     await self.deps.repository.audit(
-                        "project_runtime_context_prepared",
+                        "project_workspace_prepared",
                         target_type="message",
                         target_id=str(message_id),
                         detail={
@@ -432,7 +432,8 @@ def _attachment_ack_result() -> SkillResult:
 
 def _project_entry_result(runtime_context: dict[str, Any]) -> SkillResult:
     project = str(runtime_context.get("running_project") or "项目").strip()
-    project_path = str(runtime_context.get("execution_path") or runtime_context.get("project_path") or "").strip()
+    source_path = str(runtime_context.get("source_path") or runtime_context.get("project_path") or "").strip()
+    worktree_path = str(runtime_context.get("worktree_path") or runtime_context.get("execution_path") or "").strip()
     version = str(
         runtime_context.get("execution_version")
         or runtime_context.get("current_version")
@@ -440,7 +441,7 @@ def _project_entry_result(runtime_context: dict[str, Any]) -> SkillResult:
         or runtime_context.get("current_describe")
         or ""
     ).strip()
-    summary = f"已进入 {project} 项目上下文，后续问题会优先基于该项目目录处理。"
+    summary = f"已进入 {project} 项目上下文，后续问题会优先基于 session worktree 处理。"
     return SkillResult(
         action="reply",
         reply=ReplyPayload(
@@ -465,7 +466,8 @@ def _project_entry_result(runtime_context: dict[str, Any]) -> SkillResult:
                             ],
                             "rows": [
                                 {"name": "项目", "value": project},
-                                {"name": "目录", "value": project_path or "未配置"},
+                                {"name": "源仓库", "value": source_path or "未配置"},
+                                {"name": "Worktree", "value": worktree_path or "未准备"},
                                 {"name": "版本", "value": version or "未识别"},
                             ],
                         },
@@ -482,7 +484,7 @@ def _project_entry_result(runtime_context: dict[str, Any]) -> SkillResult:
         ),
         session_patch={
             "project": project,
-            "analysis_workspace": project_path,
+            "analysis_workspace": str(runtime_context.get("session_dir") or ""),
         },
         skill_trace=[{"skill": "core-project-entry", "reason": "direct project name first message"}],
         audit=[
@@ -490,7 +492,7 @@ def _project_entry_result(runtime_context: dict[str, Any]) -> SkillResult:
                 "event_type": "project_entry_acknowledged",
                 "detail": {
                     "running_project": project,
-                    "execution_path": project_path,
+                    "execution_path": worktree_path,
                     "version": version,
                 },
             }

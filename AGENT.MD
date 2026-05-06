@@ -16,7 +16,7 @@ Agent 只返回 contract。core 负责发送回复、更新 session、记录 aud
 
 ## Workspace 规则
 
-所有运行产物都应使用这里准备好的 session artifact roots：
+session 目录骨架由 `core/artifacts/session_init.py` 初始化。所有运行产物都应使用这里准备好的 session artifact roots：
 
 ```text
 data/sessions/session-<id>/workspace/input/artifact_roots.json
@@ -36,15 +36,23 @@ scratch     -> 临时文件
 
 不要在仓库根目录新建运行时 `.ones`、`.triage`、`.review`、`.session` 目录。
 
-## Project Worktree
+## Project Workspace
 
-需要版本对齐的项目工作，使用 `prepare_project_runtime_context()`，并传入 session worktree root：
+每个 session 都有项目工作区注册表：
 
 ```text
-data/sessions/session-<id>/worktrees/<project>/<task-version>
+data/sessions/session-<id>/project_workspace.json
+data/sessions/session-<id>/workspace/input/project_workspace.json
 ```
 
-`project_runtime_context.json` 是主项目或活跃项目的兼容文件，保持单项目对象。多项目支持应新增每项目 runtime 文件和多项目索引，不要破坏这个旧结构。
+项目源码按需加载为 session worktree：
+
+```text
+data/sessions/session-<id>/worktrees/<project>/<task-version-or-current>
+```
+
+`source_path/project_path` 只是源仓库登记位置；分析和修改都应使用 `worktree_path/execution_path`。
+跨项目时调用 `prepare_project_worktree` 把相关项目加入 `project_workspace.projects`。
 
 ## Subagent Dispatch
 
@@ -55,11 +63,11 @@ data/sessions/session-<id>/worktrees/<project>/<task-version>
 ```text
 主 Agent 判断项目
 core 准备 runtime/worktree
-项目 subagent 在 execution_path 中运行
+项目 subagent 在 session worktree 中运行
 主 Agent 汇总结果
 ```
 
-不要让项目 subagent 自己猜或手动切换 worktree。
+不要让项目 subagent 自己切到源仓库目录。
 
 ## 常用命令
 

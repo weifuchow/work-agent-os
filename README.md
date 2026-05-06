@@ -25,7 +25,7 @@ flowchart TB
     Agent --> Orchestrator["通用 Orchestrator Agent"]
     Orchestrator --> Tools["query_db / list_projects / dispatch_to_project"]
     Tools --> ProjectAgent["项目 Subagent"]
-    ProjectAgent --> Worktree["项目 execution_path / worktree"]
+    ProjectAgent --> Worktree["session worktree"]
 
     Agent --> Contract["SkillResult JSON contract"]
     Contract --> ResultHandler["ResultHandler"]
@@ -39,7 +39,7 @@ flowchart TB
 - Agent 不直接发送飞书消息。
 - Agent 不直接保存 bot reply。
 - core 负责 workspace、附件 staging、session patch、回复发送、审计记录和状态更新。
-- 项目级工作通过 `dispatch_to_project` 下沉到项目 subagent，subagent 的 cwd 由系统指定为该项目的 `execution_path`。
+- 项目级工作通过 `dispatch_to_project` 下沉到项目 subagent，subagent 的 cwd 由系统指定为该项目的 session worktree。
 
 ## 目录结构
 
@@ -83,7 +83,7 @@ tests/
 ```text
 data/sessions/session-152/
   workspace/
-    input/             message/session/history/media/project context
+    input/             message/session/history/media/project workspace
     state/             runtime state
     output/            final contract 和 summary
     artifacts/         当前运行 staging 产物
@@ -91,6 +91,7 @@ data/sessions/session-152/
   .triage/             日志排障产物
   .review/             GitLab review 产物
   worktrees/           项目 worktree：<project>/<task-version>
+  project_workspace.json
   uploads/             飞书媒体下载文件
   attachments/         解压或人工整理后的附件
   scratch/             临时文件
@@ -98,15 +99,29 @@ data/sessions/session-152/
 
 不要把运行时分析产物写到仓库根目录的 `.ones`、`.triage`、`.review` 或 `.session`。所有路径应从 `workspace/input/artifact_roots.json` 读取。
 
-## 项目 Runtime Context
+## 项目 Workspace
 
-项目 runtime 元信息由 `core/projects.py` 构建。
+会话目录骨架由 `core/artifacts/session_init.py` 初始化；Agent 和 skill 只在已初始化的 roots 下追加文件。
 
-对于 ONES 或需要对齐版本的问题，`prepare_project_runtime_context()` 会：
+项目工作区由 `core/app/project_workspace.py` 管理。每个 session 都会有：
+
+```text
+data/sessions/<session>/project_workspace.json
+data/sessions/<session>/workspace/input/project_workspace.json
+```
+
+`project_workspace.projects` 是当前 session 的多项目注册表。每个项目 entry 记录：
+
+- `source_path/project_path`：源仓库登记位置，只用于识别。
+- `worktree_path/execution_path`：实际分析和修改目录。
+- 版本、checkout_ref、branch/tag、commit 元信息。
+- 加载原因和 worktree 决策说明。
+
+对于 ONES、直接项目上下文或按需加载的问题，系统会：
 
 - 读取 `data/projects.yaml` 中注册的项目。
 - 读取 git 当前分支、commit、describe 等元信息。
-- 从 ONES 结果中提取版本线索。
+- 从 ONES 结果或当前仓库中提取版本线索。
 - 匹配 tag 或 branch。
 - 在 session 的 worktree 根目录下创建或复用 detached worktree。
 
@@ -116,14 +131,7 @@ worktree 路径规则：
 data/sessions/<session>/worktrees/<project>/<task-number>-<task-uuid>-<version>
 ```
 
-兼容文件保持不变：
-
-```text
-workspace/input/project_runtime_context.json
-workspace/output/project_runtime_context.json
-```
-
-这个文件表示当前已准备好的主项目或活跃项目。后续如果引入多项目需求，不要把这个对象直接改成数组；应保留它作为兼容视图，再新增多项目索引和每项目 runtime 文件。
+无 ONES 版本线索时，会为当前分支/版本创建 `current-*` worktree。系统不再写单项目兼容文件 `project_runtime_context.json`。
 
 ## 项目 Dispatch
 
@@ -131,15 +139,16 @@ Orchestrator 当前暴露这些工具：
 
 - `query_db`：只读 SQL 查询。
 - `list_projects`：列出 `data/projects.yaml` 注册项目。
+- `prepare_project_worktree`：把指定项目加载到当前 session worktree 并写入 `project_workspace.json`。
 - `dispatch_to_project`：在指定项目上下文中运行项目 subagent。
 
-`dispatch_to_project` 会合并全局和项目本地 skill，构建 runtime prompt block，并调用 `agent_client.run_for_project()`，其中 `project_cwd` 使用 runtime 的 `execution_path`。
+`dispatch_to_project` 会合并全局和项目本地 skill，构建 project workspace prompt block，并调用 `agent_client.run_for_project()`，其中 `project_cwd` 使用该项目的 session worktree。
 
 跨项目工作的设计原则：
 
 - 主 Agent 判断下一步属于哪个项目。
-- core 准备或复用该项目 runtime/worktree。
-- 项目 subagent 只在分配给它的 `execution_path` 中工作。
+- core 准备或复用该项目 session worktree。
+- 项目 subagent 只在分配给它的 `worktree_path/execution_path` 中工作。
 - 主 Agent 汇总多个项目 subagent 的结果。
 
 ## Workflow Skills

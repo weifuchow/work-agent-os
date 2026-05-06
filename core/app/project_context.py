@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
 from typing import Any
 
 from core.app.context import MessageContext, PreparedWorkspace
-from core.projects import get_projects, resolve_project_runtime_context
+from core.app.project_workspace import prepare_project_in_workspace
+from core.projects import get_projects
 
 
 def prepare_direct_project_context(
@@ -19,18 +18,13 @@ def prepare_direct_project_context(
     if not project_name:
         return None
 
-    runtime_context = resolve_project_runtime_context(
+    payload = prepare_project_in_workspace(
+        workspace,
         project_name,
-        worktree_root=Path(
-            workspace.artifact_roots.get("worktrees_dir")
-            or (Path(workspace.artifact_roots["session_dir"]) / "worktrees")
-        ),
+        reason="direct_project_alias",
+        active=True,
+        worktree_token=_direct_entry_worktree_token(ctx, project_name),
     )
-    if not runtime_context:
-        return None
-
-    payload = runtime_context.to_payload()
-    _persist_project_runtime_context(workspace, payload)
     return payload
 
 
@@ -41,8 +35,6 @@ def is_direct_project_entry_message(
     project_name = str(runtime_context.get("running_project") or "").strip()
     if not project_name:
         return False
-    if _user_message_count(ctx) > 1:
-        return False
 
     content = str(ctx.message.get("content") or "").strip()
     if not content or len(content) > 80 or "\n" in content:
@@ -51,24 +43,53 @@ def is_direct_project_entry_message(
     project = next((item for item in get_projects() if item.name == project_name), None)
     if not project:
         return False
-    aliases = [project.name, *_description_aliases(project.description)]
-    normalized_content = _normalize_entry_text(content)
-    return normalized_content in {_normalize_entry_text(alias) for alias in aliases if alias}
+    return _is_direct_project_entry_text(content, project)
 
 
 def _infer_project_name(ctx: MessageContext) -> str:
+    message_project = _infer_project_name_from_text(str(ctx.message.get("content") or ""))
+    if message_project:
+        return message_project
+
     session_project = str((ctx.session or {}).get("project") or "").strip()
     if session_project:
-        return session_project
+        return ""
 
-    text = _project_signal_text(ctx)
+    return _infer_project_name_from_text(_project_signal_text(ctx))
+
+
+def _direct_entry_worktree_token(ctx: MessageContext, project_name: str) -> str:
+    project = next((item for item in get_projects() if item.name == project_name), None)
+    if not project:
+        return ""
+    if not _is_direct_project_entry_text(str(ctx.message.get("content") or ""), project):
+        return ""
+    message_id = str(ctx.message.get("id") or "").strip()
+    if message_id:
+        safe_message_id = re.sub(r"[^A-Za-z0-9._-]+", "-", message_id).strip("-")
+        if safe_message_id:
+            return f"entry-{safe_message_id}"
+    return ""
+
+
+def _infer_project_name_from_text(text: str) -> str:
     if not text:
         return ""
+    normalized_text = text.lower()
+    matches: list[tuple[int, str]] = []
     for project in get_projects():
         names = [project.name, *_description_aliases(project.description)]
-        if any(_contains_project_alias(text, alias) for alias in names):
-            return project.name
-    return ""
+        for alias in names:
+            if not _contains_project_alias(normalized_text, alias):
+                continue
+            normalized_alias = _normalize_entry_text(alias)
+            score = len(normalized_alias)
+            if _normalize_entry_text(text) == normalized_alias:
+                score += 1000
+            matches.append((score, project.name))
+    if not matches:
+        return ""
+    return max(matches, key=lambda item: item[0])[1]
 
 
 def _user_message_count(ctx: MessageContext) -> int:
@@ -86,6 +107,12 @@ def _user_message_count(ctx: MessageContext) -> int:
 
 def _normalize_entry_text(value: str) -> str:
     return re.sub(r"[\s`'\"“”‘’。.!！?？,，:：;；/\\_-]+", "", str(value or "").lower())
+
+
+def _is_direct_project_entry_text(content: str, project: Any) -> bool:
+    aliases = [project.name, *_description_aliases(project.description)]
+    normalized_content = _normalize_entry_text(content)
+    return normalized_content in {_normalize_entry_text(alias) for alias in aliases if alias}
 
 
 def _project_signal_text(ctx: MessageContext) -> str:
@@ -118,33 +145,3 @@ def _contains_project_alias(text: str, alias: str) -> bool:
     if re.fullmatch(r"[a-z0-9_.-]+", alias_text):
         return bool(re.search(rf"(?<![a-z0-9_.-]){re.escape(alias_text)}(?![a-z0-9_.-])", text))
     return alias_text in text
-
-
-def _persist_project_runtime_context(
-    workspace: PreparedWorkspace,
-    runtime_context: dict[str, Any],
-) -> None:
-    context_path = workspace.input_dir / "project_context.json"
-    try:
-        project_context = json.loads(context_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        project_context = {"artifact_roots": workspace.artifact_roots}
-    if not isinstance(project_context, dict):
-        project_context = {"artifact_roots": workspace.artifact_roots}
-
-    project_context["project_runtime"] = runtime_context
-    project_context["project_runtime_context_path"] = str(
-        (workspace.input_dir / "project_runtime_context.json").resolve()
-    )
-    context_path.write_text(
-        json.dumps(project_context, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (workspace.input_dir / "project_runtime_context.json").write_text(
-        json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (workspace.output_dir / "project_runtime_context.json").write_text(
-        json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )

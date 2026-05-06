@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         description="Extract code-derived keyword hints for RIOT log triage.",
     )
     parser.add_argument("--state", default="", help="Path to 00-state.json.")
-    parser.add_argument("--code-root", default="", help="Source repository root. Defaults to state.project_runtime.project_path.")
+    parser.add_argument("--code-root", default="", help="Source repository root. Defaults to active project worktree in state.project_workspace.")
     parser.add_argument("--keyword-package-file", default="", help="Existing keyword package to use as seed terms.")
     parser.add_argument("--output-dir", default="", help="Where code_keyword_hints.json is written.")
     parser.add_argument("--max-files", type=int, default=80, help="Maximum matched source files to inspect.")
@@ -381,12 +381,24 @@ def build_hints(*, state: dict[str, Any], package: dict[str, Any], code_root: Pa
 def resolve_code_root(args: argparse.Namespace, state: dict[str, Any]) -> Path:
     if args.code_root:
         return Path(args.code_root).resolve()
-    runtime = dict(state.get("project_runtime") or {})
-    for key in ("project_path", "execution_path", "recommended_worktree"):
+    workspace = dict(state.get("project_workspace") or {})
+    projects = workspace.get("projects") if isinstance(workspace.get("projects"), dict) else {}
+    active_project = str(workspace.get("active_project") or state.get("project") or "").strip()
+    runtime = (
+        dict(projects.get(active_project) or {})
+        if isinstance(projects, dict) and active_project
+        else {}
+    )
+    if not runtime and isinstance(projects, dict):
+        for value in projects.values():
+            if isinstance(value, dict):
+                runtime = dict(value)
+                break
+    for key in ("worktree_path", "execution_path", "recommended_worktree", "project_path"):
         value = str(runtime.get(key) or "").strip()
         if value:
             return Path(value).resolve()
-    raise SystemExit("Provide --code-root or state.project_runtime.project_path.")
+    raise SystemExit("Provide --code-root or state.project_workspace active project worktree.")
 
 
 def main() -> int:

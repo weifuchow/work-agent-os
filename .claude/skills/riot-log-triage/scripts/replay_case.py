@@ -364,6 +364,18 @@ def build_replay_bundle(
         else projects_mod.resolve_project_runtime_context(case["input"]["project"], ones_result=ones_result)
     )
     runtime_payload = runtime_context.to_payload() if runtime_context else {}
+    project_name = str(case["input"]["project"] or "")
+    if runtime_payload:
+        runtime_payload.setdefault("name", project_name)
+        runtime_payload.setdefault("source_path", runtime_payload.get("project_path", ""))
+        runtime_payload.setdefault("worktree_path", runtime_payload.get("execution_path", ""))
+    project_workspace = {
+        "schema_version": "1.0",
+        "workspace_scope": "replay",
+        "active_project": project_name,
+        "project_order": [project_name] if project_name else [],
+        "projects": {project_name: runtime_payload} if project_name and runtime_payload else {},
+    }
 
     normalized_window = build_search_window(
         project_name=str(case["input"]["project"] or ""),
@@ -387,7 +399,7 @@ def build_replay_bundle(
         primary_question=build_primary_question(case),
     )
     state["work_dir"] = str(replay_dir)
-    state["project_runtime"] = runtime_payload
+    state["project_workspace"] = project_workspace
     state["current_question"] = "问题时间点车辆处于什么状态、卡在哪个流程门禁"
     state["time_alignment"]["normalized_problem_time"] = normalized_window["problem_time_log"]
     state["time_alignment"]["log_timezone"] = "UTC+0" if str(case["input"]["project"]).strip().lower() in {"allspark", "riot3"} else str(case["input"]["problem_timezone"] or "")
@@ -422,6 +434,7 @@ def build_replay_bundle(
         "log_bundle": log_bundle or {},
         "search_root": str(Path(log_bundle["path"]).resolve().parent) if log_bundle and log_bundle.get("path") else "",
         "runtime_context": runtime_payload,
+        "project_workspace": project_workspace,
         "normalized_window": normalized_window,
         "log_routing": log_routing,
         "expected_progression": dict(case.get("expected_progression") or {}),

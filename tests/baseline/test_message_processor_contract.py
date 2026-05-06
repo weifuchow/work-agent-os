@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from core.deps import CoreDependencies
 from core.pipeline import configure_dependencies_for_tests, process_message, reprocess_message
 from core.ports import AgentRequest, AgentResponse
 from core.projects import ProjectConfig
+import core.projects as projects_mod
 from core.repositories import Repository
 from core.sessions.service import SessionService
 from builders.messages import create_schema, fetch_all, fetch_one, insert_message
@@ -87,6 +89,7 @@ async def test_reply_flow_completes_and_delivers_payload(harness):
     assert "skills" in read_workspace_json(workspace, "input/skill_registry.json")
     artifact_roots = read_workspace_json(workspace, "input/artifact_roots.json")
     project_context = read_workspace_json(workspace, "input/project_context.json")
+    project_workspace = read_workspace_json(workspace, "input/project_workspace.json")
     session_dir = Path(artifact_roots["session_dir"])
     session_workspace_path = session_dir / "session_workspace.json"
     assert not (workspace / "input" / "session_workspace.json").exists()
@@ -101,6 +104,10 @@ async def test_reply_flow_completes_and_delivers_payload(harness):
     assert "data/attachments" in session_workspace["forbidden_roots"]
     assert project_context["artifact_roots"] == artifact_roots
     assert project_context["session_workspace_path"] == str(session_workspace_path.resolve())
+    assert project_context["project_workspace_path"] == str((session_dir / "project_workspace.json").resolve())
+    assert project_context["project_workspace"]["projects"] == {}
+    assert project_workspace["projects"] == {}
+    assert project_workspace["worktrees_dir"] == artifact_roots["worktrees_dir"]
     for key in ("ones_dir", "triage_dir", "review_dir", "uploads_dir", "attachments_dir", "scratch_dir"):
         path = Path(artifact_roots[key])
         assert path.is_dir()
@@ -203,6 +210,10 @@ async def test_direct_project_context_updates_session_and_audit(harness, monkeyp
         lambda ctx, workspace: {
             "running_project": "allspark",
             "project_path": r"D:\standard\riot\allspark",
+            "source_path": r"D:\standard\riot\allspark",
+            "worktree_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "current"),
+            "execution_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "current"),
+            "session_dir": workspace.artifact_roots["session_dir"],
             "current_branch": "release/3.46.x",
             "current_version": "3.46.16",
         },
@@ -214,11 +225,12 @@ async def test_direct_project_context_updates_session_and_audit(harness, monkeyp
     msg = await fetch_one(db_file, "SELECT * FROM messages WHERE id = ?", (msg_id,))
     session = await fetch_one(db_file, "SELECT * FROM sessions WHERE id = ?", (msg["session_id"],))
     assert session["project"] == "allspark"
+    assert Path(session["analysis_workspace"]).name == f"session-{msg['session_id']}"
 
     audit = await fetch_one(
         db_file,
         "SELECT detail FROM audit_logs WHERE event_type = ?",
-        ("project_runtime_context_prepared",),
+        ("project_workspace_prepared",),
     )
     detail = json.loads(audit["detail"])
     assert detail["running_project"] == "allspark"
@@ -236,7 +248,10 @@ async def test_first_direct_project_name_uses_fast_entry_path(harness, monkeypat
         lambda ctx, workspace: {
             "running_project": "allspark",
             "project_path": str(project_path),
-            "execution_path": str(project_path),
+            "source_path": str(project_path),
+            "worktree_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "current"),
+            "execution_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "current"),
+            "session_dir": workspace.artifact_roots["session_dir"],
             "current_branch": "release/3.46.x",
             "current_version": "3.46.16",
             "execution_version": "3.46.16",
@@ -266,13 +281,92 @@ async def test_first_direct_project_name_uses_fast_entry_path(harness, monkeypat
     msg = await fetch_one(db_file, "SELECT * FROM messages WHERE id = ?", (msg_id,))
     session = await fetch_one(db_file, "SELECT * FROM sessions WHERE id = ?", (msg["session_id"],))
     assert session["project"] == "allspark"
-    assert session["analysis_workspace"] == str(project_path)
+    assert Path(session["analysis_workspace"]).name == f"session-{msg['session_id']}"
 
     audits = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
     event_types = [item["event_type"] for item in audits]
     assert "project_entry_fast_path" in event_types
     assert "project_entry_acknowledged" in event_types
     assert "agent_run_started" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_session_164_frontend_switch_prepares_worktree_before_analysis(harness, monkeypatch, tmp_path):
+    db_file = harness["db_file"]
+    repos_dir = tmp_path / "repos"
+    allspark_repo = _init_repo(repos_dir / "allspark", initial_branch="master", tag="3.52.0")
+    frontend_repo = _init_repo(repos_dir / "riot-frontend-v3", initial_branch="main", tag="v3.51.0")
+    projects = [
+        ProjectConfig(
+            name="allspark",
+            path=allspark_repo,
+            description="Riot 调度系统 3.0（allspark）。别名：riot3、RIOT3、riot3调度系统。",
+        ),
+        ProjectConfig(
+            name="riot-frontend-v3",
+            path=frontend_repo,
+            description="RIOT3 前端项目（riot-frontend-v3）。别名：riot3前端、riot3 前端、RIOT3前端、RIOT3 前端、riot3 frontend、riot3-frontend、allspark frontend。",
+        ),
+    ]
+    monkeypatch.setattr("core.app.project_context.get_projects", lambda: projects)
+    monkeypatch.setattr(projects_mod, "get_projects", lambda: projects)
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: next((project for project in projects if project.name == name), None),
+    )
+    projects_mod._git_ref_inventory.cache_clear()
+
+    allspark_id = await insert_message(db_file, platform_message_id="om_session164_allspark", content="allspark")
+    await process_message(allspark_id)
+    allspark_msg = await fetch_one(db_file, "SELECT * FROM messages WHERE id = ?", (allspark_id,))
+    session_id = int(allspark_msg["session_id"])
+    session_dir = harness["workspace_root"] / f"session-{session_id}"
+    project_workspace = json.loads((session_dir / "project_workspace.json").read_text(encoding="utf-8"))
+    assert project_workspace["active_project"] == "allspark"
+    assert project_workspace["projects"]["allspark"]["worktree_path"].endswith(
+        f"worktrees{os.sep}allspark{os.sep}entry-{allspark_id}-master"
+    )
+    assert harness["agent_port"].calls == []
+
+    frontend_id = await insert_message(
+        db_file,
+        platform_message_id="om_session164_frontend",
+        content="RIOT3 前端",
+        thread_id="omt_reply_001",
+    )
+    await process_message(frontend_id)
+    project_workspace = json.loads((session_dir / "project_workspace.json").read_text(encoding="utf-8"))
+    assert project_workspace["active_project"] == "riot-frontend-v3"
+    assert set(project_workspace["projects"]) == {"allspark", "riot-frontend-v3"}
+    frontend_entry = project_workspace["projects"]["riot-frontend-v3"]
+    assert frontend_entry["worktree_path"].endswith(
+        f"worktrees{os.sep}riot-frontend-v3{os.sep}entry-{frontend_id}-main"
+    )
+    assert Path(frontend_entry["worktree_path"]).is_dir()
+    assert harness["agent_port"].calls == []
+
+    harness["agent_port"].results.append(_reply_result("frontend analysis"))
+    followup_id = await insert_message(
+        db_file,
+        platform_message_id="om_session164_frontend_followup",
+        content="如果后端调整这些信息，前端需要怎么修改",
+        thread_id="omt_reply_001",
+    )
+    await process_message(followup_id)
+
+    assert len(harness["agent_port"].calls) == 1
+    agent_workspace = harness["agent_port"].calls[0].workspace_path
+    agent_project_workspace = read_workspace_json(agent_workspace, "input/project_workspace.json")
+    assert agent_project_workspace["active_project"] == "riot-frontend-v3"
+    assert agent_project_workspace["projects"]["riot-frontend-v3"]["worktree_path"] == frontend_entry["worktree_path"]
+    assert agent_project_workspace["projects"]["allspark"]["worktree_path"] == project_workspace["projects"]["allspark"]["worktree_path"]
+
+    audits = await fetch_all(db_file, "SELECT event_type, target_id FROM audit_logs ORDER BY id")
+    fast_path_targets = [item["target_id"] for item in audits if item["event_type"] == "project_entry_fast_path"]
+    assert str(allspark_id) in fast_path_targets
+    assert str(frontend_id) in fast_path_targets
+    assert str(followup_id) not in fast_path_targets
 
 
 @pytest.mark.asyncio
@@ -310,7 +404,7 @@ async def test_ones_reference_skips_direct_project_context(harness, monkeypatch)
     audits = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
     event_types = [item["event_type"] for item in audits]
     assert "ones_intake_prepared" in event_types
-    assert "project_runtime_context_prepared" not in event_types
+    assert "project_workspace_prepared" not in event_types
 
 
 @pytest.mark.asyncio
@@ -621,6 +715,29 @@ def _reply_result(content: str) -> dict:
         "skill_trace": [{"skill": "test-skill", "reason": "fixture"}],
         "audit": [],
     }
+
+
+def _init_repo(path: Path, *, initial_branch: str, tag: str = "") -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init", f"--initial-branch={initial_branch}")
+    _git(path, "config", "user.name", "Test User")
+    _git(path, "config", "user.email", "test@example.com")
+    (path / "README.md").write_text(path.name + "\n", encoding="utf-8")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-m", "init")
+    if tag:
+        _git(path, "tag", tag)
+    return path
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
 
 
 class TimeoutAfterArtifactAgentPort:

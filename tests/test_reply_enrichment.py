@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from core.app.context import PreparedWorkspace
 from core.app.context import MessageContext
-from core.app.reply_enrichment import enrich_reply_with_workspace_context
+from core.app.reply_enrichment import enhance_feishu_card_code_blocks, enrich_reply_with_workspace_context
 from core.app.result_handler import ResultHandler
 from core.ports import ReplyPayload
 
@@ -31,20 +31,26 @@ def _workspace(tmp_path):
 
 def test_enrich_feishu_card_with_runtime_context(tmp_path):
     workspace = _workspace(tmp_path)
-    (workspace.input_dir / "project_runtime_context.json").write_text(
+    (workspace.input_dir / "project_workspace.json").write_text(
         json.dumps(
             {
-                "running_project": "allspark",
-                "normalized_version": "3.52.0",
-                "version_source_field": "summary_snapshot.version_normalized",
-                "version_source_value": "3.52.0",
-                "target_branch_ref": "master",
-                "current_branch": "release/3.46.x",
-                "checkout_ref": "3.52.0",
-                "execution_path": r"D:\standard\work-agent-os\data\sessions\session-141\worktrees\allspark\ones-3.52.0",
-                "execution_commit_sha": "a7916525f8d1",
-                "execution_describe": "3.52.0",
-                "execution_version": "3.52.0",
+                "active_project": "allspark",
+                "project_order": ["allspark"],
+                "projects": {
+                    "allspark": {
+                        "running_project": "allspark",
+                        "normalized_version": "3.52.0",
+                        "version_source_field": "summary_snapshot.version_normalized",
+                        "version_source_value": "3.52.0",
+                        "target_branch_ref": "master",
+                        "current_branch": "release/3.46.x",
+                        "checkout_ref": "3.52.0",
+                        "worktree_path": r"D:\standard\work-agent-os\data\sessions\session-141\worktrees\allspark\ones-3.52.0",
+                        "execution_commit_sha": "a7916525f8d1",
+                        "execution_describe": "3.52.0",
+                        "execution_version": "3.52.0",
+                    }
+                },
             },
             ensure_ascii=False,
         ),
@@ -71,27 +77,31 @@ def test_enrich_feishu_card_with_runtime_context(tmp_path):
     assert "allspark" in first["content"]
     assert r"D:\standard\riot\allspark" not in first["content"]
     assert "3.52.0" in first["content"]
-    assert "目标分支：master" in first["content"]
-    assert "主仓库分支：release/3.46.x" in first["content"]
+    assert "检出 `3.52.0`" in first["content"]
+    assert "主仓库 `release/3.46.x`" in first["content"]
     assert "Worktree" in first["content"]
-    assert "Worktree 版本：3.52.0" in first["content"]
     assert "a7916525f8d1 / 3.52.0" in first["content"]
     assert "运行上下文" in enriched.content
 
 
-def test_enrich_feishu_card_with_direct_project_runtime_context(tmp_path):
+def test_enrich_feishu_card_with_direct_project_workspace_context(tmp_path):
     workspace = _workspace(tmp_path)
-    (workspace.input_dir / "project_runtime_context.json").write_text(
+    (workspace.input_dir / "project_workspace.json").write_text(
         json.dumps(
             {
-                "running_project": "allspark",
-                "project_path": r"D:\standard\riot\allspark",
-                "execution_path": r"D:\standard\riot\allspark",
-                "current_branch": "release/3.46.x",
-                "current_commit_sha": "5ed0956073b6",
-                "current_describe": "3.46.16-7-g5ed095607",
-                "current_version": "3.46.16",
-                "execution_version": "3.46.16",
+                "active_project": "allspark",
+                "projects": {
+                    "allspark": {
+                        "running_project": "allspark",
+                        "source_path": r"D:\standard\riot\allspark",
+                        "worktree_path": r"D:\standard\work-agent-os\data\sessions\session-141\worktrees\allspark\current-3.46.16",
+                        "current_branch": "release/3.46.x",
+                        "current_commit_sha": "5ed0956073b6",
+                        "current_describe": "3.46.16-7-g5ed095607",
+                        "current_version": "3.46.16",
+                        "execution_version": "3.46.16",
+                    }
+                },
             },
             ensure_ascii=False,
         ),
@@ -113,20 +123,79 @@ def test_enrich_feishu_card_with_direct_project_runtime_context(tmp_path):
     enriched = enrich_reply_with_workspace_context(reply, workspace)
 
     first = enriched.payload["body"]["elements"][0]["content"]
-    assert "- 项目：allspark" in first
-    assert r"- 项目目录：`D:\standard\riot\allspark`" in first
-    assert "- 版本：3.46.16" in first
-    assert "- 主仓库分支：release/3.46.x" in first
+    assert "**当前项目：allspark**" in first
+    assert r"源仓库：`D:\standard\riot\allspark`" in first
+    assert "Worktree" in first
+    assert "版本 `3.46.16`" in first
+    assert "主仓库 `release/3.46.x`" in first
+
+
+def test_enrich_feishu_card_compacts_multi_project_runtime_context(tmp_path):
+    workspace = _workspace(tmp_path)
+    (workspace.input_dir / "project_workspace.json").write_text(
+        json.dumps(
+            {
+                "active_project": "riot-frontend-v3",
+                "project_order": ["allspark", "riot-frontend-v3"],
+                "projects": {
+                    "allspark": {
+                        "running_project": "allspark",
+                        "source_path": r"D:\standard\riot\allspark",
+                        "worktree_path": r"D:\standard\work-agent-os\data\sessions\session-164\worktrees\allspark\entry-977-master",
+                        "checkout_ref": "master",
+                        "execution_version": "3.52.0",
+                        "execution_commit_sha": "a7916525f8d1",
+                        "execution_describe": "3.52.0",
+                    },
+                    "riot-frontend-v3": {
+                        "running_project": "riot-frontend-v3",
+                        "source_path": r"D:\standard\riot\riot-frontend-v3",
+                        "worktree_path": r"D:\standard\work-agent-os\data\sessions\session-164\worktrees\riot-frontend-v3\entry-992-main",
+                        "checkout_ref": "main",
+                        "execution_version": "3.51.0",
+                        "execution_commit_sha": "03f87835ff90",
+                        "execution_describe": "v3.51.0-10-g03f87835",
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="前端 WebSocket 配置梳理",
+        payload={"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "**结论**\n需要调整。"}]}},
+    )
+
+    enriched = enrich_reply_with_workspace_context(reply, workspace)
+
+    first = enriched.payload["body"]["elements"][0]["content"]
+    assert "**当前项目：riot-frontend-v3**" in first
+    assert "版本 `3.51.0`" in first
+    assert "Worktree：`D:\\...\\session-164\\worktrees\\riot-frontend-v3\\entry-992-main`" in first
+    assert "**相关项目**" in first
+    assert "- allspark：版本 `3.52.0`" in first
+    assert "D:\\...\\session-164\\worktrees\\allspark\\entry-977-master" in first
+    assert first.count("源仓库") == 1
+    assert "项目目录：" not in first
+    assert "Worktree 版本" not in first
 
 
 def test_enrich_feishu_card_moves_runtime_context_to_front(tmp_path):
     workspace = _workspace(tmp_path)
-    (workspace.input_dir / "project_runtime_context.json").write_text(
+    (workspace.input_dir / "project_workspace.json").write_text(
         json.dumps(
             {
-                "running_project": "allspark",
-                "project_path": r"D:\standard\riot\allspark",
-                "execution_version": "3.46",
+                "active_project": "allspark",
+                "projects": {
+                    "allspark": {
+                        "running_project": "allspark",
+                        "source_path": r"D:\standard\riot\allspark",
+                        "worktree_path": r"D:\standard\work-agent-os\data\sessions\session-141\worktrees\allspark\current-3.46",
+                        "execution_version": "3.46",
+                    }
+                },
             },
             ensure_ascii=False,
         ),
@@ -155,6 +224,55 @@ def test_enrich_feishu_card_moves_runtime_context_to_front(tmp_path):
     assert r"D:\standard\riot\allspark" in elements[0]["content"]
     assert elements[1]["content"].startswith("**结论**")
     assert sum("运行上下文" in item.get("content", "") for item in elements) == 1
+
+
+def test_enhance_feishu_card_code_blocks_splits_markdown_code_panel():
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="代码说明",
+        payload={
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "先定义类型。\n\n```ts path=src/types/robot.ts\nexport interface RobotLiteFrame {\n  deviceKey: string\n}\n```\n\n再切订阅。",
+                    }
+                ],
+            },
+        },
+    )
+
+    enhanced = enhance_feishu_card_code_blocks(reply)
+
+    contents = [item["content"] for item in enhanced.payload["body"]["elements"]]
+    assert contents[0] == "先定义类型。"
+    assert "代码片段：src/types/robot.ts" in contents[1]
+    assert "文件 `src/types/robot.ts`" in contents[1]
+    assert "语言 `ts`" in contents[1]
+    assert contents[2].startswith("```ts\nexport interface RobotLiteFrame")
+    assert contents[3] == "再切订阅。"
+
+
+def test_enhance_feishu_card_code_blocks_keeps_mermaid_for_image_renderer():
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="流程图",
+        payload={
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "```mermaid\nflowchart TD\nA-->B\n```"},
+                ],
+            },
+        },
+    )
+
+    enhanced = enhance_feishu_card_code_blocks(reply)
+
+    elements = enhanced.payload["body"]["elements"]
+    assert len(elements) == 1
+    assert elements[0]["content"].startswith("```mermaid")
 
 
 def test_result_handler_rebuilds_card_from_structured_summary(tmp_path):

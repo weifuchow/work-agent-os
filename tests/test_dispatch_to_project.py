@@ -84,9 +84,11 @@ async def test_dispatch_to_project_uses_riot_log_triage_for_analysis_session(tmp
     monkeypatch.setattr(
         projects_mod,
         "prepare_project_runtime_context",
-        lambda project_name, ones_result=None: SimpleNamespace(execution_path=tmp_path / "repo" / project_name),
+        lambda project_name, ones_result=None: SimpleNamespace(
+            execution_path=tmp_path / "repo" / project_name,
+            to_payload=lambda: {"running_project": project_name, "execution_path": str(tmp_path / "repo" / project_name)},
+        ),
     )
-    monkeypatch.setattr(projects_mod, "build_project_runtime_prompt_block", lambda runtime_context: "")
     monkeypatch.setattr(
         projects_mod,
         "merge_skills",
@@ -168,9 +170,11 @@ async def test_dispatch_to_project_correction_turn_resets_saved_triage_session(t
     monkeypatch.setattr(
         projects_mod,
         "prepare_project_runtime_context",
-        lambda project_name, ones_result=None: SimpleNamespace(execution_path=tmp_path / "repo" / project_name),
+        lambda project_name, ones_result=None: SimpleNamespace(
+            execution_path=tmp_path / "repo" / project_name,
+            to_payload=lambda: {"running_project": project_name, "execution_path": str(tmp_path / "repo" / project_name)},
+        ),
     )
-    monkeypatch.setattr(projects_mod, "build_project_runtime_prompt_block", lambda runtime_context: "")
     monkeypatch.setattr(
         projects_mod,
         "merge_skills",

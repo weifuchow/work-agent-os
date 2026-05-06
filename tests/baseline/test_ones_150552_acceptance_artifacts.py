@@ -29,14 +29,15 @@ def test_ones_150552_acceptance_artifacts():
     final_decision_path = process_dir / "final_decision.json"
     trace_json_path = process_dir / "analysis_trace.json"
     trace_md_path = process_dir / "analysis_trace.md"
-    runtime_context_path = session_dir / "workspace" / "input" / "project_runtime_context.json"
+    project_workspace_path = session_dir / "project_workspace.json"
     search_results = sorted((triage_dir / "search-runs").glob("*/search_results.json"))
 
     summary = _read_json(summary_path)
     task = _read_json(task_path)
     package = _read_json(package_path)
     state = _read_json(state_path)
-    runtime_context = _read_json(runtime_context_path)
+    project_workspace = _read_json(project_workspace_path)
+    runtime_context = (project_workspace.get("projects") or {}).get("allspark") or {}
     search = _read_json(search_results[-1]) if search_results else {}
     dsl_text = dsl_path.read_text(encoding="utf-8") if dsl_path.exists() else ""
 

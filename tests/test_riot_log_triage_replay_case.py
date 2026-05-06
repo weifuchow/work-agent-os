@@ -155,7 +155,7 @@ def test_build_replay_bundle_uses_frozen_ones_and_generates_seed_inputs(tmp_path
     assert state["primary_question"].startswith("RIot3.46.23 小车 AG0019")
     assert state["current_question"] == "问题时间点车辆处于什么状态、卡在哪个流程门禁"
     assert state["time_alignment"]["normalized_problem_time"] == "2026-04-21 10:34:00"
-    assert state["project_runtime"]["checkout_ref"] == "3.46.23"
+    assert state["project_workspace"]["projects"]["allspark"]["checkout_ref"] == "3.46.23"
     assert state["missing_items"] == ["order_id"]
 
     keyword_package = json.loads(Path(manifest["keyword_package_round1"]).read_text(encoding="utf-8"))

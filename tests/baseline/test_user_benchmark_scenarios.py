@@ -343,7 +343,9 @@ async def test_ones_150552_pipeline_materializes_dsl_trace_and_runtime_card_cont
         runtime_context = {
             "running_project": "allspark",
             "project_path": r"D:\standard\riot\allspark",
+            "source_path": r"D:\standard\riot\allspark",
             "execution_path": str(session_dir / "worktrees" / "allspark" / "ones-3.52.0"),
+            "worktree_path": str(session_dir / "worktrees" / "allspark" / "ones-3.52.0"),
             "current_branch": "release/3.46.x",
             "current_commit_sha": "5ed0956073b6",
             "current_version": "3.46",
@@ -364,17 +366,28 @@ async def test_ones_150552_pipeline_materializes_dsl_trace_and_runtime_card_cont
             "workspace_scope": "session",
         }
         Path(runtime_context["execution_path"]).mkdir(parents=True, exist_ok=True)
-        (request.workspace_path / "input" / "project_runtime_context.json").write_text(
-            json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
+        project_workspace = {
+            "schema_version": "1.0",
+            "workspace_scope": "session",
+            "session_dir": str(session_dir),
+            "workspace_dir": str(request.workspace_path),
+            "worktrees_dir": str(session_dir / "worktrees"),
+            "active_project": "allspark",
+            "project_order": ["allspark"],
+            "projects": {"allspark": runtime_context},
+        }
+        (session_dir / "project_workspace.json").write_text(
+            json.dumps(project_workspace, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        (request.workspace_path / "output" / "project_runtime_context.json").write_text(
-            json.dumps(runtime_context, ensure_ascii=False, indent=2) + "\n",
+        (request.workspace_path / "input" / "project_workspace.json").write_text(
+            json.dumps(project_workspace, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         project_context_path = request.workspace_path / "input" / "project_context.json"
         project_context = json.loads(project_context_path.read_text(encoding="utf-8"))
-        project_context["project_runtime"] = runtime_context
+        project_context["project_workspace"] = project_workspace
+        project_context["project_workspace_path"] = str(session_dir / "project_workspace.json")
         project_context_path.write_text(
             json.dumps(project_context, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -545,10 +558,9 @@ async def test_ones_150552_pipeline_materializes_dsl_trace_and_runtime_card_cont
         "运行上下文",
         "allspark",
         "3.52.0",
-        "目标分支：master",
-        "主仓库分支：release/3.46.x",
+        "检出 `3.52.0`",
+        "主仓库 `release/3.46.x`",
         "Worktree",
-        "Worktree 版本：3.52.0",
         "a7916525f8d1 / 3.52.0",
     ):
         assert expected in card_text

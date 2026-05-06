@@ -366,6 +366,7 @@ class AgentClient(CodexRuntimeMixin):
         model: Optional[str] = None,
         runtime: Optional[str] = None,
         image_paths: list[str] | None = None,
+        cwd: str | None = None,
     ) -> dict[str, Any]:
         """Run agent to completion. Returns {"text": ..., "session_id": ...}."""
         resolved_runtime = self._resolve_runtime(runtime)
@@ -380,6 +381,7 @@ class AgentClient(CodexRuntimeMixin):
                     session_id=session_id,
                     skill=skill,
                     model=model,
+                    cwd=cwd,
                     scope="orchestrator",
                     orchestrator_mode=True,
                     image_paths=image_paths,
@@ -397,6 +399,7 @@ class AgentClient(CodexRuntimeMixin):
                 return await self._run_cli_resume(
                     prompt=prompt,
                     session_id=session_id,
+                    cwd=cwd,
                     model=selected_model,
                     max_turns=max_turns,
                     system_prompt=system_prompt or None,
@@ -408,6 +411,7 @@ class AgentClient(CodexRuntimeMixin):
                 session_id=session_id,
                 skill=skill,
                 model=model,
+                project_cwd=cwd,
                 orchestrator_mode=True,
             )
             return await self._run_sdk_query(

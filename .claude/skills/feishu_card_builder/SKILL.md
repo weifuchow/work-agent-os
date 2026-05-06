@@ -50,6 +50,26 @@ When uncertain:
   "missing_items": ["还缺什么"],
   "next_steps": ["下一步"],
   "sections": [{"title": "结论", "content": "内容"}],
+  "steps": [
+    {"title": "收到前端订阅请求", "detail": "网关建立 WebSocket 连接并校验参数"}
+  ],
+  "mermaid": "flowchart TD\nA[\"开始\"]-->B[\"结束\"]",
+  "flowcharts": [
+    {
+      "title": "WebSocket 数据链路",
+      "description": "从前端订阅到后端推送的关键路径。",
+      "source": "flowchart TD\nA[\"前端订阅\"]-->B[\"后端鉴权\"]"
+    }
+  ],
+  "code_blocks": [
+    {
+      "title": "轻量车辆帧 DTO",
+      "path": "packages/presentation/src/main/java/.../RobotLiteDTO.java",
+      "language": "java",
+      "code": "public record RobotLiteDTO(...) {}",
+      "note": "只保留地图渲染必要字段"
+    }
+  ],
   "table": {
     "columns": [{"key": "fact", "label": "事实"}],
     "rows": [{"fact": "已确认"}]
@@ -96,9 +116,9 @@ When uncertain:
 `structured_summary`、调试信息、artifact 路径、skill metadata 或其他非飞书字段放进
 `reply.payload` 根节点。需要机器可读摘要时，写入 `workspace/output` 的独立 JSON，或只在
 Markdown 回复的 `reply.payload.structured_summary` 中保留。飞书会拒绝未知的卡片根字段。
-如果 `workspace/input/project_context.json` 中存在 `project_runtime`，ONES/现场问题卡片必须包含
-“运行上下文”区块：项目名、版本来源、normalized_version、checkout_ref/target_branch、
-current_branch、execution_path 或 recommended_worktree、execution_version/execution_describe，
+如果 `workspace/input/project_workspace.json` 或 `project_context.json.project_workspace` 中存在已加载项目，
+ONES/现场问题卡片必须包含“运行上下文”区块：本次实际使用的项目名、版本来源、normalized_version、
+checkout_ref/target_branch、current_branch、worktree_path/execution_path、execution_version/execution_describe，
 以及 execution_commit_sha/current_commit_sha。
 
 ## Summary Rules
@@ -109,6 +129,16 @@ current_branch、execution_path 或 recommended_worktree、execution_version/exe
 - `facts` 只放已确认事实，不放推测。
 - `missing_items` 用于补料清单，不能混进结论。
 - `next_steps` 必须是可执行动作。
+- 涉及流程、链路、时序、状态流转、调用顺序、排障步骤、跨项目协作步骤时，优先输出 Mermaid 流程图：
+  - 简单场景可直接填 `mermaid`。
+  - 多张图使用 `flowcharts`，每项写清 `title/description/source`。
+  - 同时需要文字步骤时使用 `steps`，不要只堆普通段落。
+  - Mermaid 源码必须可被 mermaid-cli 解析；含中文、空格、箭头、括号、斜杠、冒号或等号的节点标签用双引号包住，
+    例如 `A["actuator存在 -> nextStage(Cancel)"]`。
+  - 飞书发送前会把 ` ```mermaid ` 块渲染成图片；不要把流程图放进 `code_blocks`。
+- 需要展示代码时，优先使用 `code_blocks`；每个代码块写清 `title/path/language/code/note`。
+  不要把大段代码混在普通正文里。代码片段应控制在关键方法或关键类型，避免整文件粘贴。
+  如果上游只能提供 Markdown 代码块，也可以放在 section `content` 中，渲染器会拆成独立代码展板。
 - 不要在这个 skill 内重新检索日志、读取工单或调用项目分析；需要这些能力时交给上游业务 skill。
 
 ## Scripts

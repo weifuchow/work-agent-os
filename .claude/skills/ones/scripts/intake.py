@@ -936,9 +936,19 @@ def persist_ones_context_to_state(
 
                 runtime_context = resolve_project_runtime_context(project_name, ones_result=ones_result)
                 if runtime_context:
-                    state["project_runtime"] = runtime_context.to_payload()
+                    runtime_payload = runtime_context.to_payload()
+                    runtime_payload.setdefault("name", project_name)
+                    runtime_payload.setdefault("source_path", runtime_payload.get("project_path", ""))
+                    runtime_payload.setdefault("worktree_path", runtime_payload.get("execution_path", ""))
+                    state["project_workspace"] = {
+                        "schema_version": "1.0",
+                        "workspace_scope": "triage",
+                        "active_project": project_name,
+                        "project_order": [project_name],
+                        "projects": {project_name: runtime_payload},
+                    }
             except Exception as e:
-                logger.warning("ONES intake: failed to persist project runtime context for {}: {}", project_name, e)
+                logger.warning("ONES intake: failed to persist project workspace context for {}: {}", project_name, e)
         state["updated_at"] = datetime.now().isoformat()
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except Exception as e:
