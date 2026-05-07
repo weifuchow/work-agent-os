@@ -202,3 +202,110 @@ async def test_dispatch_to_project_correction_turn_resets_saved_triage_session(t
 
     assert captured["skill"] == "riot-log-triage"
     assert captured["session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_project_keeps_agent_sessions_project_scoped(tmp_path, monkeypatch):
+    from core.artifacts.session_init import initialize_session_workspace
+    from core.orchestrator import agent_client as agent_client_mod
+    from core.app import project_workspace as project_workspace_mod
+    import core.projects as projects_mod
+
+    monkeypatch.setattr(agent_client_mod, "PROJECT_ROOT", tmp_path)
+    db_dir = tmp_path / "data" / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "app.sqlite"
+
+    session_dir = tmp_path / "data" / "sessions" / "session-88"
+    initialize_session_workspace(session_dir / "workspace", 88)
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript(_SCHEMA)
+        await db.execute(
+            "INSERT INTO sessions (id, project, agent_runtime, agent_session_id, analysis_mode, analysis_workspace, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (88, "", "codex", "orchestrator-session", 0, str(session_dir), datetime.now().isoformat()),
+        )
+        await db.commit()
+
+    projects = {
+        "allspark": SimpleNamespace(name="allspark", path=tmp_path / "repo" / "allspark", description="backend"),
+        "riot-frontend-v3": SimpleNamespace(name="riot-frontend-v3", path=tmp_path / "repo" / "riot-frontend-v3", description="frontend"),
+    }
+    for project in projects.values():
+        project.path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(projects_mod, "get_project", lambda name: projects.get(name))
+    monkeypatch.setattr(
+        projects_mod,
+        "merge_skills",
+        lambda *args, **kwargs: {},
+    )
+
+    def fake_prepare_project_runtime_context(project_name, ones_result=None, worktree_root=None, worktree_token=""):
+        execution_path = Path(worktree_root) / project_name / "stable-main"
+        execution_path.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(
+            execution_path=execution_path,
+            to_payload=lambda: {
+                "running_project": project_name,
+                "project_path": str(projects[project_name].path),
+                "execution_path": str(execution_path),
+                "worktree_path": str(execution_path),
+                "checkout_ref": "main",
+                "execution_commit_sha": f"{project_name}-sha",
+                "execution_version": "test-version",
+            },
+        )
+
+    monkeypatch.setattr(
+        project_workspace_mod,
+        "prepare_project_runtime_context",
+        fake_prepare_project_runtime_context,
+    )
+
+    calls: list[dict[str, object]] = []
+    returned = iter(["allspark-session-1", "frontend-session-1", "allspark-session-2"])
+
+    async def fake_run_for_project(**kwargs):
+        calls.append(kwargs)
+        return {"text": "project result", "session_id": next(returned), "cost_usd": 0.0}
+
+    monkeypatch.setattr(agent_client_mod.agent_client, "get_active_runtime", lambda: "codex")
+    monkeypatch.setattr(agent_client_mod.agent_client, "run_for_project", fake_run_for_project)
+
+    first = await agent_client_mod.dispatch_to_project.handler({
+        "project_name": "allspark",
+        "task": "分析后端",
+        "session_id": "orchestrator-session",
+        "db_session_id": 88,
+    })
+    second = await agent_client_mod.dispatch_to_project.handler({
+        "project_name": "riot-frontend-v3",
+        "task": "分析前端",
+        "session_id": "orchestrator-session",
+        "db_session_id": 88,
+    })
+    third = await agent_client_mod.dispatch_to_project.handler({
+        "project_name": "allspark",
+        "task": "继续分析后端",
+        "db_session_id": 88,
+    })
+
+    assert calls[0]["session_id"] is None
+    assert first["resume_source"] == ""
+    assert calls[1]["session_id"] is None
+    assert second["resume_source"] == ""
+    assert calls[2]["session_id"] == "allspark-session-1"
+    assert third["resume_source"] == "project_workspace"
+
+    payload = json.loads((session_dir / "project_workspace.json").read_text(encoding="utf-8"))
+    project_sessions = payload["agent_sessions"]["projects"]
+    assert project_sessions["allspark"]["session_id"] == "allspark-session-2"
+    assert project_sessions["riot-frontend-v3"]["session_id"] == "frontend-session-1"
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT agent_session_id, project FROM sessions WHERE id = 88")
+        row = await cursor.fetchone()
+    assert row[0] == "orchestrator-session"
+    assert row[1] == "allspark"

@@ -128,7 +128,9 @@ class CodexRuntimeMixin:
             sections.append(
                 "## Runtime Notes\n"
                 "你运行在 Codex CLI 中，仓库内置本地 MCP 工具。"
-                "涉及项目路由或数据库读取时优先使用 MCP 工具。"
+                "主编排只做消息理解、项目路由和结果汇总。"
+                "涉及已注册项目、ONES、日志、项目代码或版本 worktree 时，必须调用 dispatch_to_project 进入项目子编排；"
+                "不要在主编排里直接用 shell/文件读取完成项目分析。"
             )
 
         sections.append(f"## User Task\n{prompt}")

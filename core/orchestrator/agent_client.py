@@ -45,6 +45,7 @@ from core.orchestrator.tools import (
     ORCHESTRATOR_MCP_SERVER,
     ORCHESTRATOR_TOOL_NAMES,
     ORCHESTRATOR_TOOLS,
+    PROJECT_MCP_SERVER,
     PROJECT_TOOL_NAMES,
     PROJECT_TOOLS,
     dispatch_to_project,
@@ -319,19 +320,22 @@ class AgentClient(CodexRuntimeMixin):
     ) -> ClaudeAgentOptions:
         from core.skill_registry import SKILL_REGISTRY
 
-        builtin_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+        if orchestrator_mode:
+            builtin_tools = []
+        else:
+            builtin_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
         # Agent-visible MCP tools stay side-effect-light. Platform delivery,
         # session writes, bot replies, and audit persistence are handled by
         # MessageProcessor/ResultHandler through core ports.
-        custom_tools = ORCHESTRATOR_TOOL_NAMES if orchestrator_mode else CUSTOM_TOOL_NAMES
+        custom_tools = ORCHESTRATOR_TOOL_NAMES if orchestrator_mode else PROJECT_TOOL_NAMES
         allowed = builtin_tools + custom_tools
         if exclude_tools:
             allowed = [t for t in allowed if t not in exclude_tools]
 
         selected_model = self._select_model(model)
 
-        mcp = ORCHESTRATOR_MCP_SERVER if orchestrator_mode else CUSTOM_MCP_SERVER
+        mcp = ORCHESTRATOR_MCP_SERVER if orchestrator_mode else PROJECT_MCP_SERVER
         opts = ClaudeAgentOptions(
             system_prompt=system_prompt or None,
             mcp_servers={"work-agent-tools": mcp},
@@ -548,7 +552,6 @@ class AgentClient(CodexRuntimeMixin):
                 skill=skill,
                 project_cwd=project_cwd,
                 project_agents=project_agents,
-                exclude_tools=[name for name in CUSTOM_TOOL_NAMES if name not in PROJECT_TOOL_NAMES],
                 model=model,
             )
             return await self._run_sdk_query(

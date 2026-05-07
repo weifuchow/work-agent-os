@@ -10,7 +10,7 @@ Real:        Claude API (haiku), pipeline, orchestrator, dispatch_to_project too
           Pipeline 将 thread_id 写入 session
   Turn 2+: 用户在话题内回复（incoming 消息携带 thread_id）
            Pipeline 通过 thread_id 路由到同一 session
-           → 有 agent_session_id+project → 直接 resume 项目 Agent
+           → 使用全局 agent_session_id resume 主编排 Agent
            → 无 project → orchestrator（新 turn）
 
 Scenario A — Project (allspark), 3 turns:
@@ -24,8 +24,8 @@ Scenario B — Non-project (music), 3 turns:
   3. 分析一下他们为什么抓人      ← 携带 thread_id
 
 Success criteria:
-  A: Turn 1 → session.project=="allspark", agent_session_id 非空
-     Turn 2/3 → agent_session_id 与 Turn 1 完全一致（claude --resume 正确 ID）
+  A: Turn 1 → session.project=="allspark", 主编排 agent_session_id 非空
+     Turn 2/3 → 主编排 agent_session_id 与 Turn 1 完全一致
      全程同一 DB session，3 次飞书回复
   B: 全程 session.project==""
      agent_session_id 在 Turn 1 后设定，Turn 2/3 保持不变（只写一次保证）
@@ -251,14 +251,15 @@ async def test_scenario_a_project_allspark_routing():
     3-turn allspark conversation.
 
     Turn 1: Orchestrator must identify allspark → call dispatch_to_project tool
-            → dispatch writes agent_session_id + project to session
-    Turn 2: Pipeline detects agent_session_id+project → _run_project_agent(resume)
+            → dispatch writes project to session and project-scoped agent session
+    Turn 2: Pipeline routes by thread_id → resumes orchestrator; dispatch resumes
+            the allspark project agent from project_workspace.agent_sessions
     Turn 3: Same, resume continues
 
     Key assertions:
       - session.project == "allspark" after turn 1
-      - session.agent_session_id is set and non-empty after turn 1
-      - Turns 2 and 3 use the same agent_session_id (resume, not new session)
+      - session.agent_session_id is set and non-empty after turn 1 for orchestrator resume
+      - Turns 2 and 3 keep the same orchestrator agent_session_id
       - All 3 turns share the same DB session
     """
     print("\n" + "=" * 60)
@@ -275,15 +276,15 @@ async def test_scenario_a_project_allspark_routing():
         f"Orchestrator did not route to allspark. Check system prompt project list."
     )
     assert t1["agent_session_id"], (
-        "Turn 1: agent_session_id not set after dispatch.\n"
-        "dispatch_to_project tool may not have written back to session."
+        "Turn 1: orchestrator agent_session_id not set.\n"
+        "The main agent runtime may not have written back to session."
     )
     assert t1["reply"], "Turn 1: no reply content saved to DB"
 
     agent_sid_after_t1 = t1["agent_session_id"]
     print(f"\n  ✓ Turn 1 routed to allspark, agent_session_id={agent_sid_after_t1!r}")
 
-    # Turn 2 — same thread, should resume project agent
+    # Turn 2 — same thread, should resume orchestrator and project-scoped agent
     assert thread_id, "No thread_id after turn 1 — pipeline must bind thread_id on first reply"
     t2 = await _run_turn(2, "简单项目支持的数据源", thread_id=thread_id)
 
@@ -292,12 +293,12 @@ async def test_scenario_a_project_allspark_routing():
     assert t2["project"] == "allspark"
     assert t2["agent_session_id"] == agent_sid_after_t1, (
         f"Turn 2: agent_session_id changed!\n"
-        f"  Expected (resume): {agent_sid_after_t1!r}\n"
+        f"  Expected orchestrator resume: {agent_sid_after_t1!r}\n"
         f"  Got:               {t2['agent_session_id']!r}\n"
-        f"This means `claude --resume` used the wrong session."
+        f"This means the main agent resume id changed unexpectedly."
     )
 
-    print(f"  ✓ Turn 2 resumed project agent (same agent_session_id)")
+    print(f"  ✓ Turn 2 kept orchestrator agent_session_id stable")
 
     # Turn 3 — same thread, continue resume
     t3 = await _run_turn(3, "这个项目 sqlserver 怎么配置", thread_id=thread_id)
@@ -311,7 +312,7 @@ async def test_scenario_a_project_allspark_routing():
     )
     assert t3["reply"]
 
-    print(f"  ✓ Turn 3 resumed project agent (same agent_session_id)")
+    print(f"  ✓ Turn 3 kept orchestrator agent_session_id stable")
 
     # --- Summary ---
     print(f"\n{'─' * 60}")

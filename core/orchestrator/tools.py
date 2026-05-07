@@ -513,21 +513,24 @@ async def prepare_project_worktree_tool(input: dict) -> dict[str, Any]:
 @tool(
     "dispatch_to_project",
     "将任务派发到指定项目的 Agent，在该项目目录下执行，使用该项目的 skills。"
-    "如果提供 session_id（会话上下文中的 agent_session_id），则恢复之前的对话上下文，实现多轮交互。"
-    "返回项目 Agent 的输出结果和 session_id（下次 resume 用）。",
+    "通常不要传 session_id；提供 db_session_id 后，工具会按 project_name 从 project_workspace.agent_sessions.projects 恢复对应项目上下文。"
+    "只有当你明确拿到同一项目、同一 worktree 的项目级 session_id 时才传 session_id。"
+    "返回项目 Agent 的输出结果和项目级 session_id。",
     {"type": "object", "properties": {
         "project_name": {"type": "string", "description": "projects.yaml 中注册的项目名称"},
         "task": {"type": "string", "description": "要派发给项目 Agent 的任务描述（详细）"},
         "context": {"type": "string", "description": "消息的原始内容和背景信息，供项目 Agent 参考"},
-        "session_id": {"type": "string", "description": "上次 dispatch 返回的 session_id，传入则恢复上下文（多轮对话）"},
-        "db_session_id": {"type": "integer", "description": "DB 会话 ID，用于持久化 agent_session_id"},
+        "session_id": {"type": "string", "description": "可选：同一项目、同一 worktree 的项目级 session_id。不要传 workspace/input/session.json 里的全局 agent_session_id"},
+        "db_session_id": {"type": "integer", "description": "DB 会话 ID，用于读取/持久化项目级 Agent session"},
     }, "required": ["project_name", "task"]},
 )
 async def dispatch_to_project(input: dict) -> dict[str, Any]:
     from core.orchestrator.agent_client import agent_client
     from core.app.project_workspace import (
         build_project_workspace_prompt_block,
+        get_project_agent_session_id,
         prepare_project_from_session_workspace_path,
+        save_project_agent_session,
     )
     from core.projects import get_project, merge_skills, prepare_project_runtime_context
     from core.skill_registry import SKILL_REGISTRY
@@ -620,10 +623,11 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             }
     runtime_block = build_project_workspace_prompt_block(project_workspace)
     selected_skill = None
-    selected_session_id = resume_session_id
+    selected_session_id = str(resume_session_id or "").strip() or None
     triage_state_path = None
     triage_state = None
-    persist_agent_session_to_db = True
+    triage_agent_context_active = False
+    project_agent_session_source = "input" if selected_session_id else ""
 
     if analysis_mode and analysis_workspace:
         triage_state_path = Path(analysis_workspace) / "00-state.json"
@@ -639,16 +643,38 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         )
         state_skill = str(agent_context.get("skill") or "").strip()
         if state_skill and state_skill in merged_agents:
+            triage_agent_context_active = True
             selected_skill = state_skill
             selected_session_id = str(agent_context.get("session_id") or "").strip() or None
             if _is_correction_turn(task=task, context=context):
                 selected_session_id = None
-            persist_agent_session_to_db = False
+            project_agent_session_source = "triage_state" if selected_session_id else ""
             merged_agents = {
                 name: definition
                 for name, definition in merged_agents.items()
                 if name == selected_skill or name != "ones"
             }
+
+    if not triage_agent_context_active and project_workspace:
+        saved_project_session_id = get_project_agent_session_id(
+            project_workspace,
+            project_name,
+            runtime=runtime,
+        )
+        if selected_session_id:
+            if selected_session_id == saved_project_session_id:
+                project_agent_session_source = "input"
+            elif db_session_id and session_workspace_path:
+                logger.warning(
+                    "Ignoring unregistered project session_id for project {} in DB session {}",
+                    project_name,
+                    db_session_id,
+                )
+                selected_session_id = saved_project_session_id
+                project_agent_session_source = "project_workspace" if selected_session_id else ""
+        elif saved_project_session_id:
+            selected_session_id = saved_project_session_id
+            project_agent_session_source = "project_workspace"
 
     # List project-specific skills for the prompt
     project_only = list(merged_agents)
@@ -697,7 +723,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         )
 
         new_session_id = result.get("session_id")
-        if triage_state_path and isinstance(triage_state, dict):
+        saved_project_agent_session: dict[str, Any] = {}
+        if triage_agent_context_active and triage_state_path and isinstance(triage_state, dict):
             agent_context = triage_state.setdefault("agent_context", {})
             if isinstance(agent_context, dict):
                 if new_session_id:
@@ -712,6 +739,13 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                 )
             except OSError as e:
                 logger.warning("Failed to persist triage agent context: {}", e)
+        elif new_session_id and session_workspace_path:
+            saved_project_agent_session = save_project_agent_session(
+                session_workspace_path=session_workspace_path,
+                project_name=project_name,
+                session_id=str(new_session_id),
+                runtime=runtime,
+            )
 
         # Update dispatch AgentRun with result
         if dispatch_run_id:
@@ -727,15 +761,13 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             except Exception as e:
                 logger.warning("Failed to update dispatch AgentRun: {}", e)
 
-        # Persist the SDK session_id and project to DB session for future resume
+        # Persist only coarse session metadata here. Project agent resume ids are
+        # scoped by project in project_workspace.agent_sessions.projects.
         if db_session_id:
             try:
                 async with aiosqlite.connect(str(db_path)) as db:
                     updates = ["project = ?", "agent_runtime = ?", "updated_at = ?"]
                     params = [project_name, runtime, datetime.now().isoformat()]
-                    if new_session_id and persist_agent_session_to_db:
-                        updates.append("agent_session_id = ?")
-                        params.append(new_session_id)
                     params.append(db_session_id)
                     await db.execute(
                         f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?",
@@ -749,6 +781,10 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             "project": project_name,
             "result": result.get("text", ""),
             "session_id": new_session_id,
+            "resume_session_id": selected_session_id,
+            "resume_source": project_agent_session_source,
+            "agent_session_scope": "triage" if triage_agent_context_active else "project",
+            "project_agent_session": saved_project_agent_session,
         }
     except Exception as e:
         logger.exception("dispatch_to_project failed for {}: {}", project_name, e)
@@ -795,6 +831,12 @@ CUSTOM_MCP_SERVER = create_sdk_mcp_server(
     name="work-agent-tools",
     version="1.0.0",
     tools=CUSTOM_TOOLS,
+)
+
+PROJECT_MCP_SERVER = create_sdk_mcp_server(
+    name="work-agent-tools",
+    version="1.0.0",
+    tools=PROJECT_TOOLS,
 )
 
 CUSTOM_TOOL_NAMES = [f"mcp__work-agent-tools__{t.name}" for t in CUSTOM_TOOLS]

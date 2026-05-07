@@ -408,6 +408,63 @@ async def test_ones_reference_skips_direct_project_context(harness, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_ones_project_context_updates_session_and_prevents_followup_reload(harness, monkeypatch):
+    db_file = harness["db_file"]
+    direct_calls = 0
+
+    async def fake_ones_prefetch(ctx, workspace, *, runtime):
+        return SimpleNamespace(
+            project_context={
+                "running_project": "allspark",
+                "execution_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "150738-3.52.0"),
+                "worktree_path": str(Path(workspace.artifact_roots["worktrees_dir"]) / "allspark" / "150738-3.52.0"),
+                "checkout_ref": "3.52.0",
+                "execution_commit_sha": "a7916525f8d1",
+                "loaded_reason": "ones_intake",
+            },
+            to_audit_detail=lambda: {
+                "reference": "#150738",
+                "fetched": True,
+                "summary_snapshot_json": str(workspace.path / ".ones" / "summary_snapshot.json"),
+                "project_context": {"running_project": "allspark", "loaded_reason": "ones_intake"},
+            },
+        )
+
+    def fake_direct_project_context(ctx, workspace):
+        nonlocal direct_calls
+        direct_calls += 1
+        return {"running_project": "allspark"}
+
+    monkeypatch.setattr("core.app.message_processor.prepare_ones_intake", fake_ones_prefetch)
+    monkeypatch.setattr("core.app.message_processor.prepare_direct_project_context", fake_direct_project_context)
+
+    first_id = await insert_message(
+        db_file,
+        content="#150738 【3.52.0】【性能】【交管】：资源提前释放，导致撞车",
+    )
+    await process_message(first_id)
+    first = await fetch_one(db_file, "SELECT * FROM messages WHERE id = ?", (first_id,))
+    first_session = await fetch_one(db_file, "SELECT * FROM sessions WHERE id = ?", (first["session_id"],))
+
+    assert first_session["project"] == "allspark"
+    assert direct_calls == 0
+
+    second_id = await insert_message(
+        db_file,
+        content="为什么 10589 在 15:41:13.295 起释放 node-map-1.100076",
+        thread_id=first_session["thread_id"],
+    )
+    await process_message(second_id)
+
+    assert direct_calls == 0
+    audits = await fetch_all(db_file, "SELECT event_type, target_id FROM audit_logs ORDER BY id")
+    assert not [
+        item for item in audits
+        if item["event_type"] == "project_workspace_prepared" and item["target_id"] == str(second_id)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_feishu_thread_reuses_triaged_session_for_followup_attachment(harness, tmp_path):
     db_file = harness["db_file"]
     first_id = await insert_message(

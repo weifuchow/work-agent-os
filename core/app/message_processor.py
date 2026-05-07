@@ -121,6 +121,31 @@ class MessageProcessor:
             has_ones_reference = bool(extract_ones_reference(str(msg.get("content") or "")))
             ones_prefetch = await prepare_ones_intake(ctx, workspace, runtime=runtime)
             if ones_prefetch:
+                project_context = (
+                    ones_prefetch.project_context
+                    if isinstance(getattr(ones_prefetch, "project_context", None), dict)
+                    else {}
+                )
+                running_project = str(project_context.get("running_project") or "").strip()
+                if session_id and running_project:
+                    await self.deps.repository.update_session_patch(
+                        session_id,
+                        {
+                            "project": running_project,
+                            "analysis_workspace": str(workspace.artifact_roots.get("session_dir") or workspace.path.parent),
+                        },
+                        now=self.deps.clock.now_iso(),
+                    )
+                    ctx = MessageContext(
+                        message=ctx.message,
+                        session={
+                            **(ctx.session or {}),
+                            "project": running_project,
+                            "analysis_workspace": str(workspace.artifact_roots.get("session_dir") or workspace.path.parent),
+                        },
+                        history=ctx.history,
+                        attempt=ctx.attempt,
+                    )
                 await self.deps.repository.audit(
                     "ones_intake_prepared",
                     target_type="message",

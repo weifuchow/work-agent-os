@@ -33,10 +33,11 @@ class OnesPrefetchResult:
     image_findings_count: int = 0
     task_number: str = ""
     task_uuid: str = ""
+    project_context: dict[str, Any] | None = None
     error: str = ""
 
     def to_audit_detail(self) -> dict[str, Any]:
-        return {
+        detail = {
             "reference": self.reference,
             "fetched": self.fetched,
             "summary_snapshot_json": self.summary_snapshot_json,
@@ -47,6 +48,15 @@ class OnesPrefetchResult:
             "task_uuid": self.task_uuid,
             "error": self.error,
         }
+        if self.project_context:
+            detail["project_context"] = {
+                "running_project": self.project_context.get("running_project") or "",
+                "execution_path": self.project_context.get("execution_path") or self.project_context.get("worktree_path") or "",
+                "checkout_ref": self.project_context.get("checkout_ref") or "",
+                "execution_commit_sha": self.project_context.get("execution_commit_sha") or "",
+                "loaded_reason": self.project_context.get("loaded_reason") or "",
+            }
+        return detail
 
 
 async def prepare_ones_intake(
@@ -88,7 +98,12 @@ async def prepare_ones_intake(
         ones_result=ones_result,
     )
 
-    return _result_from_snapshot(reference, snapshot, fetched=True)
+    return _result_from_snapshot(
+        reference,
+        snapshot,
+        fetched=True,
+        project_context=runtime_context if isinstance(runtime_context, dict) else None,
+    )
 
 
 def extract_ones_reference(content: str) -> str:
@@ -360,7 +375,13 @@ def _reference_token(reference: str) -> str:
     return reference.lstrip("#").strip()
 
 
-def _result_from_snapshot(reference: str, snapshot: dict[str, Any], *, fetched: bool) -> OnesPrefetchResult:
+def _result_from_snapshot(
+    reference: str,
+    snapshot: dict[str, Any],
+    *,
+    fetched: bool,
+    project_context: dict[str, Any] | None = None,
+) -> OnesPrefetchResult:
     source = snapshot.get("source") or {}
     downloaded = snapshot.get("downloaded_files") or []
     task_number = ""
@@ -383,4 +404,5 @@ def _result_from_snapshot(reference: str, snapshot: dict[str, Any], *, fetched: 
         image_findings_count=len(snapshot.get("image_findings") or []),
         task_number=task_number,
         task_uuid=task_uuid,
+        project_context=project_context,
     )

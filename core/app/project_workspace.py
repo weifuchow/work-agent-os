@@ -14,6 +14,7 @@ from core.projects import ProjectRuntimeContext, get_projects, prepare_project_r
 
 PROJECT_WORKSPACE_SCHEMA_VERSION = "1.0"
 PROJECT_WORKSPACE_FILENAME = "project_workspace.json"
+AGENT_SESSIONS_KEY = "agent_sessions"
 
 
 def project_workspace_path(workspace: PreparedWorkspace) -> Path:
@@ -131,6 +132,114 @@ def persist_project_runtime(
     return entry
 
 
+def project_agent_session_entry(
+    project_workspace: dict[str, Any] | None,
+    project_name: str,
+    *,
+    runtime: str = "",
+    role: str = "project",
+) -> dict[str, Any]:
+    """Return the saved project agent session when it still matches the worktree."""
+
+    if not project_workspace:
+        return {}
+    projects = project_workspace.get("projects")
+    if not isinstance(projects, dict):
+        return {}
+    project_entry = projects.get(project_name)
+    if not isinstance(project_entry, dict):
+        return {}
+
+    agent_sessions = project_workspace.get(AGENT_SESSIONS_KEY)
+    if not isinstance(agent_sessions, dict):
+        return {}
+    project_sessions = agent_sessions.get("projects")
+    if not isinstance(project_sessions, dict):
+        return {}
+    saved = project_sessions.get(project_name)
+    if not isinstance(saved, dict):
+        return {}
+    if role and str(saved.get("role") or "project") != role:
+        return {}
+    if runtime and str(saved.get("runtime") or "") != runtime:
+        return {}
+    if not str(saved.get("session_id") or "").strip():
+        return {}
+    if not _agent_session_matches_project(saved, project_entry):
+        return {}
+    return dict(saved)
+
+
+def get_project_agent_session_id(
+    project_workspace: dict[str, Any] | None,
+    project_name: str,
+    *,
+    runtime: str = "",
+    role: str = "project",
+) -> str | None:
+    entry = project_agent_session_entry(
+        project_workspace,
+        project_name,
+        runtime=runtime,
+        role=role,
+    )
+    session_id = str(entry.get("session_id") or "").strip()
+    return session_id or None
+
+
+def save_project_agent_session(
+    *,
+    session_workspace_path: Path,
+    project_name: str,
+    session_id: str,
+    runtime: str,
+    role: str = "project",
+    skill: str = "",
+) -> dict[str, Any]:
+    """Persist a project-scoped agent session id in project_workspace.json."""
+
+    workspace = _workspace_from_session_workspace_path(session_workspace_path)
+    if not workspace:
+        return {}
+
+    payload = ensure_project_workspace(workspace)
+    projects = payload.get("projects")
+    if not isinstance(projects, dict):
+        return {}
+    project_entry = projects.get(project_name)
+    if not isinstance(project_entry, dict):
+        return {}
+
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {}
+
+    agent_sessions = payload.setdefault(AGENT_SESSIONS_KEY, {})
+    if not isinstance(agent_sessions, dict):
+        agent_sessions = {}
+        payload[AGENT_SESSIONS_KEY] = agent_sessions
+    project_sessions = agent_sessions.setdefault("projects", {})
+    if not isinstance(project_sessions, dict):
+        project_sessions = {}
+        agent_sessions["projects"] = project_sessions
+
+    saved = {
+        "session_id": session_id,
+        "runtime": str(runtime or ""),
+        "role": role,
+        "skill": str(skill or ""),
+        "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or ""),
+        "execution_path": str(project_entry.get("execution_path") or project_entry.get("worktree_path") or ""),
+        "checkout_ref": str(project_entry.get("checkout_ref") or ""),
+        "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
+        "execution_version": str(project_entry.get("execution_version") or ""),
+        "project_path": str(project_entry.get("project_path") or project_entry.get("source_path") or ""),
+    }
+    project_sessions[project_name] = saved
+    _persist_project_workspace(workspace, payload)
+    return saved
+
+
 def active_project_entry(project_workspace: dict[str, Any]) -> dict[str, Any]:
     active = str(project_workspace.get("active_project") or "").strip()
     projects = project_workspace.get("projects") if isinstance(project_workspace, dict) else {}
@@ -151,6 +260,8 @@ def build_project_workspace_prompt_block(project_workspace: dict[str, Any] | Non
         + json.dumps(project_workspace, ensure_ascii=False, indent=2)
         + "\n\n处理项目问题时，必须在 session worktrees 中工作："
         "source_path/project_path 只表示源仓库登记位置，不作为分析或修改目录。"
+        "project_workspace.agent_sessions.projects 保存项目级 Agent resume id，必须按项目名、runtime 和 worktree/commit 匹配后才能复用；"
+        "不要把一个项目的 Agent session_id 用到另一个项目。"
         "如果问题涉及尚未加载的相关项目，先调用 prepare_project_worktree，"
         "把该项目加载到 project_workspace.projects 后再检索。"
         "最终回复必须说明本次实际使用的项目、worktree、分支/Tag/版本和提交。"
@@ -179,6 +290,7 @@ def _empty_project_workspace_payload(artifact_roots: dict[str, str]) -> dict[str
         "active_project": "",
         "project_order": [],
         "projects": {},
+        AGENT_SESSIONS_KEY: {"projects": {}},
         "available_projects": _available_project_entries(),
         "policy": {
             "work_directory": "session_worktree",
@@ -202,6 +314,10 @@ def _normalize_project_workspace_payload(
         normalized["projects"] = {}
     if not isinstance(normalized.get("project_order"), list):
         normalized["project_order"] = list(normalized["projects"])
+    if not isinstance(normalized.get(AGENT_SESSIONS_KEY), dict):
+        normalized[AGENT_SESSIONS_KEY] = {"projects": {}}
+    elif not isinstance(normalized[AGENT_SESSIONS_KEY].get("projects"), dict):
+        normalized[AGENT_SESSIONS_KEY]["projects"] = {}
     normalized["available_projects"] = _available_project_entries()
     normalized.setdefault("policy", {})
     if isinstance(normalized["policy"], dict):
@@ -266,6 +382,26 @@ def _runtime_entry(
         }
     )
     return payload
+
+
+def _agent_session_matches_project(saved: dict[str, Any], project_entry: dict[str, Any]) -> bool:
+    comparisons = (
+        ("worktree_path", "worktree_path"),
+        ("execution_path", "execution_path"),
+        ("checkout_ref", "checkout_ref"),
+        ("execution_commit_sha", "execution_commit_sha"),
+    )
+    for saved_key, project_key in comparisons:
+        saved_value = str(saved.get(saved_key) or "").strip()
+        project_value = str(project_entry.get(project_key) or "").strip()
+        if saved_value and project_value and saved_value != project_value:
+            return False
+
+    saved_worktree = str(saved.get("worktree_path") or saved.get("execution_path") or "").strip()
+    project_worktree = str(project_entry.get("worktree_path") or project_entry.get("execution_path") or "").strip()
+    if saved_worktree and project_worktree and saved_worktree != project_worktree:
+        return False
+    return True
 
 
 def _persist_project_workspace(workspace: PreparedWorkspace, payload: dict[str, Any]) -> None:

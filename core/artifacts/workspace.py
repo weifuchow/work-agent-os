@@ -83,6 +83,7 @@ def _session_payload(session: dict[str, Any] | None) -> dict[str, Any]:
         "status": session.get("status") or "",
         "thread_id": session.get("thread_id") or "",
         "agent_session_id": session.get("agent_session_id") or "",
+        "agent_session_scope": "orchestrator",
         "agent_runtime": session.get("agent_runtime") or "",
         "summary_path": session.get("summary_path") or "",
         "last_active_at": _stringify_time(session.get("last_active_at") or ""),

@@ -584,7 +584,7 @@ def _feishu_reply_body(reply: ReplyPayload, client: FeishuClient | None = None) 
     reply_type = reply.type
     if reply_type == "feishu_card":
         payload = _sanitize_feishu_card_payload(reply.payload)
-        if payload and client is not None:
+        if payload:
             payload = _replace_mermaid_blocks_with_images(payload, client=client)
         if not payload:
             fallback = _safe_text_fallback(reply.content)
@@ -629,67 +629,127 @@ def _sanitize_feishu_card_payload(payload: Any) -> dict[str, Any]:
 _MERMAID_BLOCK_RE = re.compile(r"```mermaid\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
+class _ElementReplacement:
+    def __init__(self, elements: list[dict[str, Any]]) -> None:
+        self.elements = elements
+
+
 def _replace_mermaid_blocks_with_images(
     payload: dict[str, Any],
     *,
-    client: FeishuClient,
+    client: FeishuClient | None,
 ) -> dict[str, Any]:
-    body = payload.get("body")
-    if not isinstance(body, dict):
-        return payload
-    elements = body.get("elements")
-    if not isinstance(elements, list):
-        return payload
+    rewritten = _rewrite_mermaid_value(payload, client=client)
+    if isinstance(rewritten, dict):
+        return rewritten
+    return payload
 
-    changed = False
-    new_elements: list[dict[str, Any]] = []
-    for element in elements:
-        if not isinstance(element, dict):
-            continue
-        content = str(element.get("content") or "")
-        if element.get("tag") != "markdown" or "```mermaid" not in content.lower():
-            new_elements.append(element)
-            continue
 
-        changed = True
-        stripped = _MERMAID_BLOCK_RE.sub("", content).strip()
-        if stripped:
-            item = dict(element)
-            item["content"] = stripped
-            new_elements.append(item)
-
-        for index, match in enumerate(_MERMAID_BLOCK_RE.finditer(content), start=1):
-            mermaid_source = match.group(1).strip()
-            image_key = _render_and_upload_mermaid(mermaid_source, client=client)
-            if image_key:
-                new_elements.append({
-                    "tag": "img",
-                    "img_key": image_key,
-                    "alt": {
-                        "tag": "plain_text",
-                        "content": f"流程图 {index}",
-                    },
-                    "mode": "fit_horizontal",
-                })
+def _rewrite_mermaid_value(value: Any, *, client: FeishuClient | None) -> Any:
+    if isinstance(value, list):
+        rewritten_items: list[Any] = []
+        for item in value:
+            rewritten = _rewrite_mermaid_value(item, client=client)
+            if isinstance(rewritten, _ElementReplacement):
+                rewritten_items.extend(rewritten.elements)
             else:
-                new_elements.append({
-                    "tag": "markdown",
-                    "content": "**流程图**\n流程图渲染失败，已拦截原始 Mermaid 代码；请查看 session 产物中的 `.md` 流程图文件。",
-                    "text_align": "left",
-                    "text_size": "normal",
-                })
+                rewritten_items.append(rewritten)
+        return rewritten_items
 
-    if not changed:
-        return payload
-    updated = dict(payload)
-    updated_body = dict(body)
-    updated_body["elements"] = new_elements
-    updated["body"] = updated_body
-    return updated
+    if not isinstance(value, dict):
+        return value
+
+    tag = str(value.get("tag") or "").strip().lower()
+    if tag == "mermaid":
+        return _mermaid_element_to_image_or_fallback(value, client=client)
+
+    if tag == "markdown":
+        content = str(value.get("content") or "")
+        if "```mermaid" in content.lower():
+            return _ElementReplacement(
+                _markdown_mermaid_blocks_to_elements(value, client=client)
+            )
+
+    rewritten_dict: dict[str, Any] = {}
+    for key, item in value.items():
+        rewritten = _rewrite_mermaid_value(item, client=client)
+        rewritten_dict[key] = rewritten.elements if isinstance(rewritten, _ElementReplacement) else rewritten
+    return rewritten_dict
 
 
-def _render_and_upload_mermaid(mermaid_source: str, *, client: FeishuClient) -> str:
+def _markdown_mermaid_blocks_to_elements(
+    element: dict[str, Any],
+    *,
+    client: FeishuClient | None,
+) -> list[dict[str, Any]]:
+    content = str(element.get("content") or "")
+    elements: list[dict[str, Any]] = []
+    stripped = _MERMAID_BLOCK_RE.sub("", content).strip()
+    if stripped:
+        item = dict(element)
+        item["content"] = stripped
+        elements.append(item)
+
+    for index, match in enumerate(_MERMAID_BLOCK_RE.finditer(content), start=1):
+        mermaid_source = match.group(1).strip()
+        elements.append(
+            _mermaid_to_image_or_fallback(
+                mermaid_source,
+                title=f"流程图 {index}",
+                client=client,
+            )
+        )
+    return elements
+
+
+def _mermaid_element_to_image_or_fallback(
+    element: dict[str, Any],
+    *,
+    client: FeishuClient | None,
+) -> dict[str, Any]:
+    title = str(element.get("title") or element.get("name") or "流程图").strip()
+    source = _extract_mermaid_source(element)
+    return _mermaid_to_image_or_fallback(source, title=title, client=client)
+
+
+def _extract_mermaid_source(element: dict[str, Any]) -> str:
+    for key in ("source", "content", "code", "mermaid", "text"):
+        value = element.get(key)
+        if isinstance(value, str) and value.strip():
+            match = _MERMAID_BLOCK_RE.search(value)
+            return (match.group(1) if match else value).strip()
+    return ""
+
+
+def _mermaid_to_image_or_fallback(
+    mermaid_source: str,
+    *,
+    title: str,
+    client: FeishuClient | None,
+) -> dict[str, Any]:
+    image_key = _render_and_upload_mermaid(mermaid_source, client=client) if client else ""
+    if image_key:
+        return {
+            "tag": "img",
+            "img_key": image_key,
+            "alt": {
+                "tag": "plain_text",
+                "content": title[:80] or "流程图",
+            },
+            "mode": "fit_horizontal",
+        }
+    return {
+        "tag": "markdown",
+        "content": f"**{title or '流程图'}**\n流程图渲染失败，已拦截原始 Mermaid 代码；请查看 session 产物中的 `.md` 流程图文件。",
+        "text_align": "left",
+        "text_size": "normal",
+    }
+
+
+def _render_and_upload_mermaid(mermaid_source: str, *, client: FeishuClient | None) -> str:
     if not mermaid_source.strip():
+        return ""
+    if client is None:
         return ""
     image_path = _render_mermaid_png(mermaid_source)
     if not image_path:

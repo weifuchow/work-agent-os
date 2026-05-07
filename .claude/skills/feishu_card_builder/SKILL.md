@@ -135,6 +135,8 @@ checkout_ref/target_branch、current_branch、worktree_path/execution_path、exe
   - 同时需要文字步骤时使用 `steps`，不要只堆普通段落。
   - Mermaid 源码必须可被 mermaid-cli 解析；含中文、空格、箭头、括号、斜杠、冒号或等号的节点标签用双引号包住，
     例如 `A["actuator存在 -> nextStage(Cancel)"]`。
+  - 飞书卡片 payload 中禁止出现 `{"tag":"mermaid"}`。流程图只能通过 `mermaid` / `flowcharts[].source`
+    进入结构化摘要，渲染器输出 markdown 的 ` ```mermaid ` 块，发送前由 core 转成图片。
   - 飞书发送前会把 ` ```mermaid ` 块渲染成图片；不要把流程图放进 `code_blocks`。
 - 需要展示代码时，优先使用 `code_blocks`；每个代码块写清 `title/path/language/code/note`。
   不要把大段代码混在普通正文里。代码片段应控制在关键方法或关键类型，避免整文件粘贴。

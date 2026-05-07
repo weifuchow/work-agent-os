@@ -226,6 +226,104 @@ def test_mermaid_markdown_block_is_replaced_with_uploaded_image(monkeypatch, tmp
     assert elements[1]["img_key"] == "img_v3_flow"
 
 
+def test_direct_mermaid_card_element_is_replaced_with_uploaded_image(monkeypatch, tmp_path):
+    image = tmp_path / "direct-flow.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr("core.connectors.feishu._render_mermaid_png", lambda source: image)
+
+    client = SimpleNamespace(upload_image=lambda path: "img_v3_direct_flow")
+    payload = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "前置说明"},
+                {
+                    "tag": "mermaid",
+                    "title": "直接流程图",
+                    "source": "flowchart TD\nA-->B",
+                },
+            ]
+        },
+    }
+
+    card = _replace_mermaid_blocks_with_images(payload, client=client)
+    raw = json.dumps(card, ensure_ascii=False)
+
+    assert '"tag": "mermaid"' not in raw
+    assert card["body"]["elements"][1]["tag"] == "img"
+    assert card["body"]["elements"][1]["img_key"] == "img_v3_direct_flow"
+    assert card["body"]["elements"][1]["alt"]["content"] == "直接流程图"
+
+
+def test_direct_mermaid_card_element_falls_back_when_render_fails(monkeypatch):
+    monkeypatch.setattr("core.connectors.feishu._render_mermaid_png", lambda source: None)
+
+    client = SimpleNamespace(upload_image=lambda path: "never")
+    payload = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "elements": [
+                                {
+                                    "tag": "mermaid",
+                                    "title": "失败流程图",
+                                    "content": "```mermaid\nflowchart TD\nA-->B\n```",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+
+    card = _replace_mermaid_blocks_with_images(payload, client=client)
+    raw = json.dumps(card, ensure_ascii=False)
+    fallback = card["body"]["elements"][0]["columns"][0]["elements"][0]
+
+    assert '"tag": "mermaid"' not in raw
+    assert "```mermaid" not in raw
+    assert fallback["tag"] == "markdown"
+    assert "失败流程图" in fallback["content"]
+    assert "渲染失败" in fallback["content"]
+
+
+def test_feishu_reply_body_never_sends_direct_mermaid_tag(monkeypatch, tmp_path):
+    image = tmp_path / "reply-flow.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr("core.connectors.feishu._render_mermaid_png", lambda source: image)
+
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="fallback",
+        payload={
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "mermaid",
+                        "source": "flowchart TD\nA-->B",
+                    }
+                ]
+            },
+        },
+    )
+    client = SimpleNamespace(upload_image=lambda path: "img_v3_reply_flow")
+
+    msg_type, content = _feishu_reply_body(reply, client=client)
+    card = json.loads(content)
+    raw = json.dumps(card, ensure_ascii=False)
+
+    assert msg_type == "interactive"
+    assert '"tag": "mermaid"' not in raw
+    assert card["body"]["elements"][0]["tag"] == "img"
+
+
 def test_normalize_mermaid_flowchart_labels_quotes_problematic_text():
     source = "\n".join([
         "flowchart TD",
