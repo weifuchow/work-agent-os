@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session 行为复盘"
+  short_description: "复盘并重放 session，验证助手链路修复效果"
+  default_prompt: "Use $session-behavior-review to analyze and replay session-175 message 1080 with mocked Feishu delivery."
