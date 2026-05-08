@@ -220,16 +220,53 @@ def infer_version_from_git(
     return (commit_sha or "")[:8]
 
 
+def _git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "Never")
+    return env
+
+
+def _kill_git_process_tree(pid: int) -> None:
+    if os.name == "nt" and pid > 0:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception as exc:
+            logger.warning("Failed to taskkill git process tree {}: {}", pid, exc)
+
+
+def _run_git_command(
+    project_path: Path,
+    *args: str,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    cmd = ["git", "-c", "core.longpaths=true", "-C", str(project_path), *args]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=_git_env(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_git_process_tree(proc.pid)
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _git_capture(project_path: Path, *args: str) -> str:
     try:
-        result = subprocess.run(
-            ["git", "-c", "core.longpaths=true", "-C", str(project_path), *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=5,
-            check=False,
-        )
+        result = _run_git_command(project_path, *args, timeout=5)
     except Exception:
         return ""
     if result.returncode != 0:
@@ -245,14 +282,7 @@ def _git_capture_lines(project_path: Path, *args: str) -> tuple[str, ...]:
 
 
 def _git_run(project_path: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-c", "core.longpaths=true", "-C", str(project_path), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=timeout,
-        check=False,
-    )
+    return _run_git_command(project_path, *args, timeout=timeout)
 
 
 @lru_cache(maxsize=64)

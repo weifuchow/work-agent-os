@@ -45,3 +45,33 @@ def test_get_projects_reload_when_projects_file_changes(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     assert [project.name for project in projects_mod.get_projects()] == ["two"]
+
+
+def test_git_command_timeout_kills_windows_process_tree(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProc:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, timeout=None):
+            calls.append(("communicate", timeout))
+            if timeout == 5:
+                raise projects_mod.subprocess.TimeoutExpired(["git"], timeout)
+            self.returncode = -9
+            return "", "timed out"
+
+    def fake_popen(*args, **kwargs):
+        calls.append(("popen", args, kwargs))
+        return FakeProc()
+
+    def fake_run(cmd, **kwargs):
+        calls.append(("run", cmd, kwargs))
+        return projects_mod.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(projects_mod.os, "name", "nt")
+    monkeypatch.setattr(projects_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(projects_mod.subprocess, "run", fake_run)
+
+    assert projects_mod._git_capture(tmp_path, "rev-parse", "--abbrev-ref", "HEAD") == ""
+    assert any(call[0] == "run" and call[1][:2] == ["taskkill", "/PID"] for call in calls)

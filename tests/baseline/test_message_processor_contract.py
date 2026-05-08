@@ -22,13 +22,13 @@ from core.app.result_handler import ResultHandler
 from core.artifacts.workspace import WorkspacePreparer
 from core.deps import CoreDependencies
 from core.pipeline import configure_dependencies_for_tests, process_message, reprocess_message
-from core.ports import AgentRequest, AgentResponse
+from core.ports import AgentRequest, AgentResponse, DeliveryResult
 from core.projects import ProjectConfig
 import core.projects as projects_mod
 from core.repositories import Repository
 from core.sessions.service import SessionService
 from builders.messages import create_schema, fetch_all, fetch_one, insert_message
-from fakes.ports import FakeAgentPort, FakeChannelPort, FakeFilePort, FixedClock, read_workspace_json
+from fakes.ports import FakeAgentPort, FakeChannelPort, FakeFilePort, FixedClock, SequenceChannelPort, read_workspace_json
 
 
 @pytest.fixture
@@ -101,14 +101,20 @@ async def test_reply_flow_completes_and_delivers_payload(harness):
     assert session_workspace["workspace_dir"] == str((session_dir / "workspace").resolve())
     assert session_workspace["session_artifact_roots"] == artifact_roots
     assert session_workspace["write_policy"]["final_reply_contract"] == "workspace/output"
+    assert session_workspace["orchestration"]["policy"]["main_orchestrator_required"] is True
+    assert session_workspace["orchestration"]["policy"]["project_agent_resume"] is False
+    assert session_workspace["write_policy"]["project_analysis"] == "session_artifact_roots.analysis_dir/<message-id>/<project>/<dispatch-id>"
     assert "data/attachments" in session_workspace["forbidden_roots"]
     assert project_context["artifact_roots"] == artifact_roots
     assert project_context["session_workspace_path"] == str(session_workspace_path.resolve())
     assert project_context["project_workspace_path"] == str((session_dir / "project_workspace.json").resolve())
     assert project_context["project_workspace"]["projects"] == {}
     assert project_workspace["projects"] == {}
+    assert project_workspace["project_agent_runs"] == {}
+    assert project_workspace["policy"]["active_project_usage"] == "hint_only"
+    assert project_workspace["policy"]["project_agent_resume"] is False
     assert project_workspace["worktrees_dir"] == artifact_roots["worktrees_dir"]
-    for key in ("ones_dir", "triage_dir", "review_dir", "uploads_dir", "attachments_dir", "scratch_dir"):
+    for key in ("ones_dir", "triage_dir", "review_dir", "orchestration_dir", "analysis_dir", "uploads_dir", "attachments_dir", "scratch_dir"):
         path = Path(artifact_roots[key])
         assert path.is_dir()
         assert path.resolve().is_relative_to(session_dir.resolve())
@@ -235,6 +241,8 @@ async def test_direct_project_context_updates_session_and_audit(harness, monkeyp
     detail = json.loads(audit["detail"])
     assert detail["running_project"] == "allspark"
     assert detail["project_path"] == r"D:\standard\riot\allspark"
+    assert len(harness["agent_port"].calls) == 1
+    assert harness["agent_port"].calls[0].session["project"] == "allspark"
 
 
 @pytest.mark.asyncio
@@ -454,9 +462,12 @@ async def test_ones_project_context_updates_session_and_prevents_followup_reload
         content="为什么 10589 在 15:41:13.295 起释放 node-map-1.100076",
         thread_id=first_session["thread_id"],
     )
+    harness["agent_port"].results.append(_reply_result("ones followup project analysis"))
     await process_message(second_id)
 
     assert direct_calls == 0
+    assert len(harness["agent_port"].calls) == 2
+    assert harness["agent_port"].calls[-1].session["project"] == "allspark"
     audits = await fetch_all(db_file, "SELECT event_type, target_id FROM audit_logs ORDER BY id")
     assert not [
         item for item in audits
@@ -624,6 +635,62 @@ async def test_invalid_card_reply_is_repaired_and_revalidated_before_delivery(ha
 
 
 @pytest.mark.asyncio
+async def test_feishu_card_delivery_failure_retries_markdown_fallback(harness):
+    db_file = harness["db_file"]
+    fallback_channel = SequenceChannelPort([
+        DeliveryResult(delivered=False, error="feishu reply returned no result"),
+        DeliveryResult(
+            delivered=True,
+            message_id="reply_fallback_1",
+            thread_id="omt_reply_fallback",
+            root_id="om_root_fallback",
+        ),
+    ])
+    harness["deps"].result_handler.channel_port = fallback_channel
+    harness["agent_port"].results[:] = [
+        {
+            "action": "reply",
+            "reply": {
+                "channel": "feishu",
+                "type": "feishu_card",
+                "content": "PDU 单 task 只是组帧结论，不能排除碰撞风险。",
+                "payload": {
+                    "schema": "2.0",
+                    "header": {"title": {"tag": "plain_text", "content": "碰撞复核"}},
+                    "body": {"elements": [{"tag": "markdown", "content": "**结论**\n不能排除碰撞风险。"}]},
+                },
+            },
+            "session_patch": {},
+            "workspace_patch": {},
+            "skill_trace": [],
+            "audit": [],
+        },
+    ]
+    msg_id = await insert_message(db_file, content="这个问题导致碰撞了")
+
+    await process_message(msg_id)
+
+    msg = await fetch_one(db_file, "SELECT pipeline_status, pipeline_error FROM messages WHERE id = ?", (msg_id,))
+    assert msg == {"pipeline_status": "completed", "pipeline_error": ""}
+    assert [call["reply"].type for call in fallback_channel.calls] == ["feishu_card", "markdown"]
+    assert fallback_channel.calls[1]["reply"].content == "PDU 单 task 只是组帧结论，不能排除碰撞风险。"
+
+    reply = await fetch_one(db_file, "SELECT message_type, content, raw_payload FROM messages WHERE sender_id = 'bot'")
+    assert reply["message_type"] == "markdown"
+    assert "不能排除碰撞风险" in reply["content"]
+    raw = json.loads(reply["raw_payload"])
+    assert raw["delivery"]["mode"] == "fallback"
+    assert raw["delivery"]["original_error"] == "feishu reply returned no result"
+
+    audits = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
+    event_types = [item["event_type"] for item in audits]
+    assert "reply_delivery_failed" in event_types
+    assert "reply_delivery_fallback_started" in event_types
+    assert "reply_delivery_fallback_completed" in event_types
+    assert "message_failed" not in event_types
+
+
+@pytest.mark.asyncio
 async def test_agent_timeout_recovers_from_reply_contract_artifact(harness):
     db_file = harness["db_file"]
     agent_port = TimeoutAfterArtifactAgentPort(_reply_result("artifact reply"))
@@ -755,6 +822,48 @@ async def test_reprocess_resets_and_runs_again(harness):
     msg = await fetch_one(db_file, "SELECT pipeline_status, pipeline_error FROM messages WHERE id = ?", (msg_id,))
     assert msg == {"pipeline_status": "completed", "pipeline_error": ""}
     assert len(harness["agent_port"].calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_project_bound_work_message_runs_orchestrator_before_project_dispatch(harness):
+    db_file = harness["db_file"]
+    first_id = await insert_message(
+        db_file,
+        platform_message_id="om_project_orchestrator_t1",
+        content="allspark",
+    )
+    await process_message(first_id)
+    first_msg = await fetch_one(db_file, "SELECT session_id FROM messages WHERE id = ?", (first_id,))
+    session_id = int(first_msg["session_id"])
+    await harness["deps"].repository.update_session_patch(
+        session_id,
+        {"project": "allspark"},
+        now="2026-04-30T10:01:00",
+    )
+
+    harness["agent_port"].results[:] = [_reply_result("主编排已处理项目消息")]
+    second_id = await insert_message(
+        db_file,
+        platform_message_id="om_project_orchestrator_t2",
+        content="阅读一下相关代码和日志",
+        thread_id="omt_reply_001",
+    )
+    await process_message(second_id)
+
+    assert len(harness["agent_port"].calls) == 1
+    call = harness["agent_port"].calls[0]
+    assert call.session["id"] == session_id
+    assert call.session["project"] == "allspark"
+    assert call.message["id"] == second_id
+
+    reply = harness["channel"].calls[-1]["reply"]
+    assert reply.content == "主编排已处理项目消息"
+
+    events = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
+    event_names = [item["event_type"] for item in events]
+    assert "core_project_dispatch_preflight_started" not in event_names
+    assert "core_project_dispatch_preflight_completed" not in event_names
+    assert "agent_run_started" in event_names
 
 
 def _reply_result(content: str) -> dict:

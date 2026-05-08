@@ -52,6 +52,20 @@ def _codex_exec_timeout_seconds(max_turns: int) -> int:
     return max(floor, max_turns * 30)
 
 
+def _codex_mcp_tool_timeout_seconds() -> int:
+    raw = str(os.environ.get("CODEX_MCP_TOOL_TIMEOUT_SECONDS") or "").strip()
+    if raw:
+        try:
+            configured = int(raw)
+        except ValueError:
+            configured = 0
+        if configured > 0:
+            return configured
+
+    exec_timeout = _codex_exec_timeout_seconds(30)
+    return max(120, exec_timeout - 120)
+
+
 def _same_command_path(left: str, right: str) -> bool:
     return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
@@ -106,6 +120,54 @@ def _windows_shell_command(cmd: list[str]) -> str:
     return subprocess.list2cmdline(cmd)
 
 
+async def _kill_windows_process_tree(pid: int, *, reason: str) -> bool:
+    if os.name != "nt" or pid <= 0:
+        return False
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(killer.communicate(), timeout=10)
+        return killer.returncode == 0
+    except Exception as exc:
+        logger.warning("Failed to kill Codex process tree after {}: {}", reason, exc)
+        return False
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process, *, reason: str) -> None:
+    if proc.returncode is not None:
+        return
+    pid = int(getattr(proc, "pid", 0) or 0)
+    killed_tree = await _kill_windows_process_tree(pid, reason=reason)
+    if killed_tree:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except Exception:
+            pass
+        return
+
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger.warning("Failed to kill Codex process after {}: {}", reason, exc)
+        return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        logger.warning("Codex process did not exit within 10s after {}", reason)
+    except Exception as exc:
+        logger.warning("Failed while waiting for Codex process after {}: {}", reason, exc)
+
+
 class CodexRuntimeMixin:
     def _build_codex_prompt(
         self,
@@ -128,9 +190,12 @@ class CodexRuntimeMixin:
             sections.append(
                 "## Runtime Notes\n"
                 "你运行在 Codex CLI 中，仓库内置本地 MCP 工具。"
-                "主编排只做消息理解、项目路由和结果汇总。"
+                "主编排只做消息理解、项目路由、session-xx 项目工程目录初始化和结果汇总。"
                 "涉及已注册项目、ONES、日志、项目代码或版本 worktree 时，必须调用 dispatch_to_project 进入项目子编排；"
-                "不要在主编排里直接用 shell/文件读取完成项目分析。"
+                "项目未加载时，由主编排调用 prepare_project_worktree 准备 session worktree，项目 Agent 不负责创建或切换项目 worktree；"
+                "active_project 只是历史提示，每轮必须重新判断项目相关度；dispatch_to_project 必须显式给出 project_name、task、context 和需要的 skill；"
+                "ONES 工单、现场日志、订单/车辆执行链路、截图或附件排障必须给 dispatch_to_project 传 skill=\"riot-log-triage\"；"
+                "项目 Agent 返回后必须检查结果，再决定最终回复、纠正、补派或追问；不要在主编排里直接用 shell/文件读取完成项目分析。"
             )
 
         sections.append(f"## User Task\n{prompt}")
@@ -150,6 +215,8 @@ class CodexRuntimeMixin:
                 "mcp_servers.work_agent.args="
                 f"{self._toml_string_array([str(server_path), '--scope', scope])}"
             ),
+            "-c", "mcp_servers.work_agent.startup_timeout_sec=30",
+            "-c", f"mcp_servers.work_agent.tool_timeout_sec={_codex_mcp_tool_timeout_seconds()}",
         ]
 
     def _build_codex_command(
@@ -172,7 +239,7 @@ class CodexRuntimeMixin:
             "exec",
             "--json",
             "--skip-git-repo-check",
-            "--full-auto",
+            "--dangerously-bypass-approvals-and-sandbox",
             "-C",
             run_cwd,
         ]
@@ -384,8 +451,11 @@ class CodexRuntimeMixin:
                 timeout=_codex_exec_timeout_seconds(max_turns),
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            await _terminate_process(proc, reason="timeout")
             raise RuntimeError(f"codex exec timed out (session={session_id or 'new'})")
+        except asyncio.CancelledError:
+            await _terminate_process(proc, reason="cancellation")
+            raise
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -582,3 +652,4 @@ class CodexRuntimeMixin:
                 stdin_task.cancel()
             if not stderr_task.done():
                 stderr_task.cancel()
+            await _terminate_process(proc, reason="stream close")

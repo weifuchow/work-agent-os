@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,8 @@ from core.ports import ReplyPayload
 from models.db import Message
 
 
-def test_build_codex_command_includes_image_flags(tmp_path):
+def test_build_codex_command_includes_image_flags(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_MCP_TOOL_TIMEOUT_SECONDS", "777")
     image_path = tmp_path / "desc-1.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nones-image")
     client = AgentClient()
@@ -35,6 +37,60 @@ def test_build_codex_command_includes_image_flags(tmp_path):
 
     assert "--image" in cmd
     assert str(image_path.resolve()) in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    assert "--full-auto" not in cmd
+    assert "mcp_servers.work_agent.startup_timeout_sec=30" in cmd
+    assert "mcp_servers.work_agent.tool_timeout_sec=777" in cmd
+
+
+@pytest.mark.asyncio
+async def test_run_codex_kills_process_when_cancelled(monkeypatch):
+    async def fake_kill_tree(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(codex_runtime, "_kill_windows_process_tree", fake_kill_tree)
+
+    class FakeStdin:
+        def write(self, _data):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = None
+            self.killed = False
+            self.waited = False
+
+        async def communicate(self, _data):
+            raise asyncio.CancelledError()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            return self.returncode
+
+    proc = FakeProcess()
+    client = AgentClient()
+
+    monkeypatch.setattr(client, "_select_model", lambda model=None: "gpt-test")
+    monkeypatch.setattr(client, "_build_codex_command", lambda **_kwargs: ["codex", "exec", "-"])
+
+    async def fake_start(*_args, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(client, "_start_codex_process", fake_start)
+    monkeypatch.setattr(codex_runtime, "_codex_exec_timeout_seconds", lambda _turns: 60)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client._run_codex("hello", max_turns=1)
+
+    assert proc.killed is True
+    assert proc.waited is True
 
 
 def test_resolve_codex_cli_uses_cmd_wrapper_when_requested(monkeypatch, tmp_path):

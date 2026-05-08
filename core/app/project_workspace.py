@@ -15,6 +15,7 @@ from core.projects import ProjectRuntimeContext, get_projects, prepare_project_r
 PROJECT_WORKSPACE_SCHEMA_VERSION = "1.0"
 PROJECT_WORKSPACE_FILENAME = "project_workspace.json"
 AGENT_SESSIONS_KEY = "agent_sessions"
+PROJECT_AGENT_RUNS_KEY = "project_agent_runs"
 
 
 def project_workspace_path(workspace: PreparedWorkspace) -> Path:
@@ -138,6 +139,7 @@ def project_agent_session_entry(
     *,
     runtime: str = "",
     role: str = "project",
+    skill: str = "",
 ) -> dict[str, Any]:
     """Return the saved project agent session when it still matches the worktree."""
 
@@ -159,9 +161,23 @@ def project_agent_session_entry(
     saved = project_sessions.get(project_name)
     if not isinstance(saved, dict):
         return {}
+    requested_skill = str(skill or "").strip()
+    if requested_skill:
+        skill_sessions = saved.get("skills") if isinstance(saved.get("skills"), dict) else {}
+        skill_saved = skill_sessions.get(requested_skill) if isinstance(skill_sessions, dict) else None
+        if isinstance(skill_saved, dict):
+            saved = skill_saved
+        else:
+            return {}
     if role and str(saved.get("role") or "project") != role:
         return {}
     if runtime and str(saved.get("runtime") or "") != runtime:
+        return {}
+    saved_skill = str(saved.get("skill") or "").strip()
+    if requested_skill:
+        if saved_skill != requested_skill:
+            return {}
+    elif saved_skill:
         return {}
     if not str(saved.get("session_id") or "").strip():
         return {}
@@ -176,12 +192,14 @@ def get_project_agent_session_id(
     *,
     runtime: str = "",
     role: str = "project",
+    skill: str = "",
 ) -> str | None:
     entry = project_agent_session_entry(
         project_workspace,
         project_name,
         runtime=runtime,
         role=role,
+        skill=skill,
     )
     session_id = str(entry.get("session_id") or "").strip()
     return session_id or None
@@ -196,7 +214,7 @@ def save_project_agent_session(
     role: str = "project",
     skill: str = "",
 ) -> dict[str, Any]:
-    """Persist a project-scoped agent session id in project_workspace.json."""
+    """Persist a legacy project-scoped agent session id for audit compatibility."""
 
     workspace = _workspace_from_session_workspace_path(session_workspace_path)
     if not workspace:
@@ -235,9 +253,50 @@ def save_project_agent_session(
         "execution_version": str(project_entry.get("execution_version") or ""),
         "project_path": str(project_entry.get("project_path") or project_entry.get("source_path") or ""),
     }
-    project_sessions[project_name] = saved
+    if saved["skill"]:
+        existing = project_sessions.get(project_name)
+        if not isinstance(existing, dict):
+            existing = {}
+        skills = existing.setdefault("skills", {})
+        if not isinstance(skills, dict):
+            skills = {}
+            existing["skills"] = skills
+        skills[saved["skill"]] = saved
+        project_sessions[project_name] = existing
+    else:
+        existing = project_sessions.get(project_name)
+        if isinstance(existing, dict) and isinstance(existing.get("skills"), dict):
+            saved["skills"] = existing["skills"]
+        project_sessions[project_name] = saved
     _persist_project_workspace(workspace, payload)
     return saved
+
+
+def append_project_agent_run(
+    *,
+    session_workspace_path: Path,
+    project_name: str,
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    """Append a record-only project agent run entry to project_workspace.json."""
+
+    workspace = _workspace_from_session_workspace_path(session_workspace_path)
+    if not workspace:
+        return {}
+
+    payload = ensure_project_workspace(workspace)
+    runs = payload.setdefault(PROJECT_AGENT_RUNS_KEY, {})
+    if not isinstance(runs, dict):
+        runs = {}
+        payload[PROJECT_AGENT_RUNS_KEY] = runs
+    project_runs = runs.setdefault(project_name, [])
+    if not isinstance(project_runs, list):
+        project_runs = []
+        runs[project_name] = project_runs
+    record = dict(run)
+    project_runs.append(record)
+    _persist_project_workspace(workspace, payload)
+    return record
 
 
 def active_project_entry(project_workspace: dict[str, Any]) -> dict[str, Any]:
@@ -260,8 +319,9 @@ def build_project_workspace_prompt_block(project_workspace: dict[str, Any] | Non
         + json.dumps(project_workspace, ensure_ascii=False, indent=2)
         + "\n\n处理项目问题时，必须在 session worktrees 中工作："
         "source_path/project_path 只表示源仓库登记位置，不作为分析或修改目录。"
-        "project_workspace.agent_sessions.projects 保存项目级 Agent resume id，必须按项目名、runtime 和 worktree/commit 匹配后才能复用；"
-        "不要把一个项目的 Agent session_id 用到另一个项目。"
+        "project_workspace.active_project 只是历史提示，不是本轮路由结论。"
+        "project_workspace.agent_sessions/projects 和 project_agent_runs 里的 session_id 只用于审计记录，"
+        "不要把它们作为项目 Agent resume 输入。"
         "如果问题涉及尚未加载的相关项目，先调用 prepare_project_worktree，"
         "把该项目加载到 project_workspace.projects 后再检索。"
         "最终回复必须说明本次实际使用的项目、worktree、分支/Tag/版本和提交。"
@@ -291,11 +351,14 @@ def _empty_project_workspace_payload(artifact_roots: dict[str, str]) -> dict[str
         "project_order": [],
         "projects": {},
         AGENT_SESSIONS_KEY: {"projects": {}},
+        PROJECT_AGENT_RUNS_KEY: {},
         "available_projects": _available_project_entries(),
         "policy": {
             "work_directory": "session_worktree",
             "source_path_usage": "registry_only",
             "load_on_demand_tool": "prepare_project_worktree",
+            "active_project_usage": "hint_only",
+            "project_agent_resume": False,
         },
     }
 
@@ -318,6 +381,8 @@ def _normalize_project_workspace_payload(
         normalized[AGENT_SESSIONS_KEY] = {"projects": {}}
     elif not isinstance(normalized[AGENT_SESSIONS_KEY].get("projects"), dict):
         normalized[AGENT_SESSIONS_KEY]["projects"] = {}
+    if not isinstance(normalized.get(PROJECT_AGENT_RUNS_KEY), dict):
+        normalized[PROJECT_AGENT_RUNS_KEY] = {}
     normalized["available_projects"] = _available_project_entries()
     normalized.setdefault("policy", {})
     if isinstance(normalized["policy"], dict):
@@ -326,6 +391,8 @@ def _normalize_project_workspace_payload(
                 "work_directory": "session_worktree",
                 "source_path_usage": "registry_only",
                 "load_on_demand_tool": "prepare_project_worktree",
+                "active_project_usage": "hint_only",
+                "project_agent_resume": False,
             }
         )
     return normalized

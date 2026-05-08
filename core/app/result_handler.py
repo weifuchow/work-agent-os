@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from core.connectors.feishu import _MERMAID_BLOCK_RE, _render_mermaid_png, _sanitize_feishu_card_payload
@@ -133,12 +134,76 @@ class ResultHandler:
                     "error_message": delivery.error,
                 },
             )
+            fallback_reply = _delivery_fallback_reply(reply)
+            if fallback_reply is not None:
+                await self.repository.audit(
+                    "reply_delivery_fallback_started",
+                    target_type="message",
+                    target_id=str(ctx.message_id),
+                    detail={
+                        "message_id": ctx.message_id,
+                        "session_id": ctx.session_id,
+                        "from_reply_type": reply.type,
+                        "to_reply_type": fallback_reply.type,
+                        "error_message": delivery.error,
+                    },
+                )
+                fallback_delivery = await self.channel_port.deliver_reply(
+                    source_message=ctx.message,
+                    reply=fallback_reply,
+                )
+                if fallback_delivery.delivered:
+                    await self.repository.audit(
+                        "reply_delivery_fallback_completed",
+                        target_type="message",
+                        target_id=str(ctx.message_id),
+                        detail={
+                            "message_id": ctx.message_id,
+                            "session_id": ctx.session_id,
+                            "reply_type": fallback_reply.type,
+                            "original_error": delivery.error,
+                        },
+                    )
+                    await self._save_successful_delivery(
+                        ctx,
+                        workspace,
+                        fallback_reply,
+                        fallback_delivery,
+                        delivery_mode="fallback",
+                        original_error=delivery.error,
+                    )
+                    return
+                await self.repository.audit(
+                    "reply_delivery_fallback_failed",
+                    target_type="message",
+                    target_id=str(ctx.message_id),
+                    detail={
+                        "message_id": ctx.message_id,
+                        "session_id": ctx.session_id,
+                        "error_type": "delivery_failed",
+                        "error_message": fallback_delivery.error,
+                        "original_error": delivery.error,
+                    },
+                )
             await self._mark_failed(
                 ctx,
                 failed_stage="reply_delivery",
                 error_message=delivery.error or "reply delivery failed",
             )
             return
+
+        await self._save_successful_delivery(ctx, workspace, reply, delivery)
+
+    async def _save_successful_delivery(
+        self,
+        ctx: MessageContext,
+        workspace: PreparedWorkspace,
+        reply: ReplyPayload,
+        delivery: Any,
+        *,
+        delivery_mode: str = "primary",
+        original_error: str = "",
+    ) -> None:
 
         now = self.clock.now_iso()
         session_patch: dict[str, Any] = {}
@@ -158,6 +223,8 @@ class ResultHandler:
                     "message_id": delivery.message_id,
                     "thread_id": delivery.thread_id,
                     "root_id": delivery.root_id,
+                    "mode": delivery_mode,
+                    "original_error": original_error,
                 },
                 "workspace_path": str(workspace.path),
             },
@@ -170,6 +237,7 @@ class ResultHandler:
                 "reply_message_id": delivery.message_id,
                 "reply_thread_id": delivery.thread_id,
                 "reply_root_id": delivery.root_id,
+                "delivery_mode": delivery_mode,
             },
         )
 
@@ -379,6 +447,109 @@ def _load_feishu_card_renderer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _delivery_fallback_reply(reply: ReplyPayload) -> ReplyPayload | None:
+    if reply.type in {"text", "markdown"}:
+        return None
+    content = _plain_reply_text(reply)
+    if not content.strip():
+        return None
+    return ReplyPayload(
+        channel=reply.channel,
+        type="markdown",
+        content=content,
+        payload=None,
+        intent=reply.intent,
+        file_path=reply.file_path,
+        metadata={**dict(reply.metadata), "delivery_fallback_from": reply.type},
+    )
+
+
+def _plain_reply_text(reply: ReplyPayload) -> str:
+    content = str(reply.content or "").strip()
+    if content:
+        return content
+    if isinstance(reply.payload, dict):
+        summary = reply.payload.get("structured_summary")
+        if isinstance(summary, dict):
+            return _summary_to_markdown(summary)
+        return _card_to_markdown(reply.payload)
+    return ""
+
+
+def _summary_to_markdown(summary: dict[str, Any]) -> str:
+    parts: list[str] = []
+    title = str(summary.get("title") or "").strip()
+    if title:
+        parts.append(f"**{title}**")
+    for key in ("summary", "fallback_text", "conclusion"):
+        value = str(summary.get(key) or "").strip()
+        if value:
+            parts.append(value)
+            break
+    sections = summary.get("sections")
+    if isinstance(sections, list):
+        for section in sections[:6]:
+            if not isinstance(section, dict):
+                continue
+            heading = str(section.get("title") or "").strip()
+            body = str(section.get("content") or section.get("body") or "").strip()
+            if heading and body:
+                parts.append(f"**{heading}**\n{body}")
+            elif body:
+                parts.append(body)
+    return "\n\n".join(parts).strip()
+
+
+def _card_to_markdown(payload: dict[str, Any]) -> str:
+    card = _sanitize_feishu_card_payload(payload)
+    if not card:
+        return ""
+    parts: list[str] = []
+    header = card.get("header")
+    if isinstance(header, dict):
+        title = header.get("title")
+        if isinstance(title, dict):
+            value = str(title.get("content") or "").strip()
+            if value:
+                parts.append(f"**{value}**")
+    body = card.get("body")
+    elements = body.get("elements") if isinstance(body, dict) else None
+    if isinstance(elements, list):
+        for text in _iter_card_text(elements):
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def _iter_card_text(value: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            texts.extend(_iter_card_text(item))
+        return texts
+    if not isinstance(value, dict):
+        return texts
+    tag = value.get("tag")
+    if tag in {"markdown", "plain_text", "lark_md"}:
+        text = str(value.get("content") or value.get("text") or "").strip()
+        if text:
+            texts.append(_strip_markdown_images(text))
+    text_obj = value.get("text")
+    if isinstance(text_obj, dict):
+        text = str(text_obj.get("content") or "").strip()
+        if text:
+            texts.append(_strip_markdown_images(text))
+    for key in ("elements", "columns"):
+        nested = value.get(key)
+        if isinstance(nested, list):
+            texts.extend(_iter_card_text(nested))
+    return texts
+
+
+def _strip_markdown_images(text: str) -> str:
+    return re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text).strip()
 
 
 def _reply_validation_errors(reply: ReplyPayload) -> list[dict[str, Any]]:

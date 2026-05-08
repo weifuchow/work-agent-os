@@ -1,0 +1,4 @@
+interface:
+  display_name: "主编排项目协同"
+  short_description: "主编排项目匹配、工程目录初始化、派发和结果复核"
+  default_prompt: "使用这个 playbook 判断项目相关度、选择 skill、组织 dispatch_to_project 上下文、复核项目结果，并决定最终回复、纠正、补派或追问。"

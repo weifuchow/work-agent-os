@@ -85,6 +85,8 @@ def artifact_roots_for(workspace: Path, session_id: int | None) -> dict[str, str
         "ones_dir": str((session_dir / ".ones").resolve()),
         "triage_dir": str((session_dir / ".triage").resolve()),
         "review_dir": str((session_dir / ".review").resolve()),
+        "orchestration_dir": str((session_dir / ".orchestration").resolve()),
+        "analysis_dir": str((session_dir / ".analysis").resolve()),
         "worktrees_dir": str((session_dir / "worktrees").resolve()),
         "uploads_dir": str((session_dir / "uploads").resolve()),
         "attachments_dir": str((session_dir / "attachments").resolve()),
@@ -101,6 +103,19 @@ def session_workspace_map(
         "session_dir": artifact_roots["session_dir"],
         "workspace_dir": artifact_roots["workspace_dir"],
         "session_artifact_roots": artifact_roots,
+        "orchestration": {
+            "dir": ".orchestration",
+            "policy": {
+                "main_orchestrator_required": True,
+                "project_routing_owner": "main_orchestrator",
+                "project_agent_resume": False,
+                "final_reply_owner": "main_orchestrator",
+            },
+        },
+        "analysis": {
+            "dir": ".analysis",
+            "project_agent_outputs_required": True,
+        },
         "lookup_order": [
             "workspace/input/message.json",
             "workspace/input/session.json",
@@ -113,6 +128,8 @@ def session_workspace_map(
             "session_artifact_roots.ones_dir",
             "session_artifact_roots.triage_dir",
             "session_artifact_roots.review_dir",
+            "session_artifact_roots.orchestration_dir",
+            "session_artifact_roots.analysis_dir",
             "session_artifact_roots.worktrees_dir",
         ],
         "write_policy": {
@@ -130,6 +147,9 @@ def session_workspace_map(
             "review_artifacts": "session_artifact_roots.review_dir",
             "project_worktrees": "session_artifact_roots.worktrees_dir/<project>/<task-version>",
             "project_workspace_registry": "project_workspace.json + workspace/input/project_workspace.json",
+            "orchestration_plan": "session_artifact_roots.orchestration_dir/<message-id>/plan.json",
+            "orchestration_review": "session_artifact_roots.orchestration_dir/<message-id>/review.json",
+            "project_analysis": "session_artifact_roots.analysis_dir/<message-id>/<project>/<dispatch-id>",
             "scratch_files": "session_artifact_roots.scratch_dir",
         },
         "forbidden_roots": [

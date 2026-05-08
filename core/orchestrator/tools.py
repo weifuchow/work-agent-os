@@ -2,17 +2,91 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from loguru import logger
 
 from core.config import settings
-from core.orchestrator.agent_runtime import get_agent_run_runtime_type
+from core.orchestrator.agent_runtime import get_agent_run_runtime_type, normalize_agent_runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_SESSION_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_DEFAULT_PROJECT_DISPATCH_TIMEOUT_SECONDS = 1800
+_RIOT_LOG_TRIAGE_SKILL = "riot-log-triage"
+_RIOT_LOG_TRIAGE_PROJECTS = {"allspark", "riot-standalone", "fms-java"}
+_RIOT_DIRECT_TRIAGE_MARKERS = (
+    "日志",
+    "log",
+    "ones",
+    "工单",
+    "现场",
+    "附件",
+    "上传",
+    "图片",
+    "截图",
+    "报错",
+    "异常",
+    "堆栈",
+    "trace",
+    "error",
+    "exception",
+)
+_RIOT_EXECUTION_TRIAGE_MARKERS = (
+    "订单",
+    "任务",
+    "子任务",
+    "车辆",
+    "agv",
+    "seeragv",
+    "seer",
+    "自由导航",
+    "导航",
+    "路径",
+    "点位",
+    "站点",
+    "工位",
+    "库位",
+    "下发",
+    "经过",
+    "未经过",
+    "没经过",
+    "跳过",
+    "绕行",
+    "死锁",
+    "避让",
+    "交通",
+    "门禁",
+    "电梯",
+    "充电",
+    "卡住",
+    "超时",
+    "挂起",
+    "恢复",
+    "状态流转",
+    "执行链路",
+)
+_INVESTIGATION_INTENT_MARKERS = ("检查", "排查", "分析", "定位", "为什么", "为何", "原因", "看一下", "看看", "查一下")
+_NEGATED_RIOT_TRIAGE_MARKERS = (
+    "不涉及日志",
+    "不涉及现场日志",
+    "不用日志",
+    "不看日志",
+    "不要看日志",
+    "不分析日志",
+    "不是日志",
+    "无日志",
+    "没有日志",
+    "不涉及订单",
+    "不涉及车辆",
+    "不需要排障",
+)
+_LOG_LIKE_UPLOAD_SUFFIXES = {".log", ".gz", ".zip", ".tar", ".tgz", ".txt", ".json"}
 
 
 def _project_root() -> Path:
@@ -24,6 +98,389 @@ def _project_root() -> Path:
         return Path(getattr(agent_client_mod, "PROJECT_ROOT", PROJECT_ROOT))
     except Exception:
         return PROJECT_ROOT
+
+
+def _app_db_path() -> Path:
+    replay_db = str(os.environ.get("WORK_AGENT_REPLAY_DB_PATH") or "").strip()
+    if replay_db:
+        return Path(replay_db)
+    return _project_root() / "data" / "db" / "app.sqlite"
+
+
+def _sessions_root() -> Path:
+    replay_sessions = str(os.environ.get("WORK_AGENT_REPLAY_SESSIONS_DIR") or "").strip()
+    if replay_sessions:
+        return Path(replay_sessions)
+    return _project_root() / "data" / "sessions"
+
+
+def _session_workspace_path(db_session_id: int) -> Path:
+    return _sessions_root() / f"session-{int(db_session_id)}" / "session_workspace.json"
+
+
+def _message_artifact_segment(message_id: Any) -> str:
+    try:
+        value = int(message_id)
+    except (TypeError, ValueError):
+        value = 0
+    return f"message-{value}" if value > 0 else "message-unknown"
+
+
+def _safe_artifact_segment(value: Any, *, fallback: str = "item") -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = text.strip(".-")
+    return text or fallback
+
+
+def _write_json_artifact(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_json_artifact(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _session_upload_image_paths(artifact_roots: dict[str, str], *, max_images: int = 6) -> list[str]:
+    uploads_text = str(artifact_roots.get("uploads_dir") or "").strip()
+    if not uploads_text:
+        return []
+    uploads_dir = Path(uploads_text)
+    try:
+        candidates = [
+            path
+            for path in uploads_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _SESSION_IMAGE_EXTENSIONS
+        ]
+    except OSError:
+        return []
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    image_paths: list[str] = []
+    for path in sorted(candidates, key=_mtime, reverse=True)[:max_images]:
+        try:
+            image_paths.append(str(path.resolve()))
+        except OSError:
+            image_paths.append(str(path))
+    return image_paths
+
+
+def _session_upload_file_paths(artifact_roots: dict[str, str], *, max_files: int = 20) -> list[Path]:
+    uploads_text = str(artifact_roots.get("uploads_dir") or "").strip()
+    if not uploads_text:
+        return []
+    uploads_dir = Path(uploads_text)
+    try:
+        candidates = [path for path in uploads_dir.iterdir() if path.is_file()]
+    except OSError:
+        return []
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(candidates, key=_mtime, reverse=True)[:max_files]
+
+
+def _has_session_uploads(artifact_roots: dict[str, str]) -> bool:
+    return bool(_session_upload_file_paths(artifact_roots, max_files=1))
+
+
+def _has_log_like_session_uploads(artifact_roots: dict[str, str]) -> bool:
+    for path in _session_upload_file_paths(artifact_roots):
+        name = path.name.lower()
+        if any(name.endswith(suffix) for suffix in _LOG_LIKE_UPLOAD_SUFFIXES):
+            return True
+        if ".log." in name or name.endswith(".log"):
+            return True
+    return False
+
+
+def _text_contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def _looks_like_riot_log_triage_task(
+    *,
+    project_name: str,
+    task: str,
+    context: str,
+    artifact_roots: dict[str, str],
+) -> bool:
+    """Detect RIOT troubleshooting turns where the log triage workflow is required.
+
+    This intentionally uses only the current dispatch payload and session uploads.
+    Existing .triage state is ignored so stale analysis workspaces cannot force a
+    skill selection for unrelated project questions.
+    """
+
+    if project_name.strip().lower() not in _RIOT_LOG_TRIAGE_PROJECTS:
+        return False
+
+    text = f"{task}\n{context}".strip()
+    if not text:
+        return False
+    if _text_contains_any(text, _NEGATED_RIOT_TRIAGE_MARKERS):
+        return False
+
+    has_uploads = _has_session_uploads(artifact_roots)
+    has_log_uploads = _has_log_like_session_uploads(artifact_roots)
+    has_investigation_intent = _text_contains_any(text, _INVESTIGATION_INTENT_MARKERS)
+
+    if _text_contains_any(text, _RIOT_DIRECT_TRIAGE_MARKERS) and (
+        has_investigation_intent or has_uploads or has_log_uploads
+    ):
+        return True
+
+    execution_related = _text_contains_any(text, _RIOT_EXECUTION_TRIAGE_MARKERS)
+    if not execution_related:
+        return False
+
+    if has_investigation_intent:
+        return True
+
+    return has_uploads or has_log_uploads
+
+
+def _skill_registered(skill_name: str) -> bool:
+    try:
+        from core.skill_registry import SKILL_REGISTRY as registry
+
+        if skill_name in registry:
+            return True
+    except Exception:
+        pass
+    return (_project_root() / ".claude" / "skills" / skill_name / "SKILL.md").is_file()
+
+
+def _project_dispatch_timeout_seconds() -> int:
+    raw = str(os.environ.get("PROJECT_DISPATCH_TIMEOUT_SECONDS") or "").strip()
+    if raw:
+        try:
+            configured = int(raw)
+        except ValueError:
+            configured = 0
+        if configured > 0:
+            return configured
+    return _DEFAULT_PROJECT_DISPATCH_TIMEOUT_SECONDS
+
+
+def _extract_message_id(input_payload: dict[str, Any]) -> int | None:
+    for key in ("message_id", "db_message_id"):
+        try:
+            value = int(input_payload.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return None
+
+
+def _dispatch_id(dispatch_run_id: int | None) -> str:
+    if dispatch_run_id:
+        return f"dispatch-{int(dispatch_run_id):03d}"
+    return "dispatch-untracked"
+
+
+def _project_entry_from_workspace(
+    project_workspace: dict[str, Any] | None,
+    project_name: str,
+) -> dict[str, Any]:
+    projects = project_workspace.get("projects") if isinstance(project_workspace, dict) else None
+    entry = projects.get(project_name) if isinstance(projects, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _triage_dir_for_analysis_workspace(value: str) -> str:
+    if not value:
+        return ""
+    path = Path(value)
+    try:
+        if (path / "00-state.json").exists():
+            return str(path)
+    except OSError:
+        return ""
+    return ""
+
+
+def _project_entry_is_ready(entry: dict[str, Any]) -> bool:
+    path_text = str(entry.get("worktree_path") or entry.get("execution_path") or "").strip()
+    if not path_text:
+        return False
+    status = str(entry.get("status") or "").strip().lower()
+    if status and status not in {"ready", "loaded"}:
+        return False
+    try:
+        return Path(path_text).exists()
+    except OSError:
+        return False
+
+
+def _dispatch_triage_dir(
+    *,
+    analysis_workspace: str,
+    artifact_roots: dict[str, str],
+    requested_skill: str,
+    selected_skill: str,
+    message_segment: str,
+    project_segment: str,
+    dispatch_id: str,
+) -> str:
+    existing = _triage_dir_for_analysis_workspace(analysis_workspace)
+    if existing:
+        return existing
+    if (selected_skill or requested_skill) != "riot-log-triage":
+        return ""
+    triage_root = str(artifact_roots.get("triage_dir") or "").strip()
+    if not triage_root:
+        return ""
+    return str(Path(triage_root) / f"{message_segment}-{project_segment}-{dispatch_id}")
+
+
+def _ensure_triage_preflight(
+    *,
+    triage_dir: str,
+    project_name: str,
+    message_id: int | None,
+    dispatch_id: str,
+    task: str,
+    context: str,
+    analysis_dir: Path | None,
+    artifact_roots: dict[str, str],
+) -> None:
+    if not triage_dir:
+        return
+    base = Path(triage_dir)
+    try:
+        (base / "01-intake" / "messages").mkdir(parents=True, exist_ok=True)
+        (base / "01-intake" / "attachments").mkdir(parents=True, exist_ok=True)
+        (base / "02-process").mkdir(parents=True, exist_ok=True)
+        (base / "search-runs").mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to create triage preflight directories: {}", exc)
+        return
+
+    state_path = base / "00-state.json"
+    if not state_path.exists():
+        _write_json_artifact(
+            state_path,
+            {
+                "project": project_name,
+                "mode": "structured",
+                "phase": "preflight",
+                "message_id": message_id,
+                "dispatch_id": dispatch_id,
+                "primary_question": task,
+                "current_question": task,
+                "artifact_status": "preflight",
+                "analysis_dir": str(analysis_dir or ""),
+                "artifact_roots": artifact_roots,
+                "agent_context": {
+                    "runtime": "project-dispatch",
+                    "skill": "riot-log-triage",
+                },
+                "missing_items": [],
+            },
+        )
+
+    _write_json_artifact(
+        base / "01-intake" / "messages" / "dispatch_input.json",
+        {
+            "message_id": message_id,
+            "dispatch_id": dispatch_id,
+            "project": project_name,
+            "task": task,
+            "context": context,
+            "analysis_dir": str(analysis_dir or ""),
+        },
+    )
+
+
+def _persist_project_run_record(
+    *,
+    session_workspace_path: Path | None,
+    project_name: str,
+    message_id: int | None,
+    dispatch_id: str,
+    skill: str,
+    analysis_dir: Path | None,
+    agent_session_id: str,
+    status: str,
+) -> dict[str, Any]:
+    if not session_workspace_path:
+        return {}
+    try:
+        from core.app.project_workspace import append_project_agent_run
+
+        return append_project_agent_run(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            run={
+                "message_id": message_id,
+                "dispatch_id": dispatch_id,
+                "skill": skill,
+                "analysis_dir": str(analysis_dir) if analysis_dir else "",
+                "agent_session_id": agent_session_id,
+                "status": status,
+            },
+        )
+    except Exception as exc:
+        logger.warning("Failed to append project agent run record: {}", exc)
+        return {}
+
+
+def _write_project_dispatch_failure(
+    *,
+    project_name: str,
+    dispatch_id: str,
+    error_text: str,
+    result_artifact: Path | None,
+    trace_artifact: Path | None,
+    dispatch_artifact: Path | None,
+    triage_dir: str,
+    result_status: str = "failed",
+) -> None:
+    if result_artifact:
+        _write_json_artifact(
+            result_artifact,
+            {
+                "project": project_name,
+                "dispatch_id": dispatch_id,
+                "failed": True,
+                "status": result_status,
+                "error": error_text,
+                "project_agent_session_id": "",
+                "project_agent_session_record_only": True,
+                "triage_dir": triage_dir,
+                "structured_evidence_summary": [],
+            },
+        )
+    if trace_artifact:
+        trace_artifact.write_text(
+            f"# Project Analysis Trace\n\n- status: {result_status}\n- project: {project_name}\n- dispatch_id: {dispatch_id}\n- error: {error_text}\n",
+            encoding="utf-8",
+        )
+    if dispatch_artifact:
+        payload = _read_json_artifact(dispatch_artifact)
+        payload.update({
+            "status": result_status,
+            "error": error_text,
+            "result_path": str(result_artifact or ""),
+        })
+        _write_json_artifact(dispatch_artifact, payload)
 
 
 def _is_correction_turn(*, task: str, context: str) -> bool:
@@ -43,7 +500,7 @@ async def query_db(input: dict) -> dict[str, Any]:
     sql = input["sql"].strip()
     if not sql.upper().startswith("SELECT"):
         return {"error": "只允许 SELECT 查询"}
-    db_path = _project_root() / "data" / "db" / "app.sqlite"
+    db_path = _app_db_path()
     try:
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
@@ -478,13 +935,7 @@ async def prepare_project_worktree_tool(input: dict) -> dict[str, Any]:
     session_workspace_text = str(input.get("session_workspace_path") or "").strip()
     session_workspace_path = Path(session_workspace_text) if session_workspace_text else None
     if not session_workspace_path and input.get("db_session_id"):
-        session_workspace_path = (
-            _project_root()
-            / "data"
-            / "sessions"
-            / f"session-{int(input['db_session_id'])}"
-            / "session_workspace.json"
-        )
+        session_workspace_path = _session_workspace_path(int(input["db_session_id"]))
     if not session_workspace_path:
         return {"error": "session_workspace_path or db_session_id is required"}
     if not session_workspace_path.exists():
@@ -513,105 +964,349 @@ async def prepare_project_worktree_tool(input: dict) -> dict[str, Any]:
 @tool(
     "dispatch_to_project",
     "将任务派发到指定项目的 Agent，在该项目目录下执行，使用该项目的 skills。"
-    "通常不要传 session_id；提供 db_session_id 后，工具会按 project_name 从 project_workspace.agent_sessions.projects 恢复对应项目上下文。"
-    "只有当你明确拿到同一项目、同一 worktree 的项目级 session_id 时才传 session_id。"
-    "返回项目 Agent 的输出结果和项目级 session_id。",
+    "project_name 必须由主编排根据当前用户问题与上下文关联度决定；skill 应由主编排显式传入。"
+    "若主编排漏传，且当前 RIOT 项目任务明显属于日志、ONES、订单/车辆执行链路、截图或附件排障，本工具会兜底选择 riot-log-triage。"
+    "本工具不会自动恢复项目 Agent session；session_id 仅作为审计兼容字段保存，不作为 resume 输入。"
+    "主编排判断本轮属于 ONES 工单、现场日志、订单/车辆执行链路、截图或附件排障时，应传 skill='riot-log-triage'。"
+    "每次调用都会创建项目分析目录，并返回项目 Agent 输出、分析目录和 record-only session_id。",
     {"type": "object", "properties": {
         "project_name": {"type": "string", "description": "projects.yaml 中注册的项目名称"},
         "task": {"type": "string", "description": "要派发给项目 Agent 的任务描述（详细）"},
         "context": {"type": "string", "description": "消息的原始内容和背景信息，供项目 Agent 参考"},
-        "session_id": {"type": "string", "description": "可选：同一项目、同一 worktree 的项目级 session_id。不要传 workspace/input/session.json 里的全局 agent_session_id"},
+        "skill": {"type": "string", "description": "可选：指定项目 Agent 必须加载的 workflow skill，例如 riot-log-triage"},
+        "session_id": {"type": "string", "description": "可选兼容字段，仅审计记录；不会用于项目 Agent resume。不要传 workspace/input/session.json 里的全局 agent_session_id"},
         "db_session_id": {"type": "integer", "description": "DB 会话 ID，用于读取/持久化项目级 Agent session"},
+        "message_id": {"type": "integer", "description": "可选：当前 DB 消息 ID，用于落盘目录 message-<id>"},
+        "orchestration_turn_id": {"type": "string", "description": "可选：主编排本轮 ID，用于审计"},
     }, "required": ["project_name", "task"]},
 )
 async def dispatch_to_project(input: dict) -> dict[str, Any]:
     from core.orchestrator.agent_client import agent_client
     from core.app.project_workspace import (
         build_project_workspace_prompt_block,
-        get_project_agent_session_id,
         prepare_project_from_session_workspace_path,
-        save_project_agent_session,
     )
     from core.projects import get_project, merge_skills, prepare_project_runtime_context
     from core.skill_registry import SKILL_REGISTRY
 
-    runtime = agent_client.get_active_runtime()
-    project_name = input["project_name"]
-    task = input["task"]
-    context = input.get("context", "")
-    resume_session_id = input.get("session_id")  # SDK session ID for resume
+    project_name = str(input["project_name"]).strip()
+    task = str(input["task"])
+    context = str(input.get("context") or "")
+    requested_skill = str(input.get("skill") or "").strip()
+    input_session_id_record = str(input.get("session_id") or "").strip()
     db_session_id = input.get("db_session_id")
+    message_id = _extract_message_id(input)
+    orchestration_turn_id = str(input.get("orchestration_turn_id") or "").strip()
+    runtime = agent_client.get_active_runtime()
 
     project = get_project(project_name)
     if not project:
         return {"error": f"Project '{project_name}' not found. Call list_projects to see available projects."}
 
-    # Track dispatch as a separate AgentRun
     import aiosqlite
     from datetime import datetime
-    db_path = _project_root() / "data" / "db" / "app.sqlite"
+
+    db_path = _app_db_path()
     analysis_workspace = ""
-    analysis_mode = False
+    session_agent_runtime = ""
     dispatch_run_id = None
     if db_session_id:
         try:
             async with aiosqlite.connect(str(db_path)) as db:
                 cursor = await db.execute(
-                    "SELECT analysis_mode, analysis_workspace FROM sessions WHERE id = ?",
+                    "SELECT analysis_mode, analysis_workspace, agent_runtime FROM sessions WHERE id = ?",
                     (db_session_id,),
                 )
                 row = await cursor.fetchone()
                 if row:
-                    analysis_mode = bool(row[0])
                     analysis_workspace = str(row[1] or "")
+                    session_agent_runtime = str(row[2] or "").strip()
         except Exception as e:
             logger.warning("Failed to read analysis session context: {}", e)
+    if session_agent_runtime:
+        runtime = normalize_agent_runtime(session_agent_runtime)
+
+    async def _update_dispatch_run(
+        *,
+        status: str,
+        input_path: str = "",
+        output_path: str = "",
+        error_message: str = "",
+        cost_usd: float = 0.0,
+    ) -> None:
+        if not dispatch_run_id:
+            return
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                now = datetime.now().isoformat()
+                await db.execute(
+                    "UPDATE agent_runs SET status=?, ended_at=?, input_path=?, output_path=?, cost_usd=?, error_message=? WHERE id=?",
+                    (status, now, input_path, output_path, cost_usd, error_message[:500], dispatch_run_id),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("Failed to update dispatch AgentRun: {}", exc)
+
+    async def _record_dispatch_paths(*, input_path: str = "", output_path: str = "") -> None:
+        if not dispatch_run_id:
+            return
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.execute(
+                    "UPDATE agent_runs SET input_path=?, output_path=? WHERE id=?",
+                    (input_path, output_path, dispatch_run_id),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("Failed to record dispatch artifact paths: {}", exc)
 
     try:
         async with aiosqlite.connect(str(db_path)) as db:
             now = datetime.now().isoformat()
             cursor = await db.execute(
                 "INSERT INTO agent_runs (agent_name, runtime_type, session_id, status, "
-                "input_path, output_path, input_tokens, output_tokens, cost_usd, error_message, started_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "message_id, input_path, output_path, input_tokens, output_tokens, cost_usd, error_message, started_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (f"dispatch:{project_name}", get_agent_run_runtime_type(runtime), db_session_id, "running",
-                 "", "", 0, 0, 0.0, "", now),
+                 message_id, "", "", 0, 0, 0.0, "", now),
             )
             dispatch_run_id = cursor.lastrowid
             await db.commit()
     except Exception as e:
         logger.warning("Failed to create dispatch AgentRun: {}", e)
 
-    # Merge skills: project overrides global while inheriting shared workflow skills
-    merged_agents = merge_skills(SKILL_REGISTRY, project.path, include_global=True)
+    dispatch_id = _dispatch_id(dispatch_run_id)
     runtime_context = None
     project_workspace: dict[str, Any] | None = None
     project_cwd = project.path
     session_workspace_path = None
+    session_workspace: dict[str, Any] = {}
+    artifact_roots: dict[str, str] = {}
     if db_session_id:
-        session_workspace_path = (
-            _project_root()
-            / "data"
-            / "sessions"
-            / f"session-{int(db_session_id)}"
-            / "session_workspace.json"
-        )
+        session_workspace_path = _session_workspace_path(int(db_session_id))
         if session_workspace_path.exists():
-            entry = prepare_project_from_session_workspace_path(
-                project_name,
-                session_workspace_path=session_workspace_path,
-                reason="dispatch_to_project",
-                active=True,
+            session_workspace = _read_json_artifact(session_workspace_path)
+            roots = session_workspace.get("session_artifact_roots")
+            if isinstance(roots, dict):
+                artifact_roots = {str(key): str(value) for key, value in roots.items()}
+            project_workspace_path = session_workspace_path.parent / "project_workspace.json"
+            project_workspace = _read_json_artifact(project_workspace_path)
+            project_entry = _project_entry_from_workspace(project_workspace, project_name)
+            if _project_entry_is_ready(project_entry):
+                project_cwd = Path(str(project_entry.get("worktree_path") or project_entry.get("execution_path")))
+                if str(project_workspace.get("active_project") or "").strip() != project_name:
+                    project_workspace["active_project"] = project_name
+                    _write_json_artifact(project_workspace_path, project_workspace)
+
+    selected_skill = ""
+    auto_selected_skill = ""
+    message_segment = _message_artifact_segment(message_id)
+    project_segment = _safe_artifact_segment(project_name, fallback="project")
+    if artifact_roots.get("session_dir"):
+        session_dir = Path(artifact_roots["session_dir"])
+    elif session_workspace_path:
+        session_dir = session_workspace_path.parent
+    else:
+        session_dir = _sessions_root() / "no-session"
+    analysis_root = Path(artifact_roots.get("analysis_dir") or (session_dir / ".analysis"))
+    orchestration_root = Path(artifact_roots.get("orchestration_dir") or (session_dir / ".orchestration"))
+    session_image_paths = _session_upload_image_paths(artifact_roots)
+    analysis_dir = (
+        analysis_root / message_segment / project_segment / dispatch_id
+        if analysis_root
+        else None
+    )
+    orchestration_dir = orchestration_root / message_segment if orchestration_root else None
+    if analysis_dir:
+        (analysis_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    if orchestration_dir:
+        orchestration_dir.mkdir(parents=True, exist_ok=True)
+
+    project_entry = _project_entry_from_workspace(project_workspace, project_name)
+    if (
+        not requested_skill
+        and _skill_registered(_RIOT_LOG_TRIAGE_SKILL)
+        and _looks_like_riot_log_triage_task(
+            project_name=project_name,
+            task=task,
+            context=context,
+            artifact_roots=artifact_roots,
+        )
+    ):
+        selected_skill = _RIOT_LOG_TRIAGE_SKILL
+        auto_selected_skill = _RIOT_LOG_TRIAGE_SKILL
+
+    triage_dir = _dispatch_triage_dir(
+        analysis_workspace=analysis_workspace,
+        artifact_roots=artifact_roots,
+        requested_skill=requested_skill,
+        selected_skill=selected_skill,
+        message_segment=message_segment,
+        project_segment=project_segment,
+        dispatch_id=dispatch_id,
+    )
+
+    input_artifact = analysis_dir / "input.json" if analysis_dir else None
+    prompt_artifact = analysis_dir / "prompt.md" if analysis_dir else None
+    result_artifact = analysis_dir / "result.json" if analysis_dir else None
+    trace_artifact = analysis_dir / "analysis_trace.md" if analysis_dir else None
+    dispatch_artifact = orchestration_dir / f"{dispatch_id}.json" if orchestration_dir else None
+
+    def _analysis_input_payload() -> dict[str, Any]:
+        return {
+            "message_id": message_id,
+            "db_session_id": db_session_id,
+            "orchestration_turn_id": orchestration_turn_id,
+            "dispatch_id": dispatch_id,
+            "project_name": project_name,
+            "skill": selected_skill or requested_skill,
+            "task": task,
+            "context": context,
+            "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or project_cwd),
+            "checkout_ref": str(project_entry.get("checkout_ref") or ""),
+            "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
+            "execution_version": str(project_entry.get("execution_version") or ""),
+            "project_path": str(project_entry.get("project_path") or project_entry.get("source_path") or project.path),
+            "input_session_id_record_only": input_session_id_record,
+            "triage_dir": triage_dir,
+            "image_paths": session_image_paths,
+        }
+
+    async def _fail_preflight(error_text: str, *, result_status: str) -> dict[str, Any]:
+        _write_project_dispatch_failure(
+            project_name=project_name,
+            dispatch_id=dispatch_id,
+            error_text=error_text,
+            result_artifact=result_artifact,
+            trace_artifact=trace_artifact,
+            dispatch_artifact=dispatch_artifact,
+            triage_dir=triage_dir,
+            result_status=result_status,
+        )
+        await _update_dispatch_run(
+            status="failed",
+            input_path=str(input_artifact or ""),
+            output_path=str(result_artifact or ""),
+            error_message=error_text,
+        )
+        project_agent_run = _persist_project_run_record(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            message_id=message_id,
+            dispatch_id=dispatch_id,
+            skill=selected_skill,
+            analysis_dir=analysis_dir,
+            agent_session_id="",
+            status=result_status,
+        )
+        return {
+            "error": error_text,
+            "project": project_name,
+            "dispatch_id": dispatch_id,
+            "agent_run_id": dispatch_run_id,
+            "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            "result_path": str(result_artifact) if result_artifact else "",
+            "triage_dir": triage_dir,
+            "project_agent_run": project_agent_run,
+        }
+
+    if input_artifact:
+        _write_json_artifact(input_artifact, _analysis_input_payload())
+    if dispatch_artifact:
+        _write_json_artifact(
+            dispatch_artifact,
+            {
+                "dispatch_id": dispatch_id,
+                "message_id": message_id,
+                "db_session_id": db_session_id,
+                "orchestration_turn_id": orchestration_turn_id,
+                "project": project_name,
+                "skill": selected_skill,
+                "requested_skill": requested_skill,
+                "auto_selected_skill": auto_selected_skill,
+                "task_summary": task[:500],
+                "context_summary": context[:1000],
+                "analysis_dir": str(analysis_dir) if analysis_dir else "",
+                "input_path": str(input_artifact or ""),
+                "result_path": str(result_artifact or ""),
+                "image_paths": session_image_paths,
+                "status": "preflight",
+            },
+        )
+    if trace_artifact:
+        trace_artifact.write_text(
+            "\n".join(
+                [
+                    "# Project Analysis Trace",
+                    "",
+                    "- status: preflight",
+                    f"- project: {project_name}",
+                    f"- dispatch_id: {dispatch_id}",
+                    f"- skill: {selected_skill}",
+                    f"- requested_skill: {requested_skill}",
+                    f"- auto_selected_skill: {auto_selected_skill}",
+                    f"- analysis_dir: {analysis_dir or ''}",
+                    f"- triage_dir: {triage_dir}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    _ensure_triage_preflight(
+        triage_dir=triage_dir,
+        project_name=project_name,
+        message_id=message_id,
+        dispatch_id=dispatch_id,
+        task=task,
+        context=context,
+        analysis_dir=analysis_dir,
+        artifact_roots=artifact_roots,
+    )
+    await _record_dispatch_paths(input_path=str(input_artifact or ""), output_path=str(result_artifact or ""))
+
+    if not _project_entry_is_ready(project_entry) and session_workspace_path and session_workspace_path.exists():
+        try:
+            entry = await asyncio.wait_for(
+                asyncio.to_thread(
+                    prepare_project_from_session_workspace_path,
+                    project_name,
+                    session_workspace_path=session_workspace_path,
+                    reason="dispatch_to_project",
+                    active=True,
+                ),
+                timeout=30,
             )
             if entry:
                 project_cwd = Path(str(entry.get("worktree_path") or entry.get("execution_path") or project.path))
-                try:
-                    project_workspace = json.loads((session_workspace_path.parent / "project_workspace.json").read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    project_workspace = None
+                project_workspace = _read_json_artifact(session_workspace_path.parent / "project_workspace.json")
+                project_entry = _project_entry_from_workspace(project_workspace, project_name)
+        except asyncio.TimeoutError:
+            return await _fail_preflight(
+                "dispatch_to_project preflight timed out while preparing project worktree after 30s",
+                result_status="preflight_timeout",
+            )
+        except Exception as exc:
+            return await _fail_preflight(
+                f"dispatch_to_project preflight failed while preparing project worktree: {exc}",
+                result_status="preflight_failed",
+            )
 
     if not project_workspace:
-        runtime_context = prepare_project_runtime_context(project_name)
+        try:
+            runtime_context = await asyncio.wait_for(
+                asyncio.to_thread(prepare_project_runtime_context, project_name),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            return await _fail_preflight(
+                "dispatch_to_project preflight timed out while preparing fallback project runtime after 30s",
+                result_status="preflight_timeout",
+            )
+        except Exception as exc:
+            return await _fail_preflight(
+                f"dispatch_to_project preflight failed while preparing fallback project runtime: {exc}",
+                result_status="preflight_failed",
+            )
         if runtime_context:
             project_cwd = Path(runtime_context.execution_path)
             project_workspace = {
@@ -621,148 +1316,368 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                     project_name: runtime_context.to_payload(),
                 },
             }
-    runtime_block = build_project_workspace_prompt_block(project_workspace)
-    selected_skill = None
-    selected_session_id = str(resume_session_id or "").strip() or None
-    triage_state_path = None
-    triage_state = None
-    triage_agent_context_active = False
-    project_agent_session_source = "input" if selected_session_id else ""
+            project_entry = _project_entry_from_workspace(project_workspace, project_name)
 
-    if analysis_mode and analysis_workspace:
-        triage_state_path = Path(analysis_workspace) / "00-state.json"
-        try:
-            triage_state = json.loads(triage_state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            triage_state = None
-
-        agent_context = (
-            triage_state.get("agent_context")
-            if isinstance(triage_state, dict) and isinstance(triage_state.get("agent_context"), dict)
-            else {}
-        )
-        state_skill = str(agent_context.get("skill") or "").strip()
-        if state_skill and state_skill in merged_agents:
-            triage_agent_context_active = True
-            selected_skill = state_skill
-            selected_session_id = str(agent_context.get("session_id") or "").strip() or None
-            if _is_correction_turn(task=task, context=context):
-                selected_session_id = None
-            project_agent_session_source = "triage_state" if selected_session_id else ""
-            merged_agents = {
-                name: definition
-                for name, definition in merged_agents.items()
-                if name == selected_skill or name != "ones"
+    if input_artifact:
+        _write_json_artifact(input_artifact, _analysis_input_payload())
+    if dispatch_artifact:
+        payload = _read_json_artifact(dispatch_artifact)
+        payload.update(
+            {
+                "status": "preparing_prompt",
+                "skill": selected_skill,
+                "requested_skill": requested_skill,
+                "auto_selected_skill": auto_selected_skill,
+                "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or project_cwd),
+                "checkout_ref": str(project_entry.get("checkout_ref") or ""),
+                "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
+                "execution_version": str(project_entry.get("execution_version") or ""),
             }
-
-    if not triage_agent_context_active and project_workspace:
-        saved_project_session_id = get_project_agent_session_id(
-            project_workspace,
-            project_name,
-            runtime=runtime,
         )
-        if selected_session_id:
-            if selected_session_id == saved_project_session_id:
-                project_agent_session_source = "input"
-            elif db_session_id and session_workspace_path:
-                logger.warning(
-                    "Ignoring unregistered project session_id for project {} in DB session {}",
-                    project_name,
-                    db_session_id,
-                )
-                selected_session_id = saved_project_session_id
-                project_agent_session_source = "project_workspace" if selected_session_id else ""
-        elif saved_project_session_id:
-            selected_session_id = saved_project_session_id
-            project_agent_session_source = "project_workspace"
+        _write_json_artifact(dispatch_artifact, payload)
 
-    # List project-specific skills for the prompt
+    merged_agents = merge_skills(SKILL_REGISTRY, project_cwd, include_global=True)
+    runtime_block = build_project_workspace_prompt_block(project_workspace)
+
+    if requested_skill:
+        if requested_skill in merged_agents:
+            selected_skill = requested_skill
+        else:
+            error_text = f"Skill '{requested_skill}' not available for project '{project_name}'."
+            if input_artifact:
+                _write_json_artifact(input_artifact, _analysis_input_payload())
+            if result_artifact:
+                _write_json_artifact(
+                    result_artifact,
+                    {
+                        "project": project_name,
+                        "dispatch_id": dispatch_id,
+                        "failed": True,
+                        "error": error_text,
+                        "project_agent_session_id": "",
+                        "project_agent_session_record_only": True,
+                        "triage_dir": triage_dir,
+                        "structured_evidence_summary": [],
+                    },
+                )
+            if trace_artifact:
+                trace_artifact.write_text(
+                    f"# Project Analysis Trace\n\n- status: failed\n- project: {project_name}\n- dispatch_id: {dispatch_id}\n- error: {error_text}\n",
+                    encoding="utf-8",
+                )
+            if dispatch_artifact:
+                _write_json_artifact(
+                    dispatch_artifact,
+                    {
+                        "dispatch_id": dispatch_id,
+                        "message_id": message_id,
+                        "project": project_name,
+                        "skill": requested_skill,
+                        "task_summary": task[:500],
+                        "context_summary": context[:1000],
+                        "analysis_dir": str(analysis_dir) if analysis_dir else "",
+                        "status": "failed",
+                        "error": error_text,
+                    },
+                )
+            await _update_dispatch_run(
+                status="failed",
+                input_path=str(input_artifact or ""),
+                output_path=str(result_artifact or ""),
+                error_message=error_text,
+            )
+            _persist_project_run_record(
+                session_workspace_path=session_workspace_path,
+                project_name=project_name,
+                message_id=message_id,
+                dispatch_id=dispatch_id,
+                skill=requested_skill,
+                analysis_dir=analysis_dir,
+                agent_session_id="",
+                status="failed",
+            )
+            return {
+                "error": error_text,
+                "project": project_name,
+                "dispatch_id": dispatch_id,
+                "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            }
+    elif selected_skill and selected_skill not in merged_agents:
+        logger.warning(
+            "Auto-selected {} for dispatch {} project {}, but the skill is unavailable after merge; continuing without it",
+            selected_skill,
+            dispatch_id,
+            project_name,
+        )
+        selected_skill = ""
+        auto_selected_skill = ""
+        triage_dir = ""
+
+    if selected_skill:
+        if auto_selected_skill:
+            logger.info(
+                "Auto-selected {} for dispatch {} project {}",
+                _RIOT_LOG_TRIAGE_SKILL,
+                dispatch_id,
+                project_name,
+            )
+        merged_agents = {
+            name: definition
+            for name, definition in merged_agents.items()
+            if name == selected_skill or name != "ones"
+        }
+
+    if input_artifact:
+        _write_json_artifact(input_artifact, _analysis_input_payload())
+    if dispatch_artifact:
+        payload = _read_json_artifact(dispatch_artifact)
+        payload.update(
+            {
+                "status": "prompt_ready",
+                "skill": selected_skill,
+                "requested_skill": requested_skill,
+                "auto_selected_skill": auto_selected_skill,
+                "triage_dir": triage_dir,
+                "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or project_cwd),
+                "checkout_ref": str(project_entry.get("checkout_ref") or ""),
+                "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
+                "execution_version": str(project_entry.get("execution_version") or ""),
+            }
+        )
+        _write_json_artifact(dispatch_artifact, payload)
+    if trace_artifact:
+        trace_artifact.write_text(
+            "\n".join(
+                [
+                    "# Project Analysis Trace",
+                    "",
+                    "- status: prompt_ready",
+                    f"- project: {project_name}",
+                    f"- dispatch_id: {dispatch_id}",
+                    f"- skill: {selected_skill}",
+                    f"- requested_skill: {requested_skill}",
+                    f"- auto_selected_skill: {auto_selected_skill}",
+                    f"- analysis_dir: {analysis_dir or ''}",
+                    f"- triage_dir: {triage_dir}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     project_only = list(merged_agents)
     skills_line = ""
     if project_only:
         skills_line = f"\n\n可用的项目 Skills: {', '.join(project_only)}"
 
-    # Build prompts for the project sub-agent
     project_prompt = f"""你是项目 "{project.name}" 的工作 Agent。
 
 源仓库目录: {project.path}
 执行/分析目录: {project_cwd}
+项目分析落盘目录: {analysis_dir or ""}
 项目说明: {project.description}{skills_line}{runtime_block}
 
 ## 回复规则
 {PROJECT_AGENT_RESPONSE_RULES}
+
+## 指定 Skill
+{f"必须使用 {selected_skill} workflow skill 完成本次项目任务。" if selected_skill else "未指定，按项目任务自行选择合适的项目 skill。"}
+
+## 边界
+你只负责当前项目 {project.name} 的一次性分析。不要判断或调度其他项目，不要调用 dispatch_to_project，不要生成最终飞书卡片，不要依赖历史项目 Agent session。
+请把可追溯的分析摘要写入项目分析落盘目录；最终输出给主编排的是结构化结论和证据摘要。
 
 ## 任务
 {task}"""
 
     if context:
         project_prompt += f"\n\n## 消息背景\n{context}"
+    if triage_dir:
+        project_prompt += f"\n\n## 关联 Triage 目录\n{triage_dir}"
+    if session_image_paths:
+        project_prompt += (
+            "\n\n## 已作为视觉输入传入的图片\n"
+            + "\n".join(f"- {path}" for path in session_image_paths)
+        )
 
     project_prompt += (
         "\n\n请在执行/分析目录中处理以上任务，可以使用 Read、Bash、Glob、Grep 等工具访问项目文件。"
-        "不要把源仓库目录作为工作目录；跨项目时用 prepare_project_worktree 按需加载相关项目。"
+        "不要把源仓库目录作为工作目录；不要跨项目调度，缺少其他项目信息时返回给主编排说明需要补派。"
     )
 
     project_system = (
         f"你运行在项目 {project.name} 的 session worktree 中（{project_cwd}）。"
         f"源仓库目录仅供识别：{project.path}。使用项目级 skills 完成任务。"
+        f"{f'本次必须使用 {selected_skill} workflow skill。' if selected_skill else ''}"
+        f"项目分析落盘目录：{analysis_dir or ''}。"
+        "你是一次性项目执行单元，不要 resume 历史项目 Agent session，不要调用 dispatch_to_project，不要生成最终飞书卡片。"
         f"{runtime_block}"
         f"\n\n{PROJECT_AGENT_RESPONSE_RULES}"
     )
 
-    try:
-        result = await agent_client.run_for_project(
-            prompt=project_prompt,
-            system_prompt=project_system,
-            project_cwd=str(project_cwd),
-            project_agents=merged_agents,
-            max_turns=20,
-            session_id=selected_session_id,
-            skill=selected_skill,
-            runtime=runtime,
+    if input_artifact:
+        _write_json_artifact(input_artifact, _analysis_input_payload())
+    if prompt_artifact:
+        prompt_artifact.write_text(project_prompt, encoding="utf-8")
+    if dispatch_artifact:
+        payload = _read_json_artifact(dispatch_artifact)
+        payload.update(
+            {
+                "status": "running",
+                "skill": selected_skill,
+                "requested_skill": requested_skill,
+                "auto_selected_skill": auto_selected_skill,
+                "triage_dir": triage_dir,
+                "prompt_path": str(prompt_artifact or ""),
+                "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or project_cwd),
+                "checkout_ref": str(project_entry.get("checkout_ref") or ""),
+                "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
+                "execution_version": str(project_entry.get("execution_version") or ""),
+            }
         )
+        _write_json_artifact(dispatch_artifact, payload)
 
-        new_session_id = result.get("session_id")
-        saved_project_agent_session: dict[str, Any] = {}
-        if triage_agent_context_active and triage_state_path and isinstance(triage_state, dict):
-            agent_context = triage_state.setdefault("agent_context", {})
-            if isinstance(agent_context, dict):
-                if new_session_id:
-                    agent_context["session_id"] = new_session_id
-                if selected_skill:
-                    agent_context["skill"] = selected_skill
-                agent_context["runtime"] = runtime
-            try:
-                triage_state_path.write_text(
-                    json.dumps(triage_state, ensure_ascii=False, indent=2) + "\n",
+    project_dispatch_timeout = _project_dispatch_timeout_seconds()
+    try:
+        result = await asyncio.wait_for(
+            agent_client.run_for_project(
+                prompt=project_prompt,
+                system_prompt=project_system,
+                project_cwd=str(project_cwd),
+                project_agents=merged_agents,
+                max_turns=20,
+                session_id=None,
+                skill=selected_skill or None,
+                runtime=runtime,
+                image_paths=session_image_paths,
+            ),
+            timeout=project_dispatch_timeout,
+        )
+        new_session_id = str(result.get("session_id") or "").strip()
+        if result.get("is_error"):
+            error_text = str(result.get("text") or "project agent returned an error")
+            if result_artifact:
+                _write_json_artifact(
+                    result_artifact,
+                    {
+                        "project": project_name,
+                        "dispatch_id": dispatch_id,
+                        "output_text": str(result.get("text") or ""),
+                        "failed": True,
+                        "error": error_text,
+                        "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
+                        "cost_usd": result.get("cost_usd", 0),
+                        "project_agent_session_id": new_session_id,
+                        "project_agent_session_record_only": True,
+                        "input_session_id_record_only": input_session_id_record,
+                        "triage_dir": triage_dir,
+                        "structured_evidence_summary": [],
+                        "raw": result,
+                    },
+                )
+            if trace_artifact:
+                trace_artifact.write_text(
+                    f"# Project Analysis Trace\n\n- status: failed\n- project: {project_name}\n- dispatch_id: {dispatch_id}\n- skill: {selected_skill or ''}\n- error: {error_text}\n",
                     encoding="utf-8",
                 )
-            except OSError as e:
-                logger.warning("Failed to persist triage agent context: {}", e)
-        elif new_session_id and session_workspace_path:
-            saved_project_agent_session = save_project_agent_session(
+            if dispatch_artifact:
+                payload = _read_json_artifact(dispatch_artifact)
+                payload.update({"status": "failed", "error": error_text, "result_path": str(result_artifact or "")})
+                _write_json_artifact(dispatch_artifact, payload)
+            await _update_dispatch_run(
+                status="failed",
+                input_path=str(input_artifact or ""),
+                output_path=str(result_artifact or ""),
+                error_message=error_text,
+                cost_usd=float(result.get("cost_usd") or 0),
+            )
+            project_agent_run = _persist_project_run_record(
                 session_workspace_path=session_workspace_path,
                 project_name=project_name,
-                session_id=str(new_session_id),
-                runtime=runtime,
+                message_id=message_id,
+                dispatch_id=dispatch_id,
+                skill=selected_skill or "",
+                analysis_dir=analysis_dir,
+                agent_session_id=new_session_id,
+                status="failed",
             )
+            return {
+                "error": error_text,
+                "project": project_name,
+                "session_id": new_session_id,
+                "dispatch_id": dispatch_id,
+                "analysis_dir": str(analysis_dir) if analysis_dir else "",
+                "result_path": str(result_artifact) if result_artifact else "",
+                "agent_session_scope": "record_only",
+                "project_agent_run": project_agent_run,
+            }
 
-        # Update dispatch AgentRun with result
-        if dispatch_run_id:
-            try:
-                async with aiosqlite.connect(str(db_path)) as db:
-                    now = datetime.now().isoformat()
-                    await db.execute(
-                        "UPDATE agent_runs SET status=?, ended_at=?, cost_usd=?, output_path=? WHERE id=?",
-                        ("success", now, result.get("cost_usd", 0),
-                         result.get("text", "")[:2000], dispatch_run_id),
-                    )
-                    await db.commit()
-            except Exception as e:
-                logger.warning("Failed to update dispatch AgentRun: {}", e)
+        if result_artifact:
+            _write_json_artifact(
+                result_artifact,
+                {
+                    "project": project_name,
+                    "dispatch_id": dispatch_id,
+                    "output_text": str(result.get("text") or ""),
+                    "failed": False,
+                    "error": "",
+                    "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
+                    "cost_usd": result.get("cost_usd", 0),
+                    "project_agent_session_id": new_session_id,
+                    "project_agent_session_record_only": True,
+                    "input_session_id_record_only": input_session_id_record,
+                    "triage_dir": triage_dir,
+                    "structured_evidence_summary": [],
+                    "raw": result,
+                },
+            )
+        if trace_artifact:
+            trace_artifact.write_text(
+                "\n".join(
+                    [
+                        "# Project Analysis Trace",
+                        "",
+                        f"- status: success",
+                        f"- project: {project_name}",
+                        f"- dispatch_id: {dispatch_id}",
+                        f"- skill: {selected_skill or ''}",
+                        f"- analysis_dir: {analysis_dir or ''}",
+                        f"- triage_dir: {triage_dir}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        if dispatch_artifact:
+            payload = _read_json_artifact(dispatch_artifact)
+            payload.update(
+                {
+                    "status": "success",
+                    "result_path": str(result_artifact or ""),
+                    "project_agent_session_id": new_session_id,
+                    "project_agent_session_record_only": True,
+                }
+            )
+            _write_json_artifact(dispatch_artifact, payload)
 
-        # Persist only coarse session metadata here. Project agent resume ids are
-        # scoped by project in project_workspace.agent_sessions.projects.
+        await _update_dispatch_run(
+            status="success",
+            input_path=str(input_artifact or ""),
+            output_path=str(result_artifact or ""),
+            cost_usd=float(result.get("cost_usd") or 0),
+        )
+
+        project_agent_run = _persist_project_run_record(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            message_id=message_id,
+            dispatch_id=dispatch_id,
+            skill=selected_skill or "",
+            analysis_dir=analysis_dir,
+            agent_session_id=new_session_id,
+            status="success",
+        )
+
         if db_session_id:
             try:
                 async with aiosqlite.connect(str(db_path)) as db:
@@ -781,26 +1696,140 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             "project": project_name,
             "result": result.get("text", ""),
             "session_id": new_session_id,
-            "resume_session_id": selected_session_id,
-            "resume_source": project_agent_session_source,
-            "agent_session_scope": "triage" if triage_agent_context_active else "project",
-            "project_agent_session": saved_project_agent_session,
+            "resume_session_id": None,
+            "resume_source": "",
+            "dispatch_id": dispatch_id,
+            "agent_run_id": dispatch_run_id,
+            "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            "result_path": str(result_artifact) if result_artifact else "",
+            "triage_dir": triage_dir,
+            "agent_session_scope": "record_only",
+            "project_agent_run": project_agent_run,
+        }
+    except asyncio.TimeoutError:
+        error_text = f"dispatch_to_project timed out after {project_dispatch_timeout}s"
+        logger.warning("dispatch_to_project timed out for {} after {}s", project_name, project_dispatch_timeout)
+        _write_project_dispatch_failure(
+            project_name=project_name,
+            dispatch_id=dispatch_id,
+            error_text=error_text,
+            result_artifact=result_artifact,
+            trace_artifact=trace_artifact,
+            dispatch_artifact=dispatch_artifact,
+            triage_dir=triage_dir,
+            result_status="timeout",
+        )
+        await _update_dispatch_run(
+            status="failed",
+            input_path=str(input_artifact or ""),
+            output_path=str(result_artifact or ""),
+            error_message=error_text,
+        )
+        project_agent_run = _persist_project_run_record(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            message_id=message_id,
+            dispatch_id=dispatch_id,
+            skill=selected_skill or "",
+            analysis_dir=analysis_dir,
+            agent_session_id="",
+            status="timeout",
+        )
+        return {
+            "error": error_text,
+            "project": project_name,
+            "dispatch_id": dispatch_id,
+            "agent_run_id": dispatch_run_id,
+            "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            "result_path": str(result_artifact) if result_artifact else "",
+            "project_agent_run": project_agent_run,
+        }
+    except asyncio.CancelledError:
+        error_text = "dispatch_to_project cancelled before project agent completed"
+        logger.warning("dispatch_to_project cancelled for {}", project_name)
+        _write_project_dispatch_failure(
+            project_name=project_name,
+            dispatch_id=dispatch_id,
+            error_text=error_text,
+            result_artifact=result_artifact,
+            trace_artifact=trace_artifact,
+            dispatch_artifact=dispatch_artifact,
+            triage_dir=triage_dir,
+            result_status="cancelled",
+        )
+        await _update_dispatch_run(
+            status="failed",
+            input_path=str(input_artifact or ""),
+            output_path=str(result_artifact or ""),
+            error_message=error_text,
+        )
+        _persist_project_run_record(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            message_id=message_id,
+            dispatch_id=dispatch_id,
+            skill=selected_skill or "",
+            analysis_dir=analysis_dir,
+            agent_session_id="",
+            status="failed",
+        )
+        return {
+            "error": error_text,
+            "project": project_name,
+            "dispatch_id": dispatch_id,
+            "agent_run_id": dispatch_run_id,
+            "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            "result_path": str(result_artifact) if result_artifact else "",
         }
     except Exception as e:
         logger.exception("dispatch_to_project failed for {}: {}", project_name, e)
-        # Mark dispatch AgentRun as failed
-        if dispatch_run_id:
-            try:
-                async with aiosqlite.connect(str(db_path)) as db:
-                    now = datetime.now().isoformat()
-                    await db.execute(
-                        "UPDATE agent_runs SET status=?, ended_at=?, error_message=? WHERE id=?",
-                        ("failed", now, str(e)[:500], dispatch_run_id),
-                    )
-                    await db.commit()
-            except Exception:
-                pass
-        return {"error": str(e), "project": project_name}
+        error_text = str(e)
+        if result_artifact:
+            _write_json_artifact(
+                result_artifact,
+                {
+                    "project": project_name,
+                    "dispatch_id": dispatch_id,
+                    "failed": True,
+                    "error": error_text,
+                    "project_agent_session_id": "",
+                    "project_agent_session_record_only": True,
+                    "triage_dir": triage_dir,
+                    "structured_evidence_summary": [],
+                },
+            )
+        if trace_artifact:
+            trace_artifact.write_text(
+                f"# Project Analysis Trace\n\n- status: failed\n- project: {project_name}\n- dispatch_id: {dispatch_id}\n- error: {error_text}\n",
+                encoding="utf-8",
+            )
+        if dispatch_artifact:
+            payload = _read_json_artifact(dispatch_artifact)
+            payload.update({"status": "failed", "error": error_text, "result_path": str(result_artifact or "")})
+            _write_json_artifact(dispatch_artifact, payload)
+        await _update_dispatch_run(
+            status="failed",
+            input_path=str(input_artifact or ""),
+            output_path=str(result_artifact or ""),
+            error_message=error_text,
+        )
+        _persist_project_run_record(
+            session_workspace_path=session_workspace_path,
+            project_name=project_name,
+            message_id=message_id,
+            dispatch_id=dispatch_id,
+            skill=selected_skill or "",
+            analysis_dir=analysis_dir,
+            agent_session_id="",
+            status="failed",
+        )
+        return {
+            "error": error_text,
+            "project": project_name,
+            "dispatch_id": dispatch_id,
+            "analysis_dir": str(analysis_dir) if analysis_dir else "",
+            "result_path": str(result_artifact) if result_artifact else "",
+        }
 
 
 # ==================== MCP Server ====================
@@ -822,7 +1851,6 @@ if settings.enable_memory_tools:
 
 PROJECT_TOOLS = [
     query_db,
-    prepare_project_worktree_tool,
 ]
 if settings.enable_memory_tools:
     PROJECT_TOOLS.extend([read_memory, search_memory_entries])

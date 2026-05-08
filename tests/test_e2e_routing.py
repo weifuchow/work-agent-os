@@ -2,7 +2,7 @@
 
 Mocks ONLY: FeishuClient (send/receive simulation)
 Real:        Claude API (haiku), pipeline, orchestrator, dispatch_to_project tool,
-             project agent resume, DB writes
+             record-only project agent runs, DB writes
 
 飞书话题（thread）模拟流程：
   Turn 1: 用户发原始消息（无 thread_id）
@@ -251,10 +251,10 @@ async def test_scenario_a_project_allspark_routing():
     3-turn allspark conversation.
 
     Turn 1: Orchestrator must identify allspark → call dispatch_to_project tool
-            → dispatch writes project to session and project-scoped agent session
-    Turn 2: Pipeline routes by thread_id → resumes orchestrator; dispatch resumes
-            the allspark project agent from project_workspace.agent_sessions
-    Turn 3: Same, resume continues
+            → dispatch writes project to session and records project_agent_runs
+    Turn 2: Pipeline routes by thread_id → resumes orchestrator; dispatch creates
+            a fresh project agent run and records its session id as audit-only
+    Turn 3: Same, fresh project run continues under the main orchestrator's context
 
     Key assertions:
       - session.project == "allspark" after turn 1
@@ -284,7 +284,7 @@ async def test_scenario_a_project_allspark_routing():
     agent_sid_after_t1 = t1["agent_session_id"]
     print(f"\n  ✓ Turn 1 routed to allspark, agent_session_id={agent_sid_after_t1!r}")
 
-    # Turn 2 — same thread, should resume orchestrator and project-scoped agent
+    # Turn 2 — same thread, should resume orchestrator and create a fresh project run
     assert thread_id, "No thread_id after turn 1 — pipeline must bind thread_id on first reply"
     t2 = await _run_turn(2, "简单项目支持的数据源", thread_id=thread_id)
 

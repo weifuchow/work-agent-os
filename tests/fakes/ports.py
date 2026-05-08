@@ -57,6 +57,28 @@ class FakeChannelPort:
         )
 
 
+class SequenceChannelPort:
+    def __init__(self, results: list[DeliveryResult]) -> None:
+        self.results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    async def deliver_reply(
+        self,
+        *,
+        source_message: dict[str, Any],
+        reply: ReplyPayload,
+    ) -> DeliveryResult:
+        self.calls.append({"source_message": source_message, "reply": reply})
+        if self.results:
+            return self.results.pop(0)
+        return DeliveryResult(
+            delivered=True,
+            message_id=f"reply_{source_message['platform_message_id']}",
+            thread_id="omt_reply_001",
+            root_id="om_root_001",
+        )
+
+
 class FakeFilePort:
     def __init__(self, files: dict[str, DownloadedFile] | None = None) -> None:
         self.files = files or {}
