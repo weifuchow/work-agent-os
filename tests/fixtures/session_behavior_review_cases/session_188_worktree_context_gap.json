@@ -1,0 +1,82 @@
+{
+  "case_id": "session-188-worktree-context-gap",
+  "title": "session-188 reused the riot-standalone source repo instead of a session worktree",
+  "source": {
+    "type": "session",
+    "session_id": 188,
+    "message_id": 1184,
+    "project": "riot-standalone",
+    "task_number": 150906
+  },
+  "symptom": {
+    "user_question": "session-188 为什么没有拉worktree",
+    "observed": "project_workspace marked riot-standalone ready while worktree_path and execution_path pointed to D:\\standard\\riot\\riot-standalone; the session worktrees directory was empty.",
+    "expected_behavior": "When policy.work_directory is session_worktree, project dispatch must prepare and use data/sessions/session-188/worktrees/riot-standalone/<version> instead of the source repo."
+  },
+  "facts": {
+    "policy": {
+      "work_directory": "session_worktree",
+      "load_on_demand_tool": "prepare_project_worktree"
+    },
+    "project_workspace": {
+      "active_project": "riot-standalone",
+      "execution_path": "D:\\standard\\riot\\riot-standalone",
+      "worktree_path": "D:\\standard\\riot\\riot-standalone",
+      "checkout_ref": "",
+      "recommended_worktree": "D:\\standard\\work-agent-os\\data\\sessions\\session-188\\worktrees\\riot-standalone\\current-master",
+      "status": "ready"
+    },
+    "audit_events": [
+      "worktree_context_gap"
+    ],
+    "ones_version_hints": [
+      "sprint/2.1-PD240309",
+      "FMS/RIoT 2.2.0.4"
+    ]
+  },
+  "expected_review": {
+    "quality": "poor",
+    "must_identify": [
+      "source repo was incorrectly treated as ready worktree",
+      "ONES version or branch context was not used when preparing the project",
+      "dispatch ready check was too broad",
+      "recommended_worktree did not exist"
+    ],
+    "root_cause": [
+      "checkout_ref empty led worktree creation to fall back to project_path",
+      "dispatch reused any existing path as ready without enforcing session_worktree policy"
+    ],
+    "expected_fix": [
+      "recover ONES context from session artifacts before preparing project workspace",
+      "recognize explicit branch sprint/2.1-PD240309",
+      "reject source_path or project_path as ready when policy requires session_worktree",
+      "add regression tests"
+    ]
+  },
+  "expected_debt_decision": {
+    "risk": "P1",
+    "types": [
+      "architecture_boundary",
+      "toolchain_reliability",
+      "test_gap"
+    ],
+    "decision": "fix_now",
+    "acceptance": [
+      "session_worktree policy requires worktree_path under session worktrees_dir",
+      "source repo path is not accepted as ready",
+      "ONES cached summary can restore version and branch context",
+      "regression tests cover source repo ready misclassification"
+    ]
+  },
+  "must_mention": [
+    "worktree_context_gap",
+    "session_worktree",
+    "checkout_ref",
+    "sprint/2.1-PD240309",
+    "dispatch_to_project"
+  ],
+  "must_not_claim": [
+    "项目 Agent 已经使用 session worktree",
+    "电梯问题根因已确定"
+  ]
+}
