@@ -43,6 +43,7 @@ description: 主编排 Agent 的项目协同 playbook，覆盖项目匹配、ses
 - 需要项目分析时，先确认 `workspace/input/project_workspace.json` 是否已有该项目 entry。
 - 若项目未加载，调用 `prepare_project_worktree`，把项目准备到当前 session 的 `worktrees/<project>/<task-version>` 下。
 - 初始化后复读或使用返回的 `project_workspace` entry，确认 `worktree_path/execution_path`、`checkout_ref`、版本和 commit。
+- ONES 中若同时出现标题版本/迭代号和明确代码分支，以明确分支为准；例如 `RIOT 分支版本 origin/xxx` 应优先于 `【3.52.0】` 或同名 tag。标题里的 `3.xx` 只能作为版本/迭代线索，不能单独覆盖分支证据。
 - 多项目问题逐个准备项目 worktree；每个项目只派发给对应项目 Agent。
 - `source_path/project_path` 只用于识别源仓库，不作为项目 Agent 的执行目录。
 - 项目 Agent 不负责创建、切换或加载其他项目工程目录；它只在主编排指定的 worktree 中分析。
@@ -67,7 +68,7 @@ description: 主编排 Agent 的项目协同 playbook，覆盖项目匹配、ses
 
 派发时显式选择 skill：
 
-- `riot-log-triage`：ONES 工单分析、现场日志、异常堆栈、订单/车辆执行链路、截图、附件排障、现场补料、RIOT/FMS/allspark 行为排查。
+- `riot-log-triage`：RIOT/FMS/allspark 的 ONES、现场日志、执行链路、截图或附件排障。硬判断以 `core/orchestrator/routing_policy.py` 为准。
 - `gitlab-issue-review`：GitLab issue/MR review。
 - `ones`：只做 ONES intake 或结构化预处理。若 ONES 事实已准备好，且当前要做项目/日志分析，应派发项目并使用 `riot-log-triage`。
 - 空 skill：普通项目代码、配置、实现说明，且不需要 workflow skill。
