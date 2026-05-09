@@ -16,6 +16,7 @@ from claude_agent_sdk import AgentDefinition
 from loguru import logger
 
 from core.config import settings
+from core.orchestrator.routing_policy import build_policy_prompt_summary
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _NPM_CODEX_EXE = (
@@ -191,10 +192,9 @@ class CodexRuntimeMixin:
                 "## Runtime Notes\n"
                 "你运行在 Codex CLI 中，仓库内置本地 MCP 工具。"
                 "主编排只做消息理解、项目路由、session-xx 项目工程目录初始化和结果汇总。"
-                "涉及已注册项目、ONES、日志、项目代码或版本 worktree 时，必须调用 dispatch_to_project 进入项目子编排；"
+                f"{build_policy_prompt_summary()}"
                 "项目未加载时，由主编排调用 prepare_project_worktree 准备 session worktree，项目 Agent 不负责创建或切换项目 worktree；"
                 "active_project 只是历史提示，每轮必须重新判断项目相关度；dispatch_to_project 必须显式给出 project_name、task、context 和需要的 skill；"
-                "ONES 工单、现场日志、订单/车辆执行链路、截图或附件排障必须给 dispatch_to_project 传 skill=\"riot-log-triage\"；"
                 "项目 Agent 返回后必须检查结果，再决定最终回复、纠正、补派或追问；不要在主编排里直接用 shell/文件读取完成项目分析。"
             )
 

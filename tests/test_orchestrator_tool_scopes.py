@@ -57,8 +57,10 @@ def test_project_runtime_keeps_project_execution_tools_without_recursive_dispatc
 
 def test_orchestrator_prompt_requires_project_dispatch_boundary():
     from core.agents.runner import GENERIC_SYSTEM_PROMPT, _build_generic_prompt
+    from core.orchestrator.routing_policy import build_policy_prompt_summary
     from core.ports import AgentRequest
 
+    policy_summary = build_policy_prompt_summary()
     request = AgentRequest(
         workspace_path=__import__("pathlib").Path("D:/tmp/session/workspace"),
         message={"id": 1, "message_type": "text", "content": "ONES#150738 allspark 日志排查"},
@@ -69,6 +71,7 @@ def test_orchestrator_prompt_requires_project_dispatch_boundary():
     prompt = _build_generic_prompt(request)
 
     for text in (GENERIC_SYSTEM_PROMPT, prompt):
+        assert policy_summary in text
         assert "必须调用 dispatch_to_project" in text
         assert "主编排" in text
         assert "不要" in text and "项目分析" in text

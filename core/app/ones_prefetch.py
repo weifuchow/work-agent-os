@@ -74,7 +74,17 @@ async def prepare_ones_intake(
 
     existing = _existing_ready_summary(Path(workspace.artifact_roots["ones_dir"]), reference)
     if existing:
-        return _result_from_snapshot(reference, existing, fetched=False)
+        runtime_context = _prepare_project_workspace_context(
+            ctx=ctx,
+            workspace=workspace,
+            ones_result=_ones_result_from_existing_snapshot(reference, existing),
+        )
+        return _result_from_snapshot(
+            reference,
+            existing,
+            fetched=False,
+            project_context=runtime_context if isinstance(runtime_context, dict) else None,
+        )
 
     fetched = await _fetch_ones(reference, Path(workspace.artifact_roots["ones_dir"]))
     if not fetched.get("success"):
@@ -366,6 +376,59 @@ def _existing_ready_summary(ones_dir: Path, reference: str) -> dict[str, Any] | 
         if isinstance(snapshot, dict) and (snapshot.get("source") or {}).get("images_consumed") is True:
             return snapshot
     return None
+
+
+def _ones_result_from_existing_snapshot(reference: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+    task_number = ""
+    task_uuid = ""
+    summary_path = ""
+    task_dir: Path | None = None
+    downloaded = snapshot.get("downloaded_files") or []
+    if downloaded:
+        first_path = Path(str((downloaded[0] or {}).get("path") or ""))
+        task_dir = first_path.parent.parent if first_path.parent.name == "attachment" else first_path.parent
+        if task_dir.name:
+            summary_path = str(task_dir / "summary_snapshot.json")
+        if "_" in task_dir.name:
+            task_number, task_uuid = task_dir.name.split("_", 1)
+    if not task_uuid:
+        token = _reference_token(reference)
+        if token and not token.isdigit():
+            task_uuid = token
+        elif token:
+            task_number = token
+
+    result: dict[str, Any] = {}
+    task_json = task_dir / "task.json" if task_dir else None
+    if task_json and task_json.exists():
+        try:
+            loaded = json.loads(task_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            result.update(loaded)
+
+    task_payload = dict(result.get("task") or {}) if isinstance(result.get("task"), dict) else {}
+    if task_number and not str(task_payload.get("number") or "").strip():
+        task_payload["number"] = task_number
+    if task_uuid and not str(task_payload.get("uuid") or "").strip():
+        task_payload["uuid"] = task_uuid
+    result["task"] = task_payload
+    if not isinstance(result.get("project"), dict):
+        result["project"] = {}
+    if not isinstance(result.get("named_fields"), dict):
+        result["named_fields"] = {}
+    result["summary_snapshot"] = snapshot
+
+    paths = dict(result.get("paths") or {}) if isinstance(result.get("paths"), dict) else {}
+    if summary_path:
+        paths["summary_snapshot_json"] = summary_path
+    if task_dir:
+        paths.setdefault("task_dir", str(task_dir))
+    if task_json:
+        paths.setdefault("task_json", str(task_json))
+    result["paths"] = paths
+    return result
 
 
 def _reference_token(reference: str) -> str:

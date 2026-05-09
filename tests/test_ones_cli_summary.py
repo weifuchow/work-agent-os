@@ -12,10 +12,12 @@ if str(ONES_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(ONES_SCRIPTS))
 
 from ones_cli import build_summary_snapshot, merge_subagent_summary_snapshot, parser  # noqa: E402
+from core.app.context import MessageContext, PreparedWorkspace  # noqa: E402
 from core.app.ones_prefetch import (  # noqa: E402
     _build_image_summary_snapshot,
     _mark_core_summary_source,
     extract_ones_reference,
+    prepare_ones_intake,
 )
 
 
@@ -120,6 +122,105 @@ def test_core_ones_prefetch_extracts_reference_and_renames_summary_source():
     assert snapshot["source"]["summary_status"] == "success"
     assert "subagent" not in snapshot["source"]
     assert "subagent_error" not in snapshot["source"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_ones_intake_refreshes_project_context_from_cached_summary(monkeypatch, tmp_path):
+    session_dir = tmp_path / "session-183"
+    workspace_dir = session_dir / "workspace"
+    input_dir = workspace_dir / "input"
+    ones_dir = session_dir / ".ones"
+    task_dir = ones_dir / "150812_NbJXtiyGTbyYeF7Z"
+    attachment_dir = task_dir / "attachment"
+    for path in (input_dir, workspace_dir / "state", workspace_dir / "output", workspace_dir / "artifacts", attachment_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    image_path = attachment_dir / "description_image_01.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    summary_path = task_dir / "summary_snapshot.json"
+    task_path = task_dir / "task.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "ready",
+                "version_normalized": "3.52.0",
+                "version_text": "3.52.0；RIOT 分支版本 origin/zwf/deadend_optimise",
+                "business_identifiers": ["origin/zwf/deadend_optimise"],
+                "downloaded_files": [{"label": "desc", "path": str(image_path)}],
+                "source": {"images_consumed": True, "images_available": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    task_path.write_text(
+        json.dumps(
+            {
+                "project": {
+                    "ones_project_name": "软件部-基础迭代组",
+                    "display_name": "3.52.0",
+                },
+                "named_fields": {"软件版本": "3.50"},
+                "task": {"number": 150812, "uuid": "NbJXtiyGTbyYeF7Z"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    artifact_roots = {
+        "session_dir": str(session_dir),
+        "workspace_dir": str(workspace_dir),
+        "ones_dir": str(ones_dir),
+        "worktrees_dir": str(session_dir / "worktrees"),
+    }
+    (input_dir / "project_context.json").write_text(
+        json.dumps({"artifact_roots": artifact_roots}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    workspace = PreparedWorkspace(
+        path=workspace_dir,
+        input_dir=input_dir,
+        state_dir=workspace_dir / "state",
+        output_dir=workspace_dir / "output",
+        artifacts_dir=workspace_dir / "artifacts",
+        artifact_roots=artifact_roots,
+        media_manifest={},
+        skill_registry={},
+    )
+    ctx = MessageContext(
+        message={
+            "id": 1133,
+            "content": "https://ones.standard-robots.com:10120/project/#/team/UNrQ5Ny5/task/NbJXtiyGTbyYeF7Z",
+        },
+        session={"id": 183},
+        history=[],
+    )
+    captured = {}
+
+    def fake_prepare_project_in_workspace(workspace_arg, project_name, *, ones_result=None, **kwargs):
+        captured["project_name"] = project_name
+        captured["ones_result"] = ones_result
+        return {
+            "running_project": project_name,
+            "checkout_ref": "origin/zwf/deadend_optimise",
+            "loaded_reason": kwargs.get("reason"),
+        }
+
+    monkeypatch.setattr("core.app.project_workspace.prepare_project_in_workspace", fake_prepare_project_in_workspace)
+    monkeypatch.setattr(
+        "core.app.ones_prefetch._infer_project_name",
+        lambda *, ctx, ones_result: "allspark",
+    )
+
+    result = await prepare_ones_intake(ctx, workspace, runtime="codex")
+
+    assert result is not None
+    assert result.fetched is False
+    assert result.project_context["checkout_ref"] == "origin/zwf/deadend_optimise"
+    assert captured["project_name"] == "allspark"
+    assert captured["ones_result"]["project"]["ones_project_name"] == "软件部-基础迭代组"
+    assert captured["ones_result"]["summary_snapshot"]["version_normalized"] == "3.52.0"
+    assert captured["ones_result"]["task"]["uuid"] == "NbJXtiyGTbyYeF7Z"
+    assert captured["ones_result"]["paths"]["summary_snapshot_json"] == str(summary_path)
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,8 @@ def prepare_project_from_session_workspace_path(
     workspace = _workspace_from_session_workspace_path(session_workspace_path)
     if not workspace:
         return None
+    if ones_result is None:
+        ones_result = _latest_session_ones_result(workspace)
     return prepare_project_in_workspace(
         workspace,
         project_name,
@@ -98,6 +100,74 @@ def prepare_project_from_session_workspace_path(
         active=active,
         worktree_token=worktree_token,
     )
+
+
+def _latest_session_ones_result(workspace: PreparedWorkspace) -> dict[str, Any] | None:
+    artifact_roots = _artifact_roots_or_default(workspace)
+    ones_dir_text = str(artifact_roots.get("ones_dir") or "").strip()
+    if not ones_dir_text and artifact_roots.get("session_dir"):
+        ones_dir_text = str(Path(str(artifact_roots["session_dir"])) / ".ones")
+    if not ones_dir_text:
+        return None
+    ones_dir = Path(ones_dir_text)
+    if not ones_dir.exists():
+        return None
+
+    summaries = sorted(
+        ones_dir.glob("*/summary_snapshot.json"),
+        key=lambda path: _path_mtime(path),
+        reverse=True,
+    )
+    for summary_path in summaries:
+        result = _ones_result_from_summary_path(summary_path)
+        if result:
+            return result
+    return None
+
+
+def _ones_result_from_summary_path(summary_path: Path) -> dict[str, Any] | None:
+    try:
+        snapshot = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+
+    task_dir = summary_path.parent
+    result: dict[str, Any] = {}
+    task_json = task_dir / "task.json"
+    if task_json.exists():
+        try:
+            loaded = json.loads(task_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            result.update(loaded)
+
+    task_payload = dict(result.get("task") or {}) if isinstance(result.get("task"), dict) else {}
+    if "_" in task_dir.name:
+        task_number, task_uuid = task_dir.name.split("_", 1)
+        task_payload.setdefault("number", task_number)
+        task_payload.setdefault("uuid", task_uuid)
+    result["task"] = task_payload
+    if not isinstance(result.get("project"), dict):
+        result["project"] = {}
+    if not isinstance(result.get("named_fields"), dict):
+        result["named_fields"] = {}
+    paths = dict(result.get("paths") or {}) if isinstance(result.get("paths"), dict) else {}
+    paths.setdefault("task_dir", str(task_dir))
+    paths.setdefault("task_json", str(task_json))
+    paths["summary_snapshot_json"] = str(summary_path)
+    result["paths"] = paths
+    result["summary_snapshot"] = snapshot
+    return result
+
+
+def _path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def persist_project_runtime(

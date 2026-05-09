@@ -333,11 +333,18 @@ def _stringify_field_value(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _is_plain_version_label(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(re.fullmatch(r"[vV]?\d+(?:\.\d+){1,4}", text))
+
+
 def _extract_business_project_name(ones_result: dict[str, Any] | None) -> str:
     project = (ones_result or {}).get("project") or {}
     for key in ("display_name", "business_project_name", "title_project_name", "ones_project_name"):
         value = str(project.get(key) or "").strip()
-        if value:
+        if value and not _is_plain_version_label(value):
             return value
     return ""
 
@@ -372,6 +379,117 @@ def _extract_ones_version_hint(ones_result: dict[str, Any] | None) -> tuple[str,
         normalized = _extract_semver_like(raw_value)
         return field_name, raw_value, normalized
     return "", "", ""
+
+
+def _clean_branch_candidate(value: str) -> str:
+    candidate = str(value or "").strip().strip("`'\"")
+    candidate = candidate.removeprefix("refs/remotes/")
+    candidate = candidate.removeprefix("refs/heads/")
+    return candidate.strip(" ,，;；:：()（）[]【】<>。")
+
+
+def _find_branch_candidates(text: str) -> list[str]:
+    value = str(text or "")
+    if not value:
+        return []
+
+    patterns = (
+        r"(?:分支版本|版本分支|代码分支|git\s*branch|branch|分支)"
+        r"[^A-Za-z0-9_/.-]{0,24}"
+        r"(?P<branch>(?:origin/)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._/-]+)*)",
+        r"\b(?P<branch>origin/[A-Za-z0-9._/-]+)\b",
+        r"\b(?P<branch>(?:origin/)?(?:release|hotfix|sprint|feature|bugfix|fix|support)/[A-Za-z0-9._/-]+)\b",
+    )
+    candidates: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            candidate = _clean_branch_candidate(match.group("branch"))
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _ones_branch_hint_sources(ones_result: dict[str, Any] | None) -> list[tuple[str, str]]:
+    if not ones_result:
+        return []
+
+    sources: list[tuple[str, str]] = []
+    snapshot = (ones_result or {}).get("summary_snapshot") or {}
+    if isinstance(snapshot, dict):
+        for key in ("version_text", "summary_text", "branch_text", "checkout_ref"):
+            raw_value = _stringify_field_value(snapshot.get(key))
+            if raw_value:
+                sources.append((f"summary_snapshot.{key}", raw_value))
+        for key in ("business_identifiers", "observations", "version_fields"):
+            raw_items = snapshot.get(key)
+            if isinstance(raw_items, list):
+                for index, item in enumerate(raw_items, start=1):
+                    raw_value = _stringify_field_value(item)
+                    if raw_value:
+                        sources.append((f"summary_snapshot.{key}[{index}]", raw_value))
+
+    named_fields = (ones_result or {}).get("named_fields") or {}
+    if isinstance(named_fields, dict):
+        for field_name, field_value in named_fields.items():
+            if "分支" not in str(field_name).lower() and "branch" not in str(field_name).lower():
+                continue
+            raw_value = _stringify_field_value(field_value)
+            if raw_value:
+                sources.append((str(field_name), raw_value))
+
+    task = (ones_result or {}).get("task") or {}
+    if isinstance(task, dict):
+        for key in ("description_local", "description"):
+            raw_value = _stringify_field_value(task.get(key))
+            if raw_value:
+                sources.append((f"task.{key}", raw_value))
+    return sources
+
+
+def _resolve_branch_hint(
+    candidate: str,
+    *,
+    local_branches: tuple[str, ...],
+    remote_branches: tuple[str, ...],
+) -> tuple[str, str] | None:
+    clean_candidate = _clean_branch_candidate(candidate)
+    if not clean_candidate:
+        return None
+
+    if clean_candidate.startswith("origin/"):
+        display = clean_candidate.removeprefix("origin/")
+        if clean_candidate in remote_branches:
+            return display, clean_candidate
+        if display in local_branches:
+            return display, display
+        return None
+
+    if clean_candidate in local_branches:
+        return clean_candidate, clean_candidate
+
+    remote_candidate = f"origin/{clean_candidate}"
+    if remote_candidate in remote_branches:
+        return clean_candidate, remote_candidate
+    return None
+
+
+def _extract_explicit_ones_branch_hint(
+    ones_result: dict[str, Any] | None,
+    *,
+    local_branches: tuple[str, ...],
+    remote_branches: tuple[str, ...],
+) -> tuple[str, str, str, str]:
+    for source_field, raw_value in _ones_branch_hint_sources(ones_result):
+        for candidate in _find_branch_candidates(raw_value):
+            resolved = _resolve_branch_hint(
+                candidate,
+                local_branches=local_branches,
+                remote_branches=remote_branches,
+            )
+            if resolved:
+                display, ref = resolved
+                return source_field, raw_value, display, ref
+    return "", "", "", ""
 
 
 def _branch_candidates_for_version(normalized_version: str) -> list[str]:
@@ -815,7 +933,18 @@ def resolve_project_runtime_context(
     inventory = _git_ref_inventory(str(project.path.resolve()))
     version_field, version_value, normalized_version = _extract_ones_version_hint(ones_result)
     current_version = git_meta.version_hint or git_meta.describe or git_meta.branch or git_meta.commit_sha[:8]
-    if ones_result or normalized_version:
+    branch_hint_field, branch_hint_value, explicit_branch, explicit_branch_ref = _extract_explicit_ones_branch_hint(
+        ones_result,
+        local_branches=inventory["local_branches"],
+        remote_branches=inventory["remote_branches"],
+    )
+    explicit_branch_selected = bool(explicit_branch_ref)
+    if explicit_branch_selected:
+        target_branch = explicit_branch
+        target_branch_ref = explicit_branch_ref
+        branch_notes = [f"ONES 分支线索来自 {branch_hint_field}: {branch_hint_value}"]
+        target_tag = _select_matching_tag(normalized_version, tags=inventory["tags"])
+    elif ones_result or normalized_version:
         target_branch, target_branch_ref, branch_notes = _select_matching_branch(
             normalized_version,
             local_branches=inventory["local_branches"],
@@ -839,25 +968,40 @@ def resolve_project_runtime_context(
     notes = list(branch_notes)
     if version_field and version_value:
         notes.insert(0, f"ONES 版本线索来自 {version_field}: {version_value}")
-    if target_tag:
+    if target_tag and explicit_branch_selected:
+        notes.append(f"同时存在版本 Tag: {target_tag}")
+    elif target_tag:
         notes.append(f"匹配到版本 Tag: {target_tag}")
     elif normalized_version:
         notes.append("未匹配到精确 Tag")
+    if explicit_branch_selected and normalized_version:
+        notes.append(f"检测到明确分支 {target_branch_ref}，{normalized_version} 仅作为版本/迭代线索，不优先检出 Tag。")
     if ones_result:
         notes.append("如需切换版本，优先使用 worktree，避免污染当前工作区。")
 
-    checkout_ref = target_tag or target_branch_ref or target_branch or git_meta.branch or ""
+    checkout_ref = (
+        target_branch_ref
+        if explicit_branch_selected
+        else target_tag or target_branch_ref or target_branch or git_meta.branch or ""
+    )
     execution_path = project.path
-    recommended_worktree = _recommended_worktree_path(
-        project_name,
-        ones_result=ones_result,
-        normalized_version=(
+    worktree_version_token = (
+        f"{normalized_version}-{target_branch}"
+        if explicit_branch_selected and normalized_version and target_branch
+        else target_branch
+        if explicit_branch_selected and target_branch
+        else (
             normalized_version
             or (target_branch if not ones_result else "")
             or current_version
             or git_meta.branch
             or git_meta.commit_sha[:8]
-        ),
+        )
+    )
+    recommended_worktree = _recommended_worktree_path(
+        project_name,
+        ones_result=ones_result,
+        normalized_version=worktree_version_token,
         worktree_token=worktree_token,
         worktree_root=worktree_root,
     )

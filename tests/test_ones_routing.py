@@ -271,6 +271,60 @@ def test_resolve_project_runtime_context_falls_back_to_master_when_no_version_br
     assert ctx.version_source_value == "4.9.2-186-g96fb6f2f9_20250723"
 
 
+def test_resolve_project_runtime_context_prefers_explicit_ones_branch_over_title_tag(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: projects_mod.ProjectConfig(name=name, path=tmp_path, description=""),
+    )
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project_git_meta",
+        lambda **kwargs: projects_mod.ProjectGitMeta(
+            branch="zwf/deadend_optimise",
+            commit_sha="b6e4d73cca4b",
+            describe="3.51.0-17-gb6e4d73cc",
+            version_hint="3.51.0",
+        ),
+    )
+    monkeypatch.setattr(
+        projects_mod,
+        "_git_ref_inventory",
+        lambda path_str: {
+            "local_branches": ("master", "zwf/deadend_optimise"),
+            "remote_branches": ("origin/master", "origin/zwf/deadend_optimise"),
+            "tags": ("3.52.0",),
+        },
+    )
+
+    ctx = projects_mod.resolve_project_runtime_context(
+        "allspark",
+        ones_result={
+            "task": {"number": 150812, "uuid": "NbJXtiyGTbyYeF7Z"},
+            "project": {
+                "ones_project_name": "软件部-基础迭代组",
+                "display_name": "3.52.0",
+                "title_project_name": "3.52.0",
+            },
+            "summary_snapshot": {
+                "version_normalized": "3.52.0",
+                "version_text": "3.52.0；RIOT 分支版本 origin/zwf/deadend_optimise",
+                "business_identifiers": ["origin/zwf/deadend_optimise"],
+            },
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.normalized_version == "3.52.0"
+    assert ctx.target_branch == "zwf/deadend_optimise"
+    assert ctx.target_branch_ref == "origin/zwf/deadend_optimise"
+    assert ctx.target_tag == "3.52.0"
+    assert ctx.checkout_ref == "origin/zwf/deadend_optimise"
+    assert ctx.business_project_name == "软件部-基础迭代组"
+    assert any("ONES 分支线索来自 summary_snapshot.version_text" in note for note in ctx.notes)
+    assert any("仅作为版本/迭代线索" in note for note in ctx.notes)
+
+
 def _git(repo, *args):
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -317,6 +371,107 @@ def test_prepare_project_runtime_context_creates_worktree_for_matching_tag(monke
     current_ref = _git(ctx.execution_path, "describe", "--tags", "--exact-match", "HEAD").stdout.strip()
     assert current_ref == "v4.9.2"
     assert any("已创建 worktree" in note or "复用已有 worktree" in note for note in ctx.notes)
+
+
+def test_prepare_project_runtime_context_creates_worktree_for_explicit_ones_branch(monkeypatch, tmp_path):
+    repo = tmp_path / "allspark"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "README.md").write_text("master\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "tag", "3.52.0")
+    _git(repo, "checkout", "-b", "zwf/deadend_optimise")
+    (repo / "README.md").write_text("branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "branch")
+    branch_commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "master")
+
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: projects_mod.ProjectConfig(name=name, path=repo, description=""),
+    )
+    monkeypatch.setattr(projects_mod, "settings", SimpleNamespace(project_root=tmp_path))
+    projects_mod._git_ref_inventory.cache_clear()
+
+    ctx = projects_mod.prepare_project_runtime_context(
+        "allspark",
+        ones_result={
+            "task": {"number": 150812, "uuid": "NbJXtiyGTbyYeF7Z"},
+            "project": {
+                "ones_project_name": "软件部-基础迭代组",
+                "display_name": "3.52.0",
+            },
+            "summary_snapshot": {
+                "version_normalized": "3.52.0",
+                "version_text": "3.52.0；RIOT 分支版本 zwf/deadend_optimise",
+            },
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.execution_path != repo
+    assert ctx.execution_path.exists()
+    assert ctx.checkout_ref == "zwf/deadend_optimise"
+    assert ctx.target_tag == "3.52.0"
+    assert ctx.execution_commit_sha == branch_commit[:12]
+    assert _git(ctx.execution_path, "rev-parse", "HEAD").stdout.strip() == branch_commit
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "master"
+    assert any("已创建 worktree" in note or "复用已有 worktree" in note for note in ctx.notes)
+
+
+def test_prepare_project_runtime_context_detects_sprint_branch_without_label(monkeypatch, tmp_path):
+    repo = tmp_path / "riot-standalone"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "README.md").write_text("master\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "tag", "v2.1.0")
+    _git(repo, "checkout", "-b", "sprint/2.1-PD240309")
+    (repo / "README.md").write_text("project branch\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "project branch")
+    branch_commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "master")
+
+    monkeypatch.setattr(
+        projects_mod,
+        "get_project",
+        lambda name: projects_mod.ProjectConfig(name=name, path=repo, description=""),
+    )
+    monkeypatch.setattr(projects_mod, "settings", SimpleNamespace(project_root=tmp_path))
+    projects_mod._git_ref_inventory.cache_clear()
+
+    ctx = projects_mod.prepare_project_runtime_context(
+        "riot-standalone",
+        ones_result={
+            "task": {
+                "number": 150906,
+                "uuid": "QoV3VYGSsxOV9iD2",
+                "description_local": "版本: sprint/2.1-PD240309",
+            },
+            "named_fields": {"FMS/RIoT版本": "2.2.0.4"},
+            "summary_snapshot": {
+                "version_normalized": "sprint/2.1-PD240309",
+                "version_text": "sprint/2.1-PD240309",
+            },
+        },
+    )
+
+    assert ctx is not None
+    assert ctx.execution_path != repo
+    assert ctx.execution_path.exists()
+    assert ctx.checkout_ref == "sprint/2.1-PD240309"
+    assert ctx.target_branch == "sprint/2.1-PD240309"
+    assert ctx.target_tag == "v2.1.0"
+    assert ctx.execution_commit_sha == branch_commit[:12]
+    assert _git(ctx.execution_path, "rev-parse", "HEAD").stdout.strip() == branch_commit
+    assert _git(repo, "branch", "--show-current").stdout.strip() == "master"
 
 
 def test_prepare_project_runtime_context_reuses_legacy_issue_version_worktree(monkeypatch, tmp_path):

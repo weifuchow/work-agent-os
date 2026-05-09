@@ -101,6 +101,77 @@ def test_prepare_direct_project_context_persists_runtime(monkeypatch, tmp_path):
     assert not (workspace.input_dir / "project_runtime_context.json").exists()
 
 
+def test_prepare_project_from_session_workspace_path_uses_existing_ones_summary(monkeypatch, tmp_path):
+    from core.app import project_workspace as project_workspace_mod
+    from core.app.project_workspace import prepare_project_from_session_workspace_path
+
+    workspace = _workspace(tmp_path / "workspace")
+    session_dir = Path(workspace.artifact_roots["session_dir"])
+    (session_dir / "session_workspace.json").write_text(
+        json.dumps({"session_artifact_roots": workspace.artifact_roots}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    ones_task_dir = session_dir / ".ones" / "150906_QoV3VYGSsxOV9iD2"
+    ones_task_dir.mkdir(parents=True)
+    (ones_task_dir / "summary_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version_normalized": "sprint/2.1-PD240309",
+                "version_text": "sprint/2.1-PD240309",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (ones_task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task": {
+                    "number": 150906,
+                    "uuid": "QoV3VYGSsxOV9iD2",
+                    "description_local": "版本: sprint/2.1-PD240309",
+                },
+                "named_fields": {"FMS/RIoT版本": "2.2.0.4"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_prepare_project_runtime_context(project_name, ones_result=None, worktree_root=None, worktree_token=""):
+        captured["ones_result"] = ones_result
+        execution_path = Path(worktree_root) / project_name / "150906-sprint"
+        execution_path.mkdir(parents=True)
+        return SimpleNamespace(
+            to_payload=lambda: {
+                "running_project": project_name,
+                "project_path": str(tmp_path / "repo" / project_name),
+                "execution_path": str(execution_path),
+                "worktree_path": str(execution_path),
+                "checkout_ref": "sprint/2.1-PD240309",
+            }
+        )
+
+    monkeypatch.setattr(
+        project_workspace_mod,
+        "prepare_project_runtime_context",
+        fake_prepare_project_runtime_context,
+    )
+
+    payload = prepare_project_from_session_workspace_path(
+        "riot-standalone",
+        session_workspace_path=session_dir / "session_workspace.json",
+        reason="dispatch_to_project",
+    )
+
+    assert payload is not None
+    assert captured["ones_result"]["summary_snapshot"]["version_text"] == "sprint/2.1-PD240309"
+    assert captured["ones_result"]["task"]["number"] == 150906
+    assert captured["ones_result"]["named_fields"]["FMS/RIoT版本"] == "2.2.0.4"
+    assert payload["checkout_ref"] == "sprint/2.1-PD240309"
+
+
 def test_prepare_direct_project_context_fast_entry_creates_master_worktree(monkeypatch, tmp_path):
     workspace = _workspace(tmp_path / "workspace")
     repo = tmp_path / "repo" / "allspark"
