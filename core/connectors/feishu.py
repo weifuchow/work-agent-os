@@ -298,6 +298,201 @@ class FeishuClient:
             logger.info("Image uploaded: {} -> {}", image_path, image_key)
         return image_key or None
 
+    def upload_file(
+        self,
+        file_path: str,
+        *,
+        file_name: str | None = None,
+        file_type: str = "stream",
+    ) -> str | None:
+        """Upload a local file for IM file messages and return file_key."""
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        path = Path(file_path)
+        upload_name = file_name or path.name
+        try:
+            with path.open("rb") as fp:
+                request = CreateFileRequest.builder() \
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file_type(file_type or "stream")
+                        .file_name(upload_name)
+                        .file(fp)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.file.create(request)
+        except Exception as e:
+            logger.error("Failed to upload file {}: {}", file_path, e)
+            return None
+
+        if not response.success():
+            logger.error(
+                "Failed to upload file: code={}, msg={}",
+                response.code, response.msg
+            )
+            return None
+
+        file_key = getattr(response.data, "file_key", "") or ""
+        if file_key:
+            logger.info("File uploaded: {} -> {}", file_path, file_key)
+        return file_key or None
+
+    def upload_drive_file(
+        self,
+        file_path: str,
+        *,
+        file_name: str | None = None,
+        folder_token: str | None = None,
+        internal_link: bool = True,
+    ) -> dict[str, str] | None:
+        """Upload a local file to Drive and return token/url metadata."""
+        from lark_oapi.api.drive.v1 import (
+            BatchQueryMetaRequest,
+            MetaRequest,
+            PatchPermissionPublicRequest,
+            PermissionPublicRequest,
+            RequestDoc,
+            UploadAllFileRequest,
+            UploadAllFileRequestBody,
+        )
+
+        target_folder = str(
+            settings.feishu_drive_folder_token if folder_token is None else folder_token
+        ).strip()
+
+        path = Path(file_path)
+        upload_name = file_name or path.name
+        try:
+            with path.open("rb") as fp:
+                request = UploadAllFileRequest.builder() \
+                    .request_body(
+                        UploadAllFileRequestBody.builder()
+                        .file_name(upload_name)
+                        .parent_type("explorer")
+                        .parent_node(target_folder)
+                        .size(path.stat().st_size)
+                        .file(fp)
+                        .build()
+                    ).build()
+                response = self._client.drive.v1.file.upload_all(request)
+        except Exception as e:
+            logger.error("Failed to upload Drive file {}: {}", file_path, e)
+            return None
+
+        if not response.success():
+            logger.error(
+                "Failed to upload Drive file: code={}, msg={}",
+                response.code, response.msg
+            )
+            return None
+
+        file_token = str(getattr(response.data, "file_token", "") or "")
+        if not file_token:
+            return None
+
+        if internal_link:
+            permission_request = PatchPermissionPublicRequest.builder() \
+                .type("file") \
+                .token(file_token) \
+                .request_body(
+                    PermissionPublicRequest.builder()
+                    .external_access(False)
+                    .link_share_entity("tenant_readable")
+                    .build()
+                ).build()
+            permission_response = self._client.drive.v1.permission_public.patch(permission_request)
+            if not permission_response.success():
+                logger.warning(
+                    "Failed to set Drive file internal link permission {}: code={}, msg={}",
+                    file_token,
+                    permission_response.code,
+                    permission_response.msg,
+                )
+
+        url = self._drive_file_url_from_meta(
+            file_token,
+            batch_query_request_cls=BatchQueryMetaRequest,
+            meta_request_cls=MetaRequest,
+            request_doc_cls=RequestDoc,
+        )
+        if not url and target_folder:
+            url = self._drive_file_url_from_list(target_folder, file_token)
+        url = url or _drive_file_url(file_token)
+        logger.info("Drive file uploaded: {} -> {} ({})", file_path, file_token, url)
+        return {"file_token": file_token, "url": url}
+
+    def _drive_file_url_from_meta(
+        self,
+        file_token: str,
+        *,
+        batch_query_request_cls: Any | None = None,
+        meta_request_cls: Any | None = None,
+        request_doc_cls: Any | None = None,
+    ) -> str:
+        if not file_token:
+            return ""
+        if not batch_query_request_cls or not meta_request_cls or not request_doc_cls:
+            from lark_oapi.api.drive.v1 import BatchQueryMetaRequest, MetaRequest, RequestDoc
+
+            batch_query_request_cls = BatchQueryMetaRequest
+            meta_request_cls = MetaRequest
+            request_doc_cls = RequestDoc
+        try:
+            request_doc = request_doc_cls.builder() \
+                .doc_token(file_token) \
+                .doc_type("file") \
+                .build()
+            request = batch_query_request_cls.builder() \
+                .request_body(
+                    meta_request_cls.builder()
+                    .request_docs([request_doc])
+                    .with_url(True)
+                    .build()
+                ).build()
+            response = self._client.drive.v1.meta.batch_query(request)
+        except Exception as e:
+            logger.warning("Failed to query Drive file meta {} for URL lookup: {}", file_token, e)
+            return ""
+        if not response.success():
+            logger.warning(
+                "Failed to query Drive file meta {} for URL lookup: code={}, msg={}",
+                file_token,
+                response.code,
+                response.msg,
+            )
+            return ""
+        metas = getattr(getattr(response, "data", None), "metas", None) or []
+        for item in metas:
+            if str(getattr(item, "doc_token", "") or "") == file_token:
+                return str(getattr(item, "url", "") or "")
+        return ""
+
+    def _drive_file_url_from_list(self, folder_token: str, file_token: str) -> str:
+        from lark_oapi.api.drive.v1 import ListFileRequest
+
+        try:
+            request = ListFileRequest.builder() \
+                .folder_token(folder_token) \
+                .page_size(200) \
+                .build()
+            response = self._client.drive.v1.file.list(request)
+        except Exception as e:
+            logger.warning("Failed to list Drive folder {} for URL lookup: {}", folder_token, e)
+            return ""
+        if not response.success():
+            logger.warning(
+                "Failed to list Drive folder {} for URL lookup: code={}, msg={}",
+                folder_token,
+                response.code,
+                response.msg,
+            )
+            return ""
+        files = getattr(getattr(response, "data", None), "files", None) or []
+        for item in files:
+            if str(getattr(item, "token", "") or "") == file_token:
+                return str(getattr(item, "url", "") or "")
+        return ""
+
     def get_image_bytes(
         self,
         image_key: str,
@@ -392,7 +587,7 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
 
     elif message_type == "image":
         img_key = data.get("image_key", "")
-        content = f"[图片]"
+        content = "[图片]"
         media_info = {"type": "image", "image_key": img_key}
 
     elif message_type == "file":
@@ -478,11 +673,11 @@ def _parse_message_content(message_type: str, content_raw: str) -> tuple[str, di
 
     elif message_type == "sticker":
         # Sticker / emoji
-        content = f"[表情]"
+        content = "[表情]"
         media_info = {"type": "sticker"}
 
     elif message_type == "share_chat" or message_type == "share_user":
-        content = f"[分享]"
+        content = "[分享]"
         media_info = {"type": message_type}
 
     else:
@@ -506,6 +701,7 @@ class FeishuChannelPort:
         reply: ReplyPayload,
     ) -> DeliveryResult:
         try:
+            reply = self._enrich_reply_attachments_with_drive_links(reply)
             msg_type, content = _feishu_reply_body(reply, client=self.client)
             result = self.client.reply_message(
                 message_id=str(source_message.get("platform_message_id") or ""),
@@ -513,6 +709,11 @@ class FeishuChannelPort:
                 msg_type=msg_type,
                 reply_in_thread=True,
             )
+            if result:
+                try:
+                    self._deliver_reply_attachments(source_message=source_message, reply=reply)
+                except Exception as attachment_exc:
+                    logger.warning("Failed to deliver supplemental Feishu attachments: {}", attachment_exc)
         except Exception as exc:
             return DeliveryResult(delivered=False, error=str(exc))
 
@@ -525,6 +726,89 @@ class FeishuChannelPort:
             root_id=str(result.get("root_id") or ""),
             raw=dict(result),
         )
+
+    def _enrich_reply_attachments_with_drive_links(self, reply: ReplyPayload) -> ReplyPayload:
+        if not settings.feishu_drive_upload_enabled:
+            return reply
+        attachments = reply.metadata.get("feishu_file_attachments")
+        if not isinstance(attachments, list):
+            return reply
+
+        changed = False
+        enriched: list[dict[str, Any]] = []
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            attachment = dict(item)
+            if not str(attachment.get("url") or "").strip() and hasattr(self.client, "upload_drive_file"):
+                path = str(attachment.get("path") or "").strip()
+                if path:
+                    drive_meta = self.client.upload_drive_file(
+                        path,
+                        file_name=str(attachment.get("file_name") or Path(path).name),
+                        folder_token=(
+                            str(attachment["drive_folder_token"])
+                            if "drive_folder_token" in attachment
+                            else settings.feishu_drive_folder_token
+                        ),
+                        internal_link=settings.feishu_drive_internal_link_enabled,
+                    )
+                    if drive_meta:
+                        attachment.update(
+                            {
+                                "url": drive_meta.get("url") or "",
+                                "drive_file_token": drive_meta.get("file_token") or "",
+                            }
+                        )
+                        changed = True
+            enriched.append(attachment)
+
+        if not changed:
+            return reply
+        payload = _replace_attachment_markdown_with_links(reply.payload, enriched)
+        return ReplyPayload(
+            channel=reply.channel,
+            type=reply.type,
+            content=reply.content,
+            payload=payload,
+            intent=reply.intent,
+            file_path=reply.file_path,
+            metadata={**dict(reply.metadata), "feishu_file_attachments": enriched},
+        )
+
+    def _deliver_reply_attachments(
+        self,
+        *,
+        source_message: dict,
+        reply: ReplyPayload,
+    ) -> None:
+        attachments = reply.metadata.get("feishu_file_attachments")
+        if not isinstance(attachments, list):
+            return
+        source_message_id = str(source_message.get("platform_message_id") or "")
+        if not source_message_id:
+            return
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            if str(item.get("url") or "").strip() and settings.feishu_drive_upload_enabled:
+                continue
+            file_key = self.client.upload_file(
+                path,
+                file_name=str(item.get("file_name") or Path(path).name),
+                file_type=str(item.get("file_type") or "stream"),
+            )
+            if not file_key:
+                continue
+            self.client.reply_message(
+                message_id=source_message_id,
+                content=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                msg_type="file",
+                reply_in_thread=True,
+            )
 
 
 class FeishuFilePort:
@@ -882,3 +1166,83 @@ def _extract_json_string_field(text: str, field_name: str) -> str:
 
 def _looks_like_feishu_card(value: dict[str, Any]) -> bool:
     return any(key in value for key in ("schema", "body", "elements", "header"))
+
+
+def _drive_file_url(file_token: str) -> str:
+    base = str(settings.feishu_drive_base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/file/{file_token}"
+
+
+def _replace_attachment_markdown_with_links(payload: Any, attachments: list[dict[str, Any]]) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    body = payload.get("body")
+    if not isinstance(body, dict):
+        return payload
+    elements = body.get("elements")
+    if not isinstance(elements, list):
+        return payload
+
+    import copy
+
+    rewritten = copy.deepcopy(payload)
+    rewritten_body = dict(rewritten.get("body") or {})
+    rewritten_body["elements"] = [
+        *_remove_attachment_markdown_elements(rewritten_body.get("elements") or []),
+        {"tag": "markdown", "content": _attachment_markdown_with_links(attachments), "text_align": "left", "text_size": "normal"},
+    ]
+    rewritten["body"] = rewritten_body
+    return rewritten
+
+
+def _remove_attachment_markdown_elements(elements: list[Any]) -> list[Any]:
+    cleaned: list[Any] = []
+    for item in elements:
+        if (
+            isinstance(item, dict)
+            and item.get("tag") == "markdown"
+            and _is_attachment_markdown(str(item.get("content") or ""))
+        ):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _is_attachment_markdown(content: str) -> bool:
+    text = str(content or "").strip()
+    if not text:
+        return False
+    return text.splitlines()[0].strip().replace("*", "") == "附件"
+
+
+def _attachment_markdown_with_links(attachments: list[dict[str, Any]]) -> str:
+    lines = ["**附件**", "已上传至飞书云盘；点击链接查看。"]
+    for item in attachments:
+        title = str(item.get("title") or item.get("file_name") or "附件").strip()
+        url = str(item.get("url") or "").strip()
+        file_name = str(item.get("file_name") or "").strip()
+        description = str(item.get("description") or "").strip()
+        label = f"[{title}]({url})" if url else title
+        meta = _attachment_short_meta(file_name, description)
+        lines.append(f"- {label}{meta}")
+    return "\n".join(lines)
+
+
+def _attachment_short_meta(file_name: str, description: str) -> str:
+    parts: list[str] = []
+    suffix = Path(file_name).suffix.lower().lstrip(".")
+    if suffix:
+        parts.append(suffix.upper())
+    compact_description = _truncate_inline(description, 36)
+    if compact_description:
+        parts.append(compact_description)
+    return f"（{'，'.join(parts)}）" if parts else ""
+
+
+def _truncate_inline(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."

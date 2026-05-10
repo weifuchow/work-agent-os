@@ -10,6 +10,7 @@ import pytest
 
 from core.connectors import message_service as message_service_mod
 from core.connectors.feishu import (
+    FeishuChannelPort,
     FeishuClient,
     _feishu_reply_body,
     _normalize_mermaid_flowchart_labels,
@@ -437,3 +438,288 @@ def test_get_image_bytes_falls_back_to_message_resource():
 
     data = client.get_image_bytes("img_v3_x", message_id="om_img_xxx", resource_type="image")
     assert data == (b"fallback-image", "capture.png")
+
+
+@pytest.mark.asyncio
+async def test_feishu_channel_port_uploads_supplemental_markdown_file(tmp_path):
+    detail = tmp_path / "reply-details-1195.md"
+    detail.write_text("# 完整分析\n\n细节", encoding="utf-8")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.replies = []
+            self.uploads = []
+
+        def reply_message(self, message_id, content, msg_type="text", reply_in_thread=False):
+            self.replies.append(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "msg_type": msg_type,
+                    "reply_in_thread": reply_in_thread,
+                }
+            )
+            return {"message_id": f"reply_{len(self.replies)}", "thread_id": "omt_1", "root_id": "om_root"}
+
+        def upload_file(self, path, *, file_name=None, file_type="stream"):
+            self.uploads.append({"path": path, "file_name": file_name, "file_type": file_type})
+            return "file_v3_details"
+
+    client = FakeClient()
+    port = FeishuChannelPort(client=client)
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="摘要",
+        payload={"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "结论"}]}},
+        metadata={
+            "feishu_file_attachments": [
+                {
+                    "path": str(detail),
+                    "file_name": "reply-details-1195.md",
+                    "file_type": "stream",
+                }
+            ]
+        },
+    )
+
+    delivery = await port.deliver_reply(
+        source_message={"platform_message_id": "om_source"},
+        reply=reply,
+    )
+
+    assert delivery.delivered is True
+    assert client.uploads == [
+        {"path": str(detail), "file_name": "reply-details-1195.md", "file_type": "stream"}
+    ]
+    assert len(client.replies) == 2
+    assert client.replies[0]["msg_type"] == "interactive"
+    assert client.replies[1] == {
+        "message_id": "om_source",
+        "content": json.dumps({"file_key": "file_v3_details"}, ensure_ascii=False),
+        "msg_type": "file",
+        "reply_in_thread": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_feishu_channel_port_embeds_drive_links_in_card(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_upload_enabled", True)
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_folder_token", "fld_test")
+    detail = tmp_path / "deck.pptx"
+    detail.write_bytes(b"ppt")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.replies = []
+            self.drive_uploads = []
+            self.file_uploads = []
+
+        def reply_message(self, message_id, content, msg_type="text", reply_in_thread=False):
+            self.replies.append(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "msg_type": msg_type,
+                    "reply_in_thread": reply_in_thread,
+                }
+            )
+            return {"message_id": "reply_1", "thread_id": "omt_1", "root_id": "om_root"}
+
+        def upload_drive_file(self, path, *, file_name=None, folder_token=None, internal_link=True):
+            self.drive_uploads.append(
+                {
+                    "path": path,
+                    "file_name": file_name,
+                    "folder_token": folder_token,
+                    "internal_link": internal_link,
+                }
+            )
+            return {"file_token": "drive_token_1", "url": "https://example.feishu.cn/drive/file/drive_token_1"}
+
+        def upload_file(self, path, *, file_name=None, file_type="stream"):
+            self.file_uploads.append({"path": path, "file_name": file_name, "file_type": file_type})
+            return "file_should_not_send"
+
+    client = FakeClient()
+    port = FeishuChannelPort(client=client)
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="摘要",
+        payload={
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "结论"},
+                    {"tag": "markdown", "content": "**附件**\n已随本话题发送。\n- PPT 最新版（PPTX）"},
+                ]
+            },
+        },
+        metadata={
+            "feishu_file_attachments": [
+                {
+                    "path": str(detail),
+                    "file_name": "deck.pptx",
+                    "file_type": "stream",
+                    "title": "PPT 最新版",
+                    "description": "本轮版本",
+                }
+            ]
+        },
+    )
+
+    delivery = await port.deliver_reply(
+        source_message={"platform_message_id": "om_source"},
+        reply=reply,
+    )
+
+    assert delivery.delivered is True
+    assert client.drive_uploads == [
+        {
+            "path": str(detail),
+            "file_name": "deck.pptx",
+            "folder_token": "fld_test",
+            "internal_link": False,
+        }
+    ]
+    assert client.file_uploads == []
+    assert len(client.replies) == 1
+    card = json.loads(client.replies[0]["content"])
+    raw = json.dumps(card, ensure_ascii=False)
+    assert "已上传至飞书云盘" in raw
+    assert "[PPT 最新版](https://example.feishu.cn/drive/file/drive_token_1)" in raw
+
+
+@pytest.mark.asyncio
+async def test_feishu_channel_port_allows_empty_drive_folder_token_for_root(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_upload_enabled", True)
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_folder_token", "")
+    detail = tmp_path / "deck.pptx"
+    detail.write_bytes(b"ppt")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.replies = []
+            self.drive_uploads = []
+
+        def reply_message(self, message_id, content, msg_type="text", reply_in_thread=False):
+            self.replies.append(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "msg_type": msg_type,
+                    "reply_in_thread": reply_in_thread,
+                }
+            )
+            return {"message_id": "reply_1", "thread_id": "omt_1", "root_id": "om_root"}
+
+        def upload_drive_file(self, path, *, file_name=None, folder_token=None, internal_link=True):
+            self.drive_uploads.append(
+                {
+                    "path": path,
+                    "file_name": file_name,
+                    "folder_token": folder_token,
+                    "internal_link": internal_link,
+                }
+            )
+            return {"file_token": "drive_token_root", "url": "https://example.feishu.cn/drive/file/drive_token_root"}
+
+    client = FakeClient()
+    port = FeishuChannelPort(client=client)
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="摘要",
+        payload={"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "结论"}]}},
+        metadata={
+            "feishu_file_attachments": [
+                {
+                    "path": str(detail),
+                    "file_name": "deck.pptx",
+                    "file_type": "stream",
+                    "title": "PPT 最新版",
+                }
+            ]
+        },
+    )
+
+    delivery = await port.deliver_reply(
+        source_message={"platform_message_id": "om_source"},
+        reply=reply,
+    )
+
+    assert delivery.delivered is True
+    assert client.drive_uploads == [
+        {
+            "path": str(detail),
+            "file_name": "deck.pptx",
+            "folder_token": "",
+            "internal_link": False,
+        }
+    ]
+    assert len(client.replies) == 1
+
+
+def test_drive_file_url_uses_openable_file_route(monkeypatch):
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_base_url", "https://example.feishu.cn")
+
+    from core.connectors.feishu import _drive_file_url
+
+    assert _drive_file_url("file_token_1") == "https://example.feishu.cn/file/file_token_1"
+
+
+@pytest.mark.asyncio
+async def test_feishu_channel_port_falls_back_to_file_message_when_drive_upload_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.connectors.feishu.settings.feishu_drive_upload_enabled", True)
+    detail = tmp_path / "details.md"
+    detail.write_text("# details", encoding="utf-8")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.replies = []
+            self.file_uploads = []
+
+        def reply_message(self, message_id, content, msg_type="text", reply_in_thread=False):
+            self.replies.append(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "msg_type": msg_type,
+                    "reply_in_thread": reply_in_thread,
+                }
+            )
+            return {"message_id": f"reply_{len(self.replies)}", "thread_id": "omt_1", "root_id": "om_root"}
+
+        def upload_drive_file(self, path, *, file_name=None, folder_token=None, internal_link=True):
+            return None
+
+        def upload_file(self, path, *, file_name=None, file_type="stream"):
+            self.file_uploads.append({"path": path, "file_name": file_name, "file_type": file_type})
+            return "file_v3_details"
+
+    client = FakeClient()
+    port = FeishuChannelPort(client=client)
+    reply = ReplyPayload(
+        type="feishu_card",
+        content="摘要",
+        payload={"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "结论"}]}},
+        metadata={
+            "feishu_file_attachments": [
+                {
+                    "path": str(detail),
+                    "file_name": "details.md",
+                    "file_type": "stream",
+                }
+            ]
+        },
+    )
+
+    delivery = await port.deliver_reply(
+        source_message={"platform_message_id": "om_source"},
+        reply=reply,
+    )
+
+    assert delivery.delivered is True
+    assert client.file_uploads == [
+        {"path": str(detail), "file_name": "details.md", "file_type": "stream"}
+    ]
+    assert len(client.replies) == 2
+    assert client.replies[1]["msg_type"] == "file"

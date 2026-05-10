@@ -48,6 +48,31 @@ def test_render_feishu_card_outputs_reply_contract():
     assert contract["skill_trace"][0]["skill"] == "feishu_card_builder"
 
 
+def test_render_feishu_card_preserves_attachments_outside_card_payload():
+    renderer = _load_renderer()
+
+    contract = renderer.render_contract(
+        {
+            "title": "功能设计",
+            "summary": "卡片展示摘要，完整设计和代码通过附件查看。",
+            "attachments": [
+                {
+                    "path": "workspace/output/design-details.md",
+                    "title": "完整设计文档",
+                    "description": "包含详细流程和代码逻辑",
+                }
+            ],
+        },
+        reply_type="feishu_card",
+    )
+
+    reply = contract["reply"]
+    assert reply["type"] == "feishu_card"
+    assert reply["attachments"][0]["path"] == "workspace/output/design-details.md"
+    assert "attachments" not in reply["payload"]
+    assert reply["payload"]["schema"] == "2.0"
+
+
 def test_render_markdown_outputs_structured_summary_payload():
     renderer = _load_renderer()
 

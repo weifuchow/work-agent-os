@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
     feishu_bot_name: str = "WorkAgent"
+    # Empty means Drive root for the current app identity.
+    feishu_drive_folder_token: str = ""
+    feishu_drive_base_url: str = "https://k32rofd4qx.feishu.cn"
+    feishu_drive_upload_enabled: bool = True
+    feishu_drive_internal_link_enabled: bool = False
 
     # Feishu daily report push target
     feishu_report_chat_id: str = ""

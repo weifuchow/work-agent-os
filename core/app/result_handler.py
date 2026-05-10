@@ -11,7 +11,11 @@ from typing import Any
 from core.connectors.feishu import _MERMAID_BLOCK_RE, _render_mermaid_png, _sanitize_feishu_card_payload
 from core.app.context import MessageContext, PreparedWorkspace
 from core.app.contract import SkillResult
-from core.app.reply_enrichment import enhance_feishu_card_code_blocks, enrich_reply_with_workspace_context
+from core.app.reply_enrichment import (
+    attach_declared_feishu_reply_files,
+    enhance_feishu_card_code_blocks,
+    enrich_reply_with_workspace_context,
+)
 from core.ports import ChannelPort, ClockPort, ReplyPayload, ReplyRepairPort
 from core.repositories import Repository
 
@@ -95,6 +99,7 @@ class ResultHandler:
         reply = await self._repair_reply_if_needed(ctx, workspace, reply)
         reply = enhance_feishu_card_code_blocks(reply)
         reply = enrich_reply_with_workspace_context(reply, workspace)
+        reply = attach_declared_feishu_reply_files(reply, workspace)
         if reply.type in {"text", "markdown"} and not reply.content.strip():
             await self._mark_failed(
                 ctx,

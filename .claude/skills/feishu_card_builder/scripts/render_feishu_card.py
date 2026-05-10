@@ -49,14 +49,16 @@ def render_contract(payload: dict[str, Any], reply_type: str = "markdown") -> di
 def render_markdown_contract(payload: dict[str, Any]) -> dict[str, Any]:
     summary = render_structured_summary(payload)
     content = render_markdown_summary(summary)
+    reply = {
+        "channel": "feishu",
+        "type": "markdown",
+        "content": content,
+        "payload": {"structured_summary": summary},
+    }
+    reply.update(reply_attachment_fields(payload))
     return {
         "action": "reply",
-        "reply": {
-            "channel": "feishu",
-            "type": "markdown",
-            "content": content,
-            "payload": {"structured_summary": summary},
-        },
+        "reply": reply,
         "session_patch": {},
         "workspace_patch": {},
         "skill_trace": [
@@ -68,14 +70,16 @@ def render_markdown_contract(payload: dict[str, Any]) -> dict[str, Any]:
 
 def render_feishu_card_contract(payload: dict[str, Any]) -> dict[str, Any]:
     fallback = fallback_text(payload)
+    reply = {
+        "channel": "feishu",
+        "type": "feishu_card",
+        "content": fallback,
+        "payload": render_card(payload),
+    }
+    reply.update(reply_attachment_fields(payload))
     return {
         "action": "reply",
-        "reply": {
-            "channel": "feishu",
-            "type": "feishu_card",
-            "content": fallback,
-            "payload": render_card(payload),
-        },
+        "reply": reply,
         "session_patch": {},
         "workspace_patch": {},
         "skill_trace": [
@@ -123,6 +127,18 @@ def render_structured_summary(payload: dict[str, Any]) -> dict[str, Any]:
     if not normalized["conclusion"]:
         normalized["conclusion"] = normalized["summary"]
     return normalized
+
+
+def reply_attachment_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for key in ("attachments", "files", "file_attachments"):
+        value = payload.get(key)
+        if value:
+            fields[key] = value
+    file_path = str(payload.get("file_path") or "").strip()
+    if file_path:
+        fields["file_path"] = file_path
+    return fields
 
 
 def render_markdown_summary(summary: dict[str, Any]) -> str:

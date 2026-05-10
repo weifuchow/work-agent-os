@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,6 @@ from core.orchestrator.dispatch_artifacts import (
     _message_artifact_segment,
     _persist_project_run_record,
     _project_entry_from_workspace,
-    _project_entry_is_ready,
     _project_entry_is_session_worktree_ready,
     _read_json_artifact,
     _safe_artifact_segment,
@@ -50,8 +50,17 @@ PROJECT_AGENT_RESPONSE_RULES = """
 12. `format=flow` 示例：
    {"format":"flow","title":"标题","summary":"一句话说明","steps":[{"title":"步骤1","detail":"说明"}],"table":{"columns":[{"key":"step","label":"步骤","type":"text"}],"rows":[{"step":"准备"}]},"mermaid":"flowchart TD\\nA[\\\"开始\\\"]-->B[\\\"结束\\\"]","fallback_text":"纯文本兜底"}
    流程图必须优先给 `mermaid` 或 `flowcharts[].source`，节点标签包含中文、空格、箭头、括号、斜杠、冒号或等号时必须加双引号，且不要把 Mermaid 放进 `code_blocks`。
-13. 闲聊、问候、极短确认可以继续输出自然语言正文。
-14. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
+13. 不要因为分析内容较长就额外生成内容相同的附件；如果卡片/结构化摘要已经能表达清楚，就只返回结构化摘要。
+14. 只有主编排任务里明确要求你生成目标文件，或用户明确要求 Word/PDF/Markdown/PPT/完整技术方案/方案设计等独立产物时，才写文件。
+15. 目标文件由主编排预先定义固定文件名和输出路径，并通过 `target_artifacts` 下发。生成文件时只能
+   创建、覆盖或完善这些预定义 path，不能自行临时起名，不能把未列出的历史文件放入结果。
+16. 最终 JSON 中返回 `artifacts` 时只能引用主编排预定义 path：
+   {"artifacts":[{"path":"绝对或相对路径","title":"文件标题","description":"文件用途"}]}
+   如果主编排下发多个 target_artifacts，例如方案 A、方案 B，必须分别生成每个文件，并在 artifacts
+   中分别引用对应 path；不能合并成一个未声明文件。
+17. 未被明确要求的历史文件、旧报告、旧 PPT 不要重新列入 `artifacts`。
+18. 闲聊、问候、极短确认可以继续输出自然语言正文。
+19. 不要输出 action/classified_type/topic/project_name/reply_content 等外层元字段。
 """.strip()
 
 
@@ -81,6 +90,104 @@ def _skill_registered(skill_name: str) -> bool:
     return (_project_root() / ".claude" / "skills" / skill_name / "SKILL.md").is_file()
 
 
+def _normalize_target_artifacts(value: Any, *, base_dir: Path | None = None) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, str):
+            path = item.strip()
+            title = Path(path).name
+            description = ""
+        elif isinstance(item, dict):
+            path = str(item.get("path") or item.get("file_path") or "").strip()
+            title = str(item.get("title") or Path(path).name).strip()
+            description = str(item.get("description") or "").strip()
+        else:
+            continue
+        if not path:
+            continue
+        resolved_path = _target_artifact_path(path, base_dir=base_dir)
+        if resolved_path in seen:
+            continue
+        seen.add(resolved_path)
+        result.append({"path": resolved_path, "title": title or Path(path).name, "description": description})
+    return result
+
+
+def _target_artifact_path(path: str, *, base_dir: Path | None = None) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw)
+    if candidate.is_absolute() or base_dir is None:
+        return raw
+    return str((base_dir / candidate).resolve())
+
+
+def _extract_project_result_artifacts(text: str, target_artifacts: list[dict[str, str]] | None = None) -> list[dict[str, str]]:
+    parsed = _parse_project_result_json(text)
+    artifacts = parsed.get("artifacts") if isinstance(parsed, dict) else None
+    if not isinstance(artifacts, list):
+        return []
+    target_by_path = {str(item.get("path") or "").strip(): item for item in (target_artifacts or [])}
+    result: list[dict[str, str]] = []
+    for item in artifacts:
+        if isinstance(item, str):
+            path = item.strip()
+            if path:
+                if target_by_path and path not in target_by_path:
+                    continue
+                target = target_by_path.get(path, {})
+                result.append(
+                    {
+                        "path": path,
+                        "title": str(target.get("title") or Path(path).name),
+                        "description": str(target.get("description") or ""),
+                    }
+                )
+            continue
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("file_path") or "").strip()
+        if not path:
+            continue
+        if target_by_path and path not in target_by_path:
+            continue
+        target = target_by_path.get(path, {})
+        result.append(
+            {
+                "path": path,
+                "title": str(target.get("title") or item.get("title") or Path(path).name).strip(),
+                "description": str(target.get("description") or item.get("description") or "").strip(),
+            }
+        )
+    return result
+
+
+def _parse_project_result_json(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    candidates = [raw]
+    if "```" in raw:
+        for block in raw.split("```"):
+            block = block.strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            if block:
+                candidates.append(block)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 async def dispatch_to_project(input: dict) -> dict[str, Any]:
     from core.orchestrator.agent_client import agent_client
     from core.app import project_workspace as project_workspace_mod
@@ -91,6 +198,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
     project_name = str(input["project_name"]).strip()
     task = str(input["task"])
     context = str(input.get("context") or "")
+    raw_target_artifacts = input.get("target_artifacts")
+    artifact_instruction = str(input.get("artifact_instruction") or "").strip()
     requested_skill = str(input.get("skill") or "").strip()
     input_session_id_record = str(input.get("session_id") or "").strip()
     db_session_id = input.get("db_session_id")
@@ -220,6 +329,10 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
         (analysis_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     if orchestration_dir:
         orchestration_dir.mkdir(parents=True, exist_ok=True)
+    target_artifacts = _normalize_target_artifacts(
+        raw_target_artifacts,
+        base_dir=(analysis_dir / "artifacts") if analysis_dir else None,
+    )
 
     project_entry = _project_entry_from_workspace(project_workspace, project_name)
     if not requested_skill:
@@ -259,6 +372,8 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             "skill": selected_skill or requested_skill,
             "task": task,
             "context": context,
+            "target_artifacts": target_artifacts,
+            "artifact_instruction": artifact_instruction,
             "worktree_path": str(project_entry.get("worktree_path") or project_entry.get("execution_path") or project_cwd),
             "checkout_ref": str(project_entry.get("checkout_ref") or ""),
             "execution_commit_sha": str(project_entry.get("execution_commit_sha") or ""),
@@ -599,6 +714,20 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
 
     if context:
         project_prompt += f"\n\n## 消息背景\n{context}"
+    if artifact_instruction or target_artifacts:
+        project_prompt += "\n\n## 目标产物\n"
+        if artifact_instruction:
+            project_prompt += f"{artifact_instruction}\n"
+        if target_artifacts:
+            project_prompt += "需要产出的文件：\n" + "\n".join(
+                f"- path: {item['path']} | title: {item['title']} | description: {item['description']}"
+                for item in target_artifacts
+            )
+            project_prompt += "\n"
+        project_prompt += (
+            "这些 path 是主编排预先定义的固定文件名和输出位置。只能创建、覆盖或完善这些文件；"
+            "最终 JSON 的 artifacts 也只能引用这些 path。不要自行临时起名，不要把未列出的旧文件或额外文件放入 artifacts。\n"
+        )
     if triage_dir:
         project_prompt += f"\n\n## 关联 Triage 目录\n{triage_dir}"
     if session_image_paths:
@@ -720,6 +849,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
             }
 
         if result_artifact:
+            parsed_result_artifacts = _extract_project_result_artifacts(str(result.get("text") or ""), target_artifacts)
             _write_json_artifact(
                 result_artifact,
                 {
@@ -735,6 +865,9 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                     "input_session_id_record_only": input_session_id_record,
                     "triage_dir": triage_dir,
                     "structured_evidence_summary": [],
+                    "artifacts": parsed_result_artifacts,
+                    "target_artifacts": target_artifacts,
+                    "artifact_instruction": artifact_instruction,
                     "raw": result,
                 },
             )
@@ -744,7 +877,7 @@ async def dispatch_to_project(input: dict) -> dict[str, Any]:
                     [
                         "# Project Analysis Trace",
                         "",
-                        f"- status: success",
+                        "- status: success",
                         f"- project: {project_name}",
                         f"- dispatch_id: {dispatch_id}",
                         f"- skill: {selected_skill or ''}",

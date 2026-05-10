@@ -118,7 +118,173 @@ async def test_dispatch_to_project_does_not_auto_select_skill_from_stale_analysi
     assert result["session_id"] == "plain-session-new"
     assert calls[0]["skill"] is None
     assert calls[0]["session_id"] is None
+    assert "## 目标产物" not in calls[0]["prompt"]
     assert read_json(state_path)["agent_context"]["session_id"] == "triage-session-old"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_project_passes_explicit_target_artifacts_to_project_agent(tmp_path, monkeypatch):
+    harness = await make_dispatch_session(tmp_path, monkeypatch)
+    register_project(monkeypatch, tmp_path, skills=skill_defs("slides"))
+    expected_path = str(
+        (
+            harness.session_dir
+            / ".analysis"
+            / "message-unknown"
+            / "allspark"
+            / "dispatch-001"
+            / "artifacts"
+            / "feature-design.md"
+        ).resolve()
+    )
+    calls = capture_project_agent_run(
+        monkeypatch,
+        session_ids="project-session",
+        text=json.dumps(
+            {
+                "format": "rich",
+                "title": "方案设计",
+                "summary": "已生成设计文档。",
+                "artifacts": [
+                    {
+                        "path": expected_path,
+                        "title": "完整方案设计",
+                        "description": "含接口、流程和边界",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    result = await harness.dispatch(
+        project_name="allspark",
+        task="设计一个功能，并输出完整方案文档",
+        context="用户明确要求生成方案文件",
+        target_artifacts=[
+            {
+                "path": "feature-design.md",
+                "title": "完整方案设计",
+                "description": "含接口、流程和边界",
+            }
+        ],
+        artifact_instruction="只生成这个设计文档；卡片由主编排汇总。",
+        db_session_id=88,
+    )
+
+    assert "## 目标产物" in calls[0]["prompt"]
+    assert "完整方案设计" in calls[0]["prompt"]
+    assert expected_path in calls[0]["prompt"]
+    assert result["result_path"]
+    artifact = read_json(Path(result["result_path"]))
+    assert artifact["target_artifacts"][0]["title"] == "完整方案设计"
+    assert artifact["target_artifacts"][0]["path"] == expected_path
+    assert artifact["artifacts"][0]["path"] == expected_path
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_project_ignores_agent_artifacts_not_predeclared(tmp_path, monkeypatch):
+    harness = await make_dispatch_session(tmp_path, monkeypatch)
+    register_project(monkeypatch, tmp_path, skills=skill_defs("slides"))
+    expected_path = str(
+        (
+            harness.session_dir
+            / ".analysis"
+            / "message-unknown"
+            / "allspark"
+            / "dispatch-001"
+            / "artifacts"
+            / "feature-design.md"
+        ).resolve()
+    )
+    capture_project_agent_run(
+        monkeypatch,
+        session_ids="project-session",
+        text=json.dumps(
+            {
+                "format": "rich",
+                "title": "方案设计",
+                "summary": "已生成设计文档。",
+                "artifacts": [
+                    {"path": expected_path, "title": "完整方案设计"},
+                    {"path": "random-old-file.md", "title": "旧文件"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    result = await harness.dispatch(
+        project_name="allspark",
+        task="设计一个功能，并输出完整方案文档",
+        target_artifacts=[{"path": "feature-design.md", "title": "完整方案设计"}],
+        db_session_id=88,
+    )
+
+    artifact = read_json(Path(result["result_path"]))
+    assert [item["path"] for item in artifact["artifacts"]] == [expected_path]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_project_accepts_multiple_predeclared_target_artifacts(tmp_path, monkeypatch):
+    harness = await make_dispatch_session(tmp_path, monkeypatch)
+    register_project(monkeypatch, tmp_path, skills=skill_defs("doc"))
+    expected_a = str(
+        (
+            harness.session_dir
+            / ".analysis"
+            / "message-unknown"
+            / "allspark"
+            / "dispatch-001"
+            / "artifacts"
+            / "solution-a.md"
+        ).resolve()
+    )
+    expected_b = str(
+        (
+            harness.session_dir
+            / ".analysis"
+            / "message-unknown"
+            / "allspark"
+            / "dispatch-001"
+            / "artifacts"
+            / "solution-b.md"
+        ).resolve()
+    )
+    calls = capture_project_agent_run(
+        monkeypatch,
+        session_ids="project-session",
+        text=json.dumps(
+            {
+                "format": "rich",
+                "title": "双方案设计",
+                "summary": "已生成方案 A 和方案 B。",
+                "artifacts": [
+                    {"path": expected_a, "title": "方案 A"},
+                    {"path": expected_b, "title": "方案 B"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    result = await harness.dispatch(
+        project_name="allspark",
+        task="生成方案 A 和方案 B 两份设计文档",
+        target_artifacts=[
+            {"path": "solution-a.md", "title": "方案 A", "description": "保守方案"},
+            {"path": "solution-b.md", "title": "方案 B", "description": "激进方案"},
+        ],
+        db_session_id=88,
+    )
+
+    prompt = calls[0]["prompt"]
+    assert expected_a in prompt
+    assert expected_b in prompt
+    artifact = read_json(Path(result["result_path"]))
+    assert [item["path"] for item in artifact["target_artifacts"]] == [expected_a, expected_b]
+    assert [item["title"] for item in artifact["artifacts"]] == ["方案 A", "方案 B"]
+    assert [item["path"] for item in artifact["artifacts"]] == [expected_a, expected_b]
 
 
 @pytest.mark.asyncio

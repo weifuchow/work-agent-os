@@ -17,7 +17,6 @@ for item in (ROOT, TESTS_ROOT):
         sys.path.insert(0, str(item))
 
 from core.agents.runner import AgentRunner
-from core.app.message_processor import MessageProcessorDeps
 from core.app.result_handler import ResultHandler
 from core.artifacts.workspace import WorkspacePreparer
 from core.deps import CoreDependencies
@@ -691,6 +690,63 @@ async def test_feishu_card_delivery_failure_retries_markdown_fallback(harness):
 
 
 @pytest.mark.asyncio
+async def test_generated_word_pdf_markdown_are_delivered_as_card_attachments(harness):
+    db_file = harness["db_file"]
+    agent_port = DocumentAttachmentAgentPort()
+    harness["deps"].agents.agent_port = agent_port
+    msg_id = await insert_message(db_file, content="hi，帮我制作一个 XX 内容的 word、pdf、.md")
+
+    await process_message(msg_id)
+
+    msg = await fetch_one(db_file, "SELECT pipeline_status, pipeline_error FROM messages WHERE id = ?", (msg_id,))
+    assert msg == {"pipeline_status": "completed", "pipeline_error": ""}
+    assert len(harness["channel"].calls) == 1
+    delivered = harness["channel"].calls[0]["reply"]
+    assert delivered.type == "feishu_card"
+    assert delivered.metadata["feishu_file_attachments"]
+    assert [item["file_name"] for item in delivered.metadata["feishu_file_attachments"]] == [
+        "xx-content.docx",
+        "xx-content.pdf",
+        "xx-content.md",
+    ]
+    for item in delivered.metadata["feishu_file_attachments"]:
+        assert Path(item["path"]).is_file()
+
+    card_text = json.dumps(delivered.payload, ensure_ascii=False)
+    assert "已生成三个版本" in card_text
+    assert "Word 版本（DOCX，可编辑文档）" in card_text
+    assert "PDF 版本（PDF，适合分发阅读）" in card_text
+    assert "Markdown 源稿（MD，保留源稿）" in card_text
+
+    reply = await fetch_one(db_file, "SELECT message_type, raw_payload FROM messages WHERE sender_id = 'bot'")
+    assert reply["message_type"] == "feishu_card"
+    raw = json.loads(reply["raw_payload"])
+    assert [item["file_name"] for item in raw["reply"]["feishu_file_attachments"]] == [
+        "xx-content.docx",
+        "xx-content.pdf",
+        "xx-content.md",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_declared_attachment_is_not_delivered_from_shared_workspace(harness):
+    db_file = harness["db_file"]
+    agent_port = StaleDeclaredAttachmentAgentPort()
+    harness["deps"].agents.agent_port = agent_port
+    msg_id = await insert_message(db_file, content="继续修改 PPT，只发最新版")
+
+    await process_message(msg_id)
+
+    msg = await fetch_one(db_file, "SELECT pipeline_status, pipeline_error FROM messages WHERE id = ?", (msg_id,))
+    assert msg == {"pipeline_status": "completed", "pipeline_error": ""}
+    delivered = harness["channel"].calls[0]["reply"]
+    assert [item["file_name"] for item in delivered.metadata["feishu_file_attachments"]] == ["latest-version.pptx"]
+    card_text = json.dumps(delivered.payload, ensure_ascii=False)
+    assert "PPT 最新版" in card_text
+    assert "PPT 旧版" not in card_text
+
+
+@pytest.mark.asyncio
 async def test_agent_timeout_recovers_from_reply_contract_artifact(harness):
     db_file = harness["db_file"]
     agent_port = TimeoutAfterArtifactAgentPort(_reply_result("artifact reply"))
@@ -728,6 +784,35 @@ async def test_agent_timeout_ignores_stale_reply_contract_artifact(harness):
     assert msg["pipeline_status"] == "failed"
     assert msg["pipeline_error"] == "codex exec timed out (session=new)"
     assert harness["channel"].calls == []
+
+    audits = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
+    event_types = [item["event_type"] for item in audits]
+    assert "agent_run_recovered_from_artifact" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_agent_timeout_ignores_previous_generic_reply_contract_in_same_session(harness):
+    db_file = harness["db_file"]
+    first_id = await insert_message(db_file, platform_message_id="om_first", content="第一版 PPT")
+    await process_message(first_id)
+    first_workspace = harness["agent_port"].calls[0].workspace_path
+    old_contract = first_workspace / "output" / "reply_contract.json"
+    old_contract.write_text(json.dumps(_reply_result("上一轮 PPT"), ensure_ascii=False), encoding="utf-8")
+
+    second_id = await insert_message(
+        db_file,
+        platform_message_id="om_second",
+        content="继续修改 PPT",
+        thread_id="omt_reply_001",
+    )
+    harness["deps"].agents.agent_port = GenericStaleContractTimeoutAgentPort()
+
+    await process_message(second_id)
+
+    msg = await fetch_one(db_file, "SELECT pipeline_status, pipeline_error FROM messages WHERE id = ?", (second_id,))
+    assert msg["pipeline_status"] == "failed"
+    assert msg["pipeline_error"] == "codex exec timed out (session=new)"
+    assert [call["reply"].content for call in harness["channel"].calls] == ["hello from skill"]
 
     audits = await fetch_all(db_file, "SELECT event_type FROM audit_logs ORDER BY id")
     event_types = [item["event_type"] for item in audits]
@@ -919,6 +1004,118 @@ class TimeoutAfterArtifactAgentPort:
         raise RuntimeError("codex exec timed out (session=new)")
 
 
+class DocumentAttachmentAgentPort:
+    def __init__(self) -> None:
+        self.calls: list[AgentRequest] = []
+
+    async def run(self, request: AgentRequest) -> AgentResponse:
+        self.calls.append(request)
+        output_dir = request.workspace_path / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        files = [
+            ("xx-content.docx", b"fake docx"),
+            ("xx-content.pdf", b"%PDF-1.4 fake pdf"),
+            ("xx-content.md", "# XX 内容\n\nhi\n".encode("utf-8")),
+        ]
+        for file_name, data in files:
+            (output_dir / file_name).write_bytes(data)
+        return AgentResponse(
+            text=json.dumps(
+                {
+                    "action": "reply",
+                    "reply": {
+                        "channel": "feishu",
+                        "type": "feishu_card",
+                        "content": "已生成 XX 内容的 Word、PDF 和 Markdown 版本。",
+                        "payload": {
+                            "schema": "2.0",
+                            "header": {"title": {"tag": "plain_text", "content": "XX 内容文档"}},
+                            "body": {
+                                "elements": [
+                                    {
+                                        "tag": "markdown",
+                                        "content": "**摘要**\n已生成三个版本：Word 便于编辑，PDF 便于分发，Markdown 便于继续迭代。",
+                                    },
+                                    {
+                                        "tag": "markdown",
+                                        "content": "**内容概览**\n主题：XX 内容。\n开头：hi。",
+                                    },
+                                ]
+                            },
+                        },
+                        "attachments": [
+                            {
+                                "path": "xx-content.docx",
+                                "title": "Word 版本",
+                                "description": "可编辑文档",
+                            },
+                            {
+                                "path": "xx-content.pdf",
+                                "title": "PDF 版本",
+                                "description": "适合分发阅读",
+                            },
+                            {
+                                "path": "xx-content.md",
+                                "title": "Markdown 源稿",
+                                "description": "保留源稿",
+                            },
+                        ],
+                    },
+                    "session_patch": {},
+                    "workspace_patch": {},
+                    "skill_trace": [{"skill": "document-generator", "reason": "generated requested files"}],
+                    "audit": [],
+                },
+                ensure_ascii=False,
+            ),
+            runtime="fake",
+        )
+
+
+class StaleDeclaredAttachmentAgentPort:
+    def __init__(self) -> None:
+        self.calls: list[AgentRequest] = []
+
+    async def run(self, request: AgentRequest) -> AgentResponse:
+        self.calls.append(request)
+        output_dir = request.workspace_path / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stale = output_dir / "old-version.pptx"
+        stale.write_bytes(b"old ppt")
+        os.utime(stale, (10, 10))
+        (output_dir / "latest-version.pptx").write_bytes(b"new ppt")
+        return AgentResponse(
+            text=json.dumps(
+                {
+                    "action": "reply",
+                    "reply": {
+                        "channel": "feishu",
+                        "type": "feishu_card",
+                        "content": "已更新 PPT。",
+                        "payload": {
+                            "schema": "2.0",
+                            "body": {
+                                "elements": [
+                                    {"tag": "markdown", "content": "**摘要**\n只发送本轮最新版本。"},
+                                ]
+                            },
+                        },
+                        "attachments": [
+                            {"path": "old-version.pptx", "title": "PPT 旧版"},
+                            {"path": "latest-version.pptx", "title": "PPT 最新版"},
+                        ],
+                    },
+                    "session_patch": {},
+                    "workspace_patch": {},
+                    "skill_trace": [{"skill": "slides", "reason": "updated deck"}],
+                    "audit": [],
+                },
+                ensure_ascii=False,
+            ),
+            runtime="fake",
+        )
+
+
 class StaleArtifactTimeoutAgentPort(TimeoutAfterArtifactAgentPort):
     async def run(self, request: AgentRequest) -> AgentResponse:
         self.calls.append(request)
@@ -926,4 +1123,13 @@ class StaleArtifactTimeoutAgentPort(TimeoutAfterArtifactAgentPort):
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(json.dumps(self.artifact_result, ensure_ascii=False), encoding="utf-8")
         os.utime(artifact_path, (1, 1))
+        raise RuntimeError("codex exec timed out (session=new)")
+
+
+class GenericStaleContractTimeoutAgentPort:
+    def __init__(self) -> None:
+        self.calls: list[AgentRequest] = []
+
+    async def run(self, request: AgentRequest) -> AgentResponse:
+        self.calls.append(request)
         raise RuntimeError("codex exec timed out (session=new)")

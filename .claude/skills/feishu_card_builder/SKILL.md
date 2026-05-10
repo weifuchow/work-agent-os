@@ -74,6 +74,13 @@ When uncertain:
     "columns": [{"key": "fact", "label": "事实"}],
     "rows": [{"fact": "已确认"}]
   },
+  "attachments": [
+    {
+      "path": "workspace/output/design-details.md",
+      "title": "完整设计文档",
+      "description": "包含详细流程、边界和代码逻辑"
+    }
+  ],
   "fallback_text": "纯文本兜底"
 }
 ```
@@ -116,6 +123,14 @@ When uncertain:
 `structured_summary`、调试信息、artifact 路径、skill metadata 或其他非飞书字段放进
 `reply.payload` 根节点。需要机器可读摘要时，写入 `workspace/output` 的独立 JSON，或只在
 Markdown 回复的 `reply.payload.structured_summary` 中保留。飞书会拒绝未知的卡片根字段。
+不要因为卡片内容较长就额外生成内容相同的 Markdown/文档附件；如果卡片已经能清楚表达结论、
+证据、流程图和建议，就只输出卡片。只有用户明确要求生成文件，或本轮确实存在完整技术方案、
+方案设计、可交付文档、PPT/Word/PDF/Markdown、代码包等需要独立文件承载的目标产物时，才生成文件。
+如果本轮生成了 Word、PDF、Markdown、PPT 或其他目标文件，文件名和输出路径应由主编排预先定义；
+业务/项目 Agent 只能按这些固定 path 生成或完善文件，不能临时起名。文件必须写到 `workspace/output` 或
+session artifact 目录，并在 `reply.attachments`（或输入摘要的 `attachments`）中声明
+`path/title/description`。附件声明属于 `reply` 顶层 metadata，不属于飞书卡片 `reply.payload`；
+Core 会负责上传飞书云盘，并把文件链接拼到卡片附件区。
 如果 `workspace/input/project_workspace.json` 或 `project_context.json.project_workspace` 中存在已加载项目，
 ONES/现场问题卡片必须包含“运行上下文”区块：本次实际使用的项目名、版本来源、normalized_version、
 checkout_ref/target_branch、current_branch、worktree_path/execution_path、execution_version/execution_describe，
@@ -141,6 +156,8 @@ checkout_ref/target_branch、current_branch、worktree_path/execution_path、exe
 - 需要展示代码时，优先使用 `code_blocks`；每个代码块写清 `title/path/language/code/note`。
   不要把大段代码混在普通正文里。代码片段应控制在关键方法或关键类型，避免整文件粘贴。
   如果上游只能提供 Markdown 代码块，也可以放在 section `content` 中，渲染器会拆成独立代码展板。
+  如果代码、设计文档或分析过程较长，先判断用户是否需要独立文件；需要时卡片只展示摘要和关键片段，
+  完整内容写入目标附件并通过 `attachments` 声明。不需要独立文件时，不要复制卡片内容生成附件。
 - 不要在这个 skill 内重新检索日志、读取工单或调用项目分析；需要这些能力时交给上游业务 skill。
 
 ## Scripts

@@ -260,6 +260,7 @@ class MessageProcessor:
                     },
                 )
             ended_at = self.deps.clock.now_iso()
+            result = _stamp_reply_artifact_not_before(result, artifact_not_before)
             trace_paths = ensure_triage_analysis_traces(workspace)
             if trace_paths:
                 await self.deps.repository.audit(
@@ -374,7 +375,7 @@ def _recover_reply_contract_from_workspace(
 
     candidates = _reply_contract_candidates(ctx, workspace)
     for path in candidates:
-        if not_before_mtime and _mtime(path) + 2.0 < not_before_mtime:
+        if not _is_recoverable_reply_contract(path, ctx=ctx, not_before_mtime=not_before_mtime):
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -385,6 +386,46 @@ def _recover_reply_contract_from_workspace(
         if result.action == "reply" and result.reply is not None:
             return result, str(path)
     return None
+
+
+def _stamp_reply_artifact_not_before(result: SkillResult, not_before_mtime: float) -> SkillResult:
+    if result.action != "reply" or result.reply is None or not not_before_mtime:
+        return result
+    reply = result.reply
+    metadata = dict(reply.metadata)
+    metadata.setdefault("attachment_not_before_mtime", not_before_mtime)
+    return SkillResult(
+        action=result.action,
+        reply=ReplyPayload(
+            channel=reply.channel,
+            type=reply.type,
+            content=reply.content,
+            payload=reply.payload,
+            intent=reply.intent,
+            file_path=reply.file_path,
+            metadata=metadata,
+        ),
+        session_patch=result.session_patch,
+        workspace_patch=result.workspace_patch,
+        skill_trace=result.skill_trace,
+        audit=result.audit,
+        error_message=result.error_message,
+        raw=result.raw,
+    )
+
+
+def _is_recoverable_reply_contract(
+    path: Path,
+    *,
+    ctx: MessageContext,
+    not_before_mtime: float,
+) -> bool:
+    if not not_before_mtime:
+        return True
+    mtime = _mtime(path)
+    if path.name == f"reply_contract_{ctx.message_id}.json":
+        return mtime + 2.0 >= not_before_mtime
+    return mtime >= not_before_mtime
 
 
 def _reply_contract_candidates(ctx: MessageContext, workspace: PreparedWorkspace) -> list[Path]:

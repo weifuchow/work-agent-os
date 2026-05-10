@@ -154,11 +154,28 @@ async def prepare_project_worktree_tool(input: dict) -> dict[str, Any]:
     "若主编排漏传，且当前 RIOT 项目任务明显属于日志、ONES、订单/车辆执行链路、截图或附件排障，本工具会兜底选择 riot-log-triage。"
     "本工具不会自动恢复项目 Agent session；session_id 仅作为审计兼容字段保存，不作为 resume 输入。"
     "主编排判断本轮属于 ONES 工单、现场日志、订单/车辆执行链路、截图或附件排障时，应传 skill='riot-log-triage'。"
+    "只有用户明确要求生成文件，或需要完整技术方案/方案设计/可交付文档时，才传 target_artifacts/artifact_instruction；"
+    "target_artifacts 必须由主编排预先定义固定文件名和输出路径，项目 Agent 只能按这些 path 生成或完善文件；"
+    "用户要求多个产物时，target_artifacts 要逐个列出，例如方案 A、方案 B 对应两个独立条目；"
+    "普通分析不要要求项目 Agent 生成与卡片内容重复的附件。"
     "每次调用都会创建项目分析目录，并返回项目 Agent 输出、分析目录和 record-only session_id。",
     {"type": "object", "properties": {
         "project_name": {"type": "string", "description": "projects.yaml 中注册的项目名称"},
         "task": {"type": "string", "description": "要派发给项目 Agent 的任务描述（详细）"},
         "context": {"type": "string", "description": "消息的原始内容和背景信息，供项目 Agent 参考"},
+        "target_artifacts": {
+            "type": "array",
+            "description": "可选：主编排预先定义的固定目标文件列表；普通分析不要传。项目 Agent 只能生成这些 path",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "主编排固定下发的输出路径/文件名，项目 Agent 不能改名"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+            },
+        },
+        "artifact_instruction": {"type": "string", "description": "可选：目标产物要求和边界；没有明确文件产物时不要传"},
         "skill": {"type": "string", "description": "可选：指定项目 Agent 必须加载的 workflow skill，例如 riot-log-triage"},
         "session_id": {"type": "string", "description": "可选兼容字段，仅审计记录；不会用于项目 Agent resume。不要传 workspace/input/session.json 里的全局 agent_session_id"},
         "db_session_id": {"type": "integer", "description": "DB 会话 ID，用于读取/持久化项目级 Agent session"},
